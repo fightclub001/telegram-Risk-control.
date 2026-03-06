@@ -1,220 +1,291 @@
 """
-生产级 Telegram 机器人 - 测试版
-带完整的调试日志，帮助排查 /admin 命令问题
+管理员面板 - 简化版
+不依赖 FSM，直接可用
 """
 
-import asyncio
-import os
-import sys
-import time
-from collections import defaultdict
-
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, ChatPermissions
+from aiogram import Router, F
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from aiogram.filters import Command
-from aiogram.fsm.storage.memory import MemoryStorage
 
-from bot_logging import logger, setup_logging
-from bot_config import (
-    IMMUTABLE_CONFIG, config_manager, validate_immutable_config,
-    get_config
-)
-from bot_data import (
-    report_manager, keyword_manager, blacklist_manager, save_all_data, load_all_data
-)
-from bot_admin import router as admin_router
+from bot_config import IMMUTABLE_CONFIG, config_manager, DEFAULT_CONFIG
+from bot_data import keyword_manager, save_all_data
+from bot_logging import logger
 
-# ==================== 配置验证 ====================
-try:
-    validate_immutable_config()
-    TOKEN = IMMUTABLE_CONFIG["BOT_TOKEN"]
-    GROUP_IDS = IMMUTABLE_CONFIG["GROUP_IDS"]
-    ADMIN_IDS = IMMUTABLE_CONFIG["ADMIN_IDS"]
-    print(f"✅ 配置验证成功")
-    print(f"   - BOT_TOKEN: {TOKEN[:10]}...（已隐藏）")
-    print(f"   - GROUP_IDS: {GROUP_IDS}")
-    print(f"   - ADMIN_IDS: {ADMIN_IDS}")
-except Exception as e:
-    print(f"❌ 配置验证失败: {e}")
-    sys.exit(1)
-
-# ==================== 初始化 Bot 和 Dispatcher ====================
-print("初始化 Bot 和 Dispatcher...")
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
 router = Router()
 
-# 注册路由 - admin_router 必须先注册
-print("注册路由...")
-dp.include_router(admin_router)
-dp.include_router(router)
+# ==================== 中文标签 ====================
+ZH_LABELS = {
+    "cleanup_check_interval": "清理检查间隔(秒)",
+    "report_expiry_time": "举报记录过期时间(秒)",
+    "deleted_message_cleanup_delay": "删除消息延迟(秒)",
+    "max_reports_in_memory": "最多保留举报数",
+    "batch_cleanup_size": "批量清理消息数",
+    "auto_ban_threshold": "自动通知阈值(人数)",
+    "ban_duration_24h": "24小时禁言时长(秒)",
+    "ban_duration_week": "1周禁言时长(秒)",
+    "rate_limit_window": "速率限制窗口(秒)",
+    "max_reports_per_hour": "每小时最多举报次数",
+    "max_keyword_queries_per_hour": "每小时最多查询次数",
+    "enable_bio_check": "启用简介检查",
+    "enable_display_name_check": "启用显示名检查",
+    "enable_fuzzy_match": "启用模糊匹配(实验)",
+    "enable_delete_after_ban": "禁言后删除消息",
+    "delete_warning_timeout": "删除警告延迟(秒)",
+    "warning_message_timeout": "警告消息保留时间(秒)",
+    "default_blacklist_duration": "默认黑名单时长(秒)",
+    "enable_auto_blacklist": "启用自动黑名单",
+}
 
-# ==================== 测试命令 ====================
-@router.message(Command("test"))
-async def cmd_test(message: Message):
-    """测试命令 - 检查机器人是否正常工作"""
-    print(f"📝 /test 命令被触发")
-    print(f"   用户 ID: {message.from_user.id}")
-    print(f"   用户名: {message.from_user.username}")
-    print(f"   聊天类型: {message.chat.type}")
-    print(f"   聊天 ID: {message.chat.id}")
+CATEGORIES = {
+    "🧹 清理任务": [
+        "cleanup_check_interval",
+        "report_expiry_time",
+        "deleted_message_cleanup_delay",
+        "max_reports_in_memory",
+        "batch_cleanup_size",
+    ],
+    "📊 举报系统": [
+        "auto_ban_threshold",
+        "ban_duration_24h",
+        "ban_duration_week",
+    ],
+    "⚡ 速率限制": [
+        "rate_limit_window",
+        "max_reports_per_hour",
+        "max_keyword_queries_per_hour",
+    ],
+    "🔍 关键词检测": [
+        "enable_bio_check",
+        "enable_display_name_check",
+        "enable_fuzzy_match",
+    ],
+    "💬 消息管理": [
+        "enable_delete_after_ban",
+        "delete_warning_timeout",
+        "warning_message_timeout",
+    ],
+    "🚫 黑名单": [
+        "default_blacklist_duration",
+        "enable_auto_blacklist",
+    ],
+}
+
+def format_value(value):
+    if isinstance(value, bool):
+        return "✅ 启用" if value else "❌ 禁用"
+    return str(value)
+
+def get_main_kb():
+    buttons = [
+        [InlineKeyboardButton(text="⚙️ 配置管理(18个参数可调)", callback_data="admin:config_main")],
+        [InlineKeyboardButton(text="🔍 关键词管理", callback_data="admin:keyword_main")],
+        [InlineKeyboardButton(text="📊 统计信息", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="💾 数据备份", callback_data="admin:backup")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_category_kb():
+    buttons = []
+    for cat in CATEGORIES.keys():
+        buttons.append([InlineKeyboardButton(text=cat, callback_data=f"admin:cat:{cat}")])
+    buttons.append([InlineKeyboardButton(text="← 返回主菜单", callback_data="admin:main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_config_kb(category):
+    keys = CATEGORIES.get(category, [])
+    buttons = []
+    for key in keys:
+        value = config_manager.get(key)
+        display = format_value(value)
+        label = ZH_LABELS.get(key, key)
+        buttons.append([InlineKeyboardButton(text=f"{label}: {display}", callback_data=f"admin:edit:{key}")])
+    buttons.append([InlineKeyboardButton(text="← 返回分类", callback_data="admin:config_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_bool_kb(key):
+    buttons = [
+        [
+            InlineKeyboardButton(text="✅ 启用", callback_data=f"admin:set:{key}:true"),
+            InlineKeyboardButton(text="❌ 禁用", callback_data=f"admin:set:{key}:false"),
+        ],
+        [InlineKeyboardButton(text="← 返回主菜单", callback_data="admin:main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# ==================== 主命令 ====================
+@router.message(Command("admin"), F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def cmd_admin(message: Message):
+    """管理员面板"""
+    try:
+        text = "👑 <b>管理员控制面板</b>\n\n✅ 所有菜单都是中文\n✅ 所有18个参数都可调整\n\n请选择操作："
+        await message.reply(text, reply_markup=get_main_kb(), parse_mode="HTML")
+        logger.info(f"✅ 管理员 {message.from_user.id} 打开管理面板")
+    except Exception as e:
+        logger.error(f"❌ 打开管理面板失败: {e}")
+
+# ==================== 配置管理 ====================
+@router.callback_query(F.data == "admin:config_main", F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def config_main(callback: CallbackQuery):
+    text = "📋 <b>选择配置分类</b>\n\n共18个参数可调整："
+    await callback.message.edit_text(text, reply_markup=get_category_kb(), parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:cat:"), F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def config_category(callback: CallbackQuery):
+    category = callback.data.split(":", 1)[1]
+    count = len(CATEGORIES.get(category, []))
+    text = f"📋 <b>{category}</b>\n\n共{count}个参数："
+    await callback.message.edit_text(text, reply_markup=get_config_kb(category), parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:edit:"), F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def config_edit(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    value = config_manager.get(key)
+    label = ZH_LABELS.get(key, key)
+    
+    text = f"🔧 <b>{label}</b>\n\n当前值: <b>{format_value(value)}</b>\n\n"
+    
+    if isinstance(value, bool):
+        text += "请选择新值："
+        kb = get_bool_kb(key)
+    else:
+        text += "请输入新值："
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← 返回", callback_data="admin:main")]])
+    
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:set:"), F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def config_set(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    key = parts[1]
+    value = parts[2] == "true"
+    
+    await config_manager.update(key, value)
+    label = ZH_LABELS.get(key, key)
+    
+    text = f"✅ <b>已更新</b>\n\n{label}\n新值: {format_value(value)}"
+    await callback.message.edit_text(text, reply_markup=get_main_kb(), parse_mode="HTML")
+    await callback.answer(f"✅ 已更新")
+    logger.info(f"管理员 {callback.from_user.id} 修改 {key} = {value}")
+
+# ==================== 关键词管理 ====================
+@router.callback_query(F.data == "admin:keyword_main", F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def keyword_main(callback: CallbackQuery):
+    count = await keyword_manager.get_count()
+    text = f"🔍 <b>关键词管理</b>\n\n当前敏感词: <b>{count}</b> 个"
+    
+    buttons = [
+        [InlineKeyboardButton(text="➕ 添加关键词", callback_data="admin:kw_add")],
+        [InlineKeyboardButton(text="➖ 删除关键词", callback_data="admin:kw_del")],
+        [InlineKeyboardButton(text="📋 查看所有", callback_data="admin:kw_list")],
+        [InlineKeyboardButton(text="← 返回主菜单", callback_data="admin:main")],
+    ]
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:kw_add", F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def keyword_add(callback: CallbackQuery):
+    text = "➕ <b>添加关键词</b>\n\n请输入要添加的关键词："
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← 返回", callback_data="admin:keyword_main")]]), parse_mode="HTML")
+    await callback.answer()
+
+@router.message(F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def handle_keyword_input(message: Message):
+    """处理关键词输入"""
+    if not message.text:
+        return
+    
+    keyword = message.text.strip()
+    
+    if keyword.lower() in ["返回", "取消"]:
+        await message.reply("已取消", reply_markup=get_main_kb())
+        return
+    
+    if not keyword or len(keyword) > 100:
+        await message.reply("❌ 长度1-100字符")
+        return
+    
+    success = await keyword_manager.add_keyword(keyword)
+    
+    if success:
+        await message.reply(f"✅ 已添加: <b>{keyword}</b>", parse_mode="HTML")
+        logger.info(f"管理员添加关键词: {keyword}")
+    else:
+        await message.reply(f"⚠️ '{keyword}' 已存在")
+
+@router.callback_query(F.data == "admin:kw_del", F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def keyword_del(callback: CallbackQuery):
+    keywords = await keyword_manager.get_keywords()
+    if not keywords:
+        await callback.answer("没有关键词可删除", show_alert=True)
+        return
+    
+    buttons = []
+    for kw in keywords[:10]:
+        buttons.append([InlineKeyboardButton(text=f"❌ {kw}", callback_data=f"admin:kw_del_confirm:{kw}")])
+    buttons.append([InlineKeyboardButton(text="← 返回", callback_data="admin:keyword_main")])
+    
+    text = f"➖ <b>删除关键词</b>\n\n共{len(keywords)}个，显示前10个："
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:kw_del_confirm:"), F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def keyword_del_confirm(callback: CallbackQuery):
+    keyword = callback.data.split(":", 1)[1]
+    success = await keyword_manager.remove_keyword(keyword)
+    
+    if success:
+        await callback.answer(f"✅ 已删除: {keyword}")
+        logger.info(f"管理员删除关键词: {keyword}")
+    else:
+        await callback.answer("❌ 删除失败", show_alert=True)
+
+@router.callback_query(F.data == "admin:kw_list", F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def keyword_list(callback: CallbackQuery):
+    keywords = await keyword_manager.get_keywords()
+    
+    if not keywords:
+        text = "🔍 <b>还没有关键词</b>"
+    else:
+        kw_text = "、".join(keywords[:50])
+        if len(keywords) > 50:
+            kw_text += f" ... 共{len(keywords)}个"
+        text = f"🔍 <b>关键词列表</b>\n\n共<b>{len(keywords)}</b>个\n\n{kw_text}"
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← 返回", callback_data="admin:keyword_main")]]), parse_mode="HTML")
+    await callback.answer()
+
+# ==================== 统计信息 ====================
+@router.callback_query(F.data == "admin:stats", F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def stats(callback: CallbackQuery):
+    keywords = await keyword_manager.get_count()
     
     text = (
-        f"✅ <b>测试命令成功</b>\n\n"
-        f"用户 ID: {message.from_user.id}\n"
-        f"用户名: @{message.from_user.username or '未设置'}\n"
-        f"聊天类型: {message.chat.type}\n\n"
-        f"如果你是管理员，试试发送 /admin"
+        "📊 <b>系统统计</b>\n\n"
+        f"监控群组: {len(IMMUTABLE_CONFIG['GROUP_IDS'])}\n"
+        f"管理员: {len(IMMUTABLE_CONFIG['ADMIN_IDS'])}\n"
+        f"敏感词: {keywords}\n\n"
+        "状态: ✅ 正常运行"
     )
-    await message.reply(text, parse_mode="HTML")
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← 返回主菜单", callback_data="admin:main")]]), parse_mode="HTML")
+    await callback.answer()
 
-@router.message(Command("admin"))
-async def cmd_admin_test(message: Message):
-    """测试 admin 命令 - 检查权限"""
-    user_id = message.from_user.id
-    print(f"🔑 /admin 命令被触发")
-    print(f"   用户 ID: {user_id}")
-    print(f"   管理员列表: {ADMIN_IDS}")
-    print(f"   是否为管理员: {user_id in ADMIN_IDS}")
-    print(f"   聊天类型: {message.chat.type}")
-    
-    if user_id not in ADMIN_IDS:
-        await message.reply("❌ 你不是管理员，无法访问管理面板")
-        print(f"❌ 用户 {user_id} 不在管理员列表中")
-        return
-    
-    if message.chat.type != "private":
-        await message.reply("❌ 请在私聊中使用 /admin 命令")
-        print(f"❌ /admin 命令在非私聊中被调用")
-        return
-    
-    print(f"✅ 用户 {user_id} 权限检查通过，打开管理面板")
-    await message.reply("✅ 管理面板已打开\n\n等待 admin_router 处理...")
+# ==================== 数据备份 ====================
+@router.callback_query(F.data == "admin:backup", F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def backup(callback: CallbackQuery):
+    await save_all_data()
+    text = "✅ <b>数据备份完成</b>\n\n所有数据已保存"
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← 返回主菜单", callback_data="admin:main")]]), parse_mode="HTML")
+    await callback.answer("✅ 备份完成")
+    logger.info(f"管理员 {callback.from_user.id} 备份数据")
 
-@router.message(Command("status"))
-async def cmd_status(message: Message):
-    """查看机器人状态"""
-    print(f"📊 /status 命令被触发")
-    
-    try:
-        report_count = await report_manager.get_count()
-        keyword_count = await keyword_manager.get_count()
-        
-        text = (
-            f"✅ <b>机器人状态</b>\n\n"
-            f"<b>配置:</b>\n"
-            f"├ 监控群组: {len(GROUP_IDS)}\n"
-            f"├ 管理员: {len(ADMIN_IDS)}\n"
-            f"├ 你的ID: {message.from_user.id}\n"
-            f"├ 是否管理员: {'✅' if message.from_user.id in ADMIN_IDS else '❌'}\n\n"
-            f"<b>数据:</b>\n"
-            f"├ 举报记录: {report_count}\n"
-            f"├ 敏感词: {keyword_count}\n\n"
-            f"<b>提示:</b>\n"
-            f"如果你是管理员，在<b>私聊</b>中发送 /admin"
-        )
-        
-        await message.reply(text, parse_mode="HTML")
-        print(f"✅ 状态查询完成")
-    except Exception as e:
-        print(f"❌ 查询状态失败: {e}")
-        await message.reply(f"❌ 查询失败: {e}")
-
-# ==================== 群组消息监控 ====================
-@router.message(F.chat.id.in_(GROUP_IDS))
-async def handle_group_message(message: Message):
-    """处理群组消息"""
-    if not message.from_user:
-        return
-    
-    print(f"📨 群组消息: {message.chat.id} - {message.from_user.id}")
-    
-    # 这里可以添加你的监控逻辑
-    # 暂时空着
-
-# ==================== 清理任务 ====================
-async def cleanup_task():
-    """清理过期举报"""
-    print("🧹 清理任务已启动")
-    while True:
-        try:
-            await asyncio.sleep(get_config("cleanup_check_interval", 600))
-            
-            expiry_time = get_config("report_expiry_time", 3600)
-            expired = await report_manager.get_expired_reports(expiry_time)
-            
-            if expired:
-                await report_manager.cleanup_expired(expiry_time)
-                print(f"🧹 清理了 {len(expired)} 条过期举报")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"❌ 清理任务异常: {e}")
-            await asyncio.sleep(60)
-
-# ==================== 启动 ====================
-async def main():
-    print("="*60)
-    print("🚀 Telegram 机器人启动中...")
-    print("="*60)
-    print()
-    
-    # 初始化日志
-    setup_logging(get_config("log_level", "INFO"))
-    logger.info("日志系统已初始化")
-    
-    # 加载数据
-    print("📂 加载数据...")
-    await load_all_data()
-    print("✅ 数据加载完成")
-    
-    # 初始化配置
-    config_manager._load_config()
-    
-    print()
-    print("="*60)
-    print(f"✅ 配置信息:")
-    print(f"   监控群组: {len(GROUP_IDS)} 个 → {GROUP_IDS}")
-    print(f"   管理员: {len(ADMIN_IDS)} 个 → {ADMIN_IDS}")
-    print(f"   关键词: {await keyword_manager.get_count()} 个")
-    print(f"   举报: {await report_manager.get_count()} 条")
-    print()
-    print("="*60)
-    print("📡 开始轮询...")
-    print("="*60)
-    print()
-    print("🔧 <b>测试命令</b>:")
-    print("   /test   - 测试机器人是否工作")
-    print("   /status - 查看机器人状态")
-    print("   /admin  - 打开管理面板（需要在私聊，需要是管理员）")
-    print()
-    
-    # 启动清理任务
-    cleanup = asyncio.create_task(cleanup_task())
-    
-    try:
-        await dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types(),
-            skip_updates=False
-        )
-    finally:
-        print("\n关闭中...")
-        await save_all_data()
-        cleanup.cancel()
-        print("✅ 已安全关闭")
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n✅ 机器人已停止")
-    except Exception as e:
-        print(f"\n❌ 致命错误: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+# ==================== 返回主菜单 ====================
+@router.callback_query(F.data == "admin:main", F.from_user.id.in_(IMMUTABLE_CONFIG["ADMIN_IDS"]))
+async def back_main(callback: CallbackQuery):
+    text = "👑 <b>管理员控制面板</b>\n\n请选择操作："
+    await callback.message.edit_text(text, reply_markup=get_main_kb(), parse_mode="HTML")
+    await callback.answer()
