@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: telegram_bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - GROUP_IDS=${GROUP_IDS}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CONFIG_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+    networks:
+      - bot_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  bot_network:
+    driver: bridge
+
+# 使用方法：
+# 1. 复制 .env.example 为 .env 并填入实际值
+# 2. 运行：docker-compose up -d
+# 3. 查看日志：docker-compose logs -f bot
+# 4. 停止：docker-compose down
