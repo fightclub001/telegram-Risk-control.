@@ -44,9 +44,11 @@ dp.include_router(router)
 os.makedirs("/data", exist_ok=True)
 DATA_FILE = "/data/reports.json"
 CONFIG_FILE = "/data/config.json"
+USER_VIOLATIONS_FILE = "/data/user_violations.json"
 
 reports = {}
 lock = asyncio.Lock()
+user_violations = {}
 
 # ==================== 全局配置结构 ====================
 DEFAULT_CONFIG = {
@@ -76,36 +78,45 @@ async def save_config():
     except Exception as e:
         print(f"保存配置失败: {e}")
 
+async def load_user_violations():
+    global user_violations
+    try:
+        if os.path.exists(USER_VIOLATIONS_FILE):
+            with open(USER_VIOLATIONS_FILE, "r", encoding="utf-8") as f:
+                user_violations = json.load(f)
+    except Exception as e:
+        print(f"加载违规记录失败: {e}")
+
+async def save_user_violations():
+    try:
+        with open(USER_VIOLATIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_violations, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存违规记录失败: {e}")
+
 def get_group_config(group_id: int):
-    """获取群组配置，不存在则创建默认配置"""
     gid = str(group_id)
     if gid not in config["groups"]:
         config["groups"][gid] = {
             "name": f"群组-{group_id}",
             "enabled": True,
-            
-            # 简介检测
-            "bio_keywords": ["qq:", "qq：", "qq号", "加qq", "扣扣", "微信", "wx:", "weixin", "加我微信", "wxid_", "幼女", "萝莉", "少妇", "人妻", "福利", "约炮", "onlyfans", "小红书", "抖音", "纸飞机", "机场", "t.me/", "@"],
             "check_bio_link": True,
+            "bio_keywords": ["qq:", "qq：", "qq号", "加qq", "扣扣", "微信", "wx:", "weixin", "加我微信", "wxid_", "幼女", "萝莉", "少妇", "人妻", "福利", "约炮", "onlyfans", "小红书", "抖音", "纸飞机", "机场", "t.me/", "@"],
             "check_bio_keywords": True,
-            
-            # 显示名称检测
             "display_keywords": ["加v", "加微信", "加qq", "加扣", "福利加", "约", "约炮", "资源私聊", "私我", "私聊我", "飞机", "纸飞机", "福利", "外围", "反差", "嫩模", "学生妹", "空姐", "人妻", "熟女", "onlyfans", "of", "leak", "nudes", "十八+", "av"],
             "check_display_keywords": True,
-            
-            # 短消息检测
+            "message_keywords": ["qq:", "qq号", "微信", "wx:", "幼女", "萝莉", "福利", "约炮", "onlyfans"],
+            "check_message_keywords": True,
             "short_msg_detection": True,
             "short_msg_threshold": 3,
             "min_consecutive_count": 2,
             "time_window_seconds": 60,
-            
-            # 填充垃圾检测
             "fill_garbage_detection": True,
             "fill_garbage_min_raw_len": 12,
             "fill_garbage_max_clean_len": 8,
             "fill_space_ratio": 0.30,
-            
-            # 自动回复
+            "violation_mute_hours": 1,
+            "reported_message_threshold": 2,
             "autoreply": {
                 "enabled": False,
                 "keywords": [],
@@ -114,8 +125,6 @@ def get_group_config(group_id: int):
                 "delete_user_sec": 0,
                 "delete_bot_sec": 0
             },
-            
-            # 豁免用户
             "exempt_users": {}
         }
     return config["groups"][gid]
@@ -127,6 +136,7 @@ class AdminStates(StatesGroup):
     GroupMenu = State()
     EditBioKeywords = State()
     EditDisplayKeywords = State()
+    EditMessageKeywords = State()
     EditAutoreplyKeywords = State()
     EditAutoreplyText = State()
     EditAutoreplyButtons = State()
@@ -137,6 +147,8 @@ class AdminStates(StatesGroup):
     EditFillGarbageMinRaw = State()
     EditFillGarbageMaxClean = State()
     EditFillSpaceRatio = State()
+    EditMuteHours = State()
+    EditReportedThreshold = State()
 
 # ==================== UI 键盘 ====================
 def get_main_menu_keyboard():
@@ -157,8 +169,9 @@ def get_group_menu_keyboard(group_id: int):
     buttons = [
         [InlineKeyboardButton(text="🔍 简介检测设置", callback_data=f"submenu_bio:{group_id}")],
         [InlineKeyboardButton(text="👤 显示名称检测", callback_data=f"submenu_display:{group_id}")],
-        [InlineKeyboardButton(text="💬 短消息检测", callback_data=f"submenu_short:{group_id}")],
-        [InlineKeyboardButton(text="🗑️ 填充垃圾检测", callback_data=f"submenu_fill:{group_id}")],
+        [InlineKeyboardButton(text="💬 消息检测设置", callback_data=f"submenu_message:{group_id}")],
+        [InlineKeyboardButton(text="短消息/填充垃圾", callback_data=f"submenu_short:{group_id}")],
+        [InlineKeyboardButton(text="⚠️ 违规处理设置", callback_data=f"submenu_violation:{group_id}")],
         [InlineKeyboardButton(text="🤖 自动回复设置", callback_data=f"submenu_autoreply:{group_id}")],
         [InlineKeyboardButton(text="🎛️ 群组基础设置", callback_data=f"submenu_basic:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回选择", callback_data="back_choose_group")],
@@ -189,26 +202,37 @@ def get_display_menu_keyboard(group_id: int):
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_short_menu_keyboard(group_id: int):
+def get_message_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
-    enabled = "✅" if cfg.get("short_msg_detection") else "❌"
+    status = "✅" if cfg.get("check_message_keywords") else "❌"
     buttons = [
-        [InlineKeyboardButton(text=f"启用检测 {enabled}", callback_data=f"toggle_short:{group_id}")],
-        [InlineKeyboardButton(text=f"字数阈值: {cfg.get('short_msg_threshold')}", callback_data=f"edit_threshold:{group_id}")],
-        [InlineKeyboardButton(text=f"连续条数: {cfg.get('min_consecutive_count')}", callback_data=f"edit_consecutive:{group_id}")],
-        [InlineKeyboardButton(text=f"时间窗口: {cfg.get('time_window_seconds')}s", callback_data=f"edit_window:{group_id}")],
+        [InlineKeyboardButton(text=f"启用检测 {status}", callback_data=f"toggle_message:{group_id}")],
+        [InlineKeyboardButton(text="📋 编辑敏感词列表", callback_data=f"edit_message_kw:{group_id}")],
+        [InlineKeyboardButton(text="👀 查看敏感词", callback_data=f"view_message_kw:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回群组菜单", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_fill_menu_keyboard(group_id: int):
+def get_short_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
-    enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
+    short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
+    fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
     buttons = [
-        [InlineKeyboardButton(text=f"启用检测 {enabled}", callback_data=f"toggle_fill:{group_id}")],
-        [InlineKeyboardButton(text=f"最小长度: {cfg.get('fill_garbage_min_raw_len')}", callback_data=f"edit_fill_min:{group_id}")],
-        [InlineKeyboardButton(text=f"清理后长度: {cfg.get('fill_garbage_max_clean_len')}", callback_data=f"edit_fill_max:{group_id}")],
-        [InlineKeyboardButton(text=f"空格比例: {cfg.get('fill_space_ratio'):.1%}", callback_data=f"edit_fill_ratio:{group_id}")],
+        [InlineKeyboardButton(text=f"短消息检测 {short_enabled}", callback_data=f"toggle_short:{group_id}")],
+        [InlineKeyboardButton(text=f"字数: {cfg.get('short_msg_threshold')}", callback_data=f"edit_threshold:{group_id}")],
+        [InlineKeyboardButton(text=f"连续条: {cfg.get('min_consecutive_count')}", callback_data=f"edit_consecutive:{group_id}")],
+        [InlineKeyboardButton(text=f"时窗: {cfg.get('time_window_seconds')}s", callback_data=f"edit_window:{group_id}")],
+        [InlineKeyboardButton(text=f"垃圾检测 {fill_enabled}", callback_data=f"toggle_fill:{group_id}")],
+        [InlineKeyboardButton(text=f"最小长: {cfg.get('fill_garbage_min_raw_len')}", callback_data=f"edit_fill_min:{group_id}")],
+        [InlineKeyboardButton(text="⬅️ 返回群组菜单", callback_data=f"group_menu:{group_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_violation_menu_keyboard(group_id: int):
+    cfg = get_group_config(group_id)
+    buttons = [
+        [InlineKeyboardButton(text=f"禁言时长: {cfg.get('violation_mute_hours')}h", callback_data=f"edit_mute:{group_id}")],
+        [InlineKeyboardButton(text=f"触发禁言: {cfg.get('reported_message_threshold')}", callback_data=f"edit_report_threshold:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回群组菜单", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -229,7 +253,7 @@ def get_autoreply_menu_keyboard(group_id: int):
 
 def get_basic_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
-    enabled = "✅ 已启用" if cfg.get("enabled") else "❌ 已禁用"
+    enabled = "✅" if cfg.get("enabled") else "❌"
     buttons = [
         [InlineKeyboardButton(text=f"群组状态: {enabled}", callback_data=f"toggle_group:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回群组菜单", callback_data=f"group_menu:{group_id}")],
@@ -244,7 +268,7 @@ async def admin_panel(message: Message, state: FSMContext):
     await message.reply(text, reply_markup=kb)
     await state.set_state(AdminStates.MainMenu)
 
-# ==================== 主菜单 ====================
+# ==================== 主菜单回调 ====================
 @router.callback_query(F.data == "choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def choose_group_callback(callback: CallbackQuery, state: FSMContext):
     text = "📋 选择要管理的群组："
@@ -259,7 +283,7 @@ async def select_group(callback: CallbackQuery, state: FSMContext):
         group_id = int(callback.data.split(":", 1)[1])
         cfg = get_group_config(group_id)
         await state.update_data(group_id=group_id)
-        text = f"👥 群组 {group_id} - {cfg.get('name')}\n\n选择要配置的项目："
+        text = f"👥 群组 {group_id}\n\n选择要配置的项目："
         kb = get_group_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
@@ -282,6 +306,20 @@ async def back_to_choose_group(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(text, reply_markup=kb)
     await state.set_state(AdminStates.ChooseGroup)
     await callback.answer()
+
+@router.callback_query(F.data.startswith("group_menu:"), F.from_user.id.in_(ADMIN_IDS))
+async def back_to_group_menu(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        await state.update_data(group_id=group_id)
+        text = f"👥 群组 {group_id}\n\n选择要配置的项目："
+        kb = get_group_menu_keyboard(group_id)
+        await callback.message.edit_text(text, reply_markup=kb)
+        await state.set_state(AdminStates.GroupMenu)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
 
 # ==================== 简介检测菜单 ====================
 @router.callback_query(F.data.startswith("submenu_bio:"), F.from_user.id.in_(ADMIN_IDS))
@@ -381,20 +419,6 @@ async def view_bio_keywords(callback: CallbackQuery):
     except Exception as e:
         await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
 
-@router.callback_query(F.data.startswith("group_menu:"), F.from_user.id.in_(ADMIN_IDS))
-async def back_to_group_menu(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        await state.update_data(group_id=group_id)
-        text = f"👥 群组 {group_id} - {cfg.get('name')}\n\n选择要配置的项目："
-        kb = get_group_menu_keyboard(group_id)
-        await callback.message.edit_text(text, reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
-
 # ==================== 显示名称检测菜单 ====================
 @router.callback_query(F.data.startswith("submenu_display:"), F.from_user.id.in_(ADMIN_IDS))
 async def display_submenu(callback: CallbackQuery, state: FSMContext):
@@ -474,14 +498,94 @@ async def view_display_keywords(callback: CallbackQuery):
     except Exception as e:
         await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
 
-# ==================== 短消息检测菜单 ====================
+# ==================== 消息检测菜单 ====================
+@router.callback_query(F.data.startswith("submenu_message:"), F.from_user.id.in_(ADMIN_IDS))
+async def message_submenu(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        status = "✅" if cfg.get("check_message_keywords") else "❌"
+        text = f"💬 消息检测设置\n\n当前状态：{status}"
+        kb = get_message_menu_keyboard(group_id)
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("toggle_message:"), F.from_user.id.in_(ADMIN_IDS))
+async def toggle_message(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        cfg["check_message_keywords"] = not cfg.get("check_message_keywords", True)
+        await save_config()
+        status = "✅ 已启用" if cfg["check_message_keywords"] else "❌ 已禁用"
+        await callback.answer(f"消息检测: {status}", show_alert=True)
+        kb = get_message_menu_keyboard(group_id)
+        status_display = "✅" if cfg.get("check_message_keywords") else "❌"
+        text = f"💬 消息检测设置\n\n当前状态：{status_display}"
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("edit_message_kw:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_message_keywords(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        keywords = cfg.get("message_keywords", [])
+        kw_text = "\n".join(keywords)
+        text = f"📝 编辑消息敏感词\n\n当前词汇：\n{kw_text}\n\n请发送新的关键词列表（一行一个），或发送 /clear 清空："
+        await callback.message.edit_text(text, reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditMessageKeywords)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditMessageKeywords), F.from_user.id.in_(ADMIN_IDS))
+async def process_message_keywords(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        
+        if message.text.strip() == "/clear":
+            cfg["message_keywords"] = []
+        else:
+            cfg["message_keywords"] = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
+        
+        await save_config()
+        kb = get_message_menu_keyboard(group_id)
+        await message.reply(f"✅ 消息敏感词已更新（共 {len(cfg['message_keywords'])} 个）", reply_markup=kb)
+        await state.set_state(AdminStates.GroupMenu)
+    except Exception as e:
+        await message.reply(f"❌ 错误: {str(e)}")
+
+@router.callback_query(F.data.startswith("view_message_kw:"), F.from_user.id.in_(ADMIN_IDS))
+async def view_message_keywords(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        keywords = cfg.get("message_keywords", [])
+        if keywords:
+            kw_text = "\n".join(keywords)
+            text = f"📋 消息敏感词列表（共 {len(keywords)} 个）：\n\n{kw_text}"
+        else:
+            text = "📋 暂无敏感词"
+        await callback.answer(text, show_alert=True)
+    except Exception as e:
+        await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
+
+# ==================== 短消息和填充垃圾检测菜单 ====================
 @router.callback_query(F.data.startswith("submenu_short:"), F.from_user.id.in_(ADMIN_IDS))
 async def short_submenu(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
         cfg = get_group_config(group_id)
-        enabled = "✅" if cfg.get("short_msg_detection") else "❌"
-        text = f"💬 短消息检测设置\n\n当前状态：{enabled}\n• 字数阈值: {cfg.get('short_msg_threshold')}\n• 连续条数: {cfg.get('min_consecutive_count')}\n• 时间窗口: {cfg.get('time_window_seconds')}s"
+        short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
+        fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
+        text = f"💬/🗑️ 检测设置\n\n• 短消息: {short_enabled}\n• 填充垃圾: {fill_enabled}"
         kb = get_short_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -498,8 +602,9 @@ async def toggle_short_msg(callback: CallbackQuery):
         status = "✅ 已启用" if cfg["short_msg_detection"] else "❌ 已禁用"
         await callback.answer(f"短消息检测: {status}", show_alert=True)
         kb = get_short_menu_keyboard(group_id)
-        enabled = "✅" if cfg.get("short_msg_detection") else "❌"
-        text = f"💬 短消息检测设置\n\n当前状态：{enabled}\n• 字数阈值: {cfg.get('short_msg_threshold')}\n• 连续条数: {cfg.get('min_consecutive_count')}\n• 时间窗口: {cfg.get('time_window_seconds')}s"
+        short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
+        fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
+        text = f"💬/🗑️ 检测设置\n\n• 短消息: {short_enabled}\n• 填充垃圾: {fill_enabled}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
@@ -597,20 +702,6 @@ async def process_window(message: Message, state: FSMContext):
     except Exception as e:
         await message.reply(f"❌ 错误: {str(e)}")
 
-# ==================== 填充垃圾检测菜单 ====================
-@router.callback_query(F.data.startswith("submenu_fill:"), F.from_user.id.in_(ADMIN_IDS))
-async def fill_submenu(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-        text = f"🗑️ 填充垃圾检测设置\n\n当前状态：{enabled}\n• 最小原始长度: {cfg.get('fill_garbage_min_raw_len')}\n• 清理后最大长度: {cfg.get('fill_garbage_max_clean_len')}\n• 空格比例阈值: {cfg.get('fill_space_ratio'):.1%}"
-        kb = get_fill_menu_keyboard(group_id)
-        await callback.message.edit_text(text, reply_markup=kb)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
-
 @router.callback_query(F.data.startswith("toggle_fill:"), F.from_user.id.in_(ADMIN_IDS))
 async def toggle_fill(callback: CallbackQuery):
     try:
@@ -620,9 +711,10 @@ async def toggle_fill(callback: CallbackQuery):
         await save_config()
         status = "✅ 已启用" if cfg["fill_garbage_detection"] else "❌ 已禁用"
         await callback.answer(f"填充垃圾检测: {status}", show_alert=True)
-        kb = get_fill_menu_keyboard(group_id)
-        enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-        text = f"🗑️ 填充垃圾检测设置\n\n当前状态：{enabled}\n• 最小原始长度: {cfg.get('fill_garbage_min_raw_len')}\n• 清理后最大长度: {cfg.get('fill_garbage_max_clean_len')}\n• 空格比例阈值: {cfg.get('fill_space_ratio'):.1%}"
+        kb = get_short_menu_keyboard(group_id)
+        short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
+        fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
+        text = f"💬/🗑️ 检测设置\n\n• 短消息: {short_enabled}\n• 填充垃圾: {fill_enabled}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
@@ -650,7 +742,7 @@ async def process_fill_min(message: Message, state: FSMContext):
         value = int(message.text.strip())
         cfg["fill_garbage_min_raw_len"] = value
         await save_config()
-        kb = get_fill_menu_keyboard(group_id)
+        kb = get_short_menu_keyboard(group_id)
         await message.reply(f"✅ 最小原始长度已更新为 {value}", reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
     except ValueError:
@@ -658,65 +750,77 @@ async def process_fill_min(message: Message, state: FSMContext):
     except Exception as e:
         await message.reply(f"❌ 错误: {str(e)}")
 
-@router.callback_query(F.data.startswith("edit_fill_max:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_fill_max(callback: CallbackQuery, state: FSMContext):
+# ==================== 违规处理设置菜单 ====================
+@router.callback_query(F.data.startswith("submenu_violation:"), F.from_user.id.in_(ADMIN_IDS))
+async def violation_submenu(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
         cfg = get_group_config(group_id)
-        current = cfg.get("fill_garbage_max_clean_len", 8)
-        text = f"输入清理后最大长度（当前: {current}）："
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditFillGarbageMaxClean)
+        mute_hours = cfg.get("violation_mute_hours", 1)
+        report_threshold = cfg.get("reported_message_threshold", 2)
+        text = f"⚠️ 违规处理设置\n\n• 禁言时长: {mute_hours}小时\n• 触发禁言: {report_threshold}条消息被举报"
+        kb = get_violation_menu_keyboard(group_id)
+        await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
 
-@router.message(StateFilter(AdminStates.EditFillGarbageMaxClean), F.from_user.id.in_(ADMIN_IDS))
-async def process_fill_max(message: Message, state: FSMContext):
+@router.callback_query(F.data.startswith("edit_mute:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_mute_hours(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("violation_mute_hours", 1)
+        text = f"输入禁言时长（小时，当前: {current}）："
+        await callback.message.edit_text(text, reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditMuteHours)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditMuteHours), F.from_user.id.in_(ADMIN_IDS))
+async def process_mute_hours(message: Message, state: FSMContext):
     try:
         data = await state.get_data()
         group_id = data.get("group_id")
         cfg = get_group_config(group_id)
         value = int(message.text.strip())
-        cfg["fill_garbage_max_clean_len"] = value
+        cfg["violation_mute_hours"] = value
         await save_config()
-        kb = get_fill_menu_keyboard(group_id)
-        await message.reply(f"✅ 清理后最大长度已更新为 {value}", reply_markup=kb)
+        kb = get_violation_menu_keyboard(group_id)
+        await message.reply(f"✅ 禁言时长已更新为 {value} 小时", reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
     except ValueError:
         await message.reply("❌ 请输入有效的数字")
     except Exception as e:
         await message.reply(f"❌ 错误: {str(e)}")
 
-@router.callback_query(F.data.startswith("edit_fill_ratio:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_fill_ratio(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("edit_report_threshold:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_report_threshold(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
         cfg = get_group_config(group_id)
-        current = cfg.get("fill_space_ratio", 0.30)
-        text = f"输入空格比例阈值（当前: {current:.2f}，范围0-1）："
+        current = cfg.get("reported_message_threshold", 2)
+        text = f"输入触发禁言的消息数（当前: {current}）："
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditFillSpaceRatio)
+        await state.set_state(AdminStates.EditReportedThreshold)
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
 
-@router.message(StateFilter(AdminStates.EditFillSpaceRatio), F.from_user.id.in_(ADMIN_IDS))
-async def process_fill_ratio(message: Message, state: FSMContext):
+@router.message(StateFilter(AdminStates.EditReportedThreshold), F.from_user.id.in_(ADMIN_IDS))
+async def process_report_threshold(message: Message, state: FSMContext):
     try:
         data = await state.get_data()
         group_id = data.get("group_id")
         cfg = get_group_config(group_id)
-        value = float(message.text.strip())
-        if not (0 <= value <= 1):
-            await message.reply("❌ 请输入0-1之间的数值")
-            return
-        cfg["fill_space_ratio"] = value
+        value = int(message.text.strip())
+        cfg["reported_message_threshold"] = value
         await save_config()
-        kb = get_fill_menu_keyboard(group_id)
-        await message.reply(f"✅ 空格比例已更新为 {value:.2f}", reply_markup=kb)
+        kb = get_violation_menu_keyboard(group_id)
+        await message.reply(f"✅ 触发阈值已更新为 {value}", reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
     except ValueError:
         await message.reply("❌ 请输入有效的数字")
@@ -909,7 +1013,7 @@ async def basic_submenu(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
         cfg = get_group_config(group_id)
-        status = "✅ 已启用" if cfg.get("enabled") else "❌ 已禁用"
+        status = "✅" if cfg.get("enabled") else "❌"
         text = f"🎛️ 群组基础设置\n\n群组ID: {group_id}\n状态: {status}"
         kb = get_basic_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
@@ -927,7 +1031,7 @@ async def toggle_group(callback: CallbackQuery):
         status = "✅ 已启用" if cfg["enabled"] else "❌ 已禁用"
         await callback.answer(f"群组状态: {status}", show_alert=True)
         kb = get_basic_menu_keyboard(group_id)
-        status_display = "✅ 已启用" if cfg.get("enabled") else "❌ 已禁用"
+        status_display = "✅" if cfg.get("enabled") else "❌"
         text = f"🎛️ 群组基础设置\n\n群组ID: {group_id}\n状态: {status_display}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
@@ -942,17 +1046,12 @@ async def view_status(callback: CallbackQuery):
         async with lock:
             report_count = len(reports)
         
-        text = f"📊 机器人状态\n\n"
-        text += f"✅ 运行正常\n"
-        text += f"👮 管理员数: {admin_count}\n"
-        text += f"📋 监控群组: {group_count}\n"
-        text += f"📁 举报记录: {report_count}\n"
-        
+        text = f"📊 机器人状态\n\n✅ 运行正常\n👮 管理员数: {admin_count}\n📋 监控群组: {group_count}\n📁 举报记录: {report_count}"
         await callback.answer(text, show_alert=True)
     except Exception as e:
         await callback.answer(f"❌ 错误: {str(e)}", show_alert=True)
 
-# ==================== 群内检测逻辑（原有保持不变） ====================
+# ==================== 群内检测逻辑 ====================
 FILL_CHARS = set(r" .,，。！？*\\\~`-_=+[]{}()\"'\\|\n\t\r　")
 
 user_short_msg_history = {}
@@ -980,174 +1079,202 @@ async def save_data():
         except Exception as e:
             print("保存失败:", e)
 
-def get_profile_hash(bio: str, full_name: str, username: str | None) -> str:
-    profile_str = f"{bio}|{full_name}|{username or ''}"
-    return hashlib.sha256(profile_str.encode('utf-8')).hexdigest()
-
-@router.message(F.chat.id.in_(GROUP_IDS))
-async def check_user_info(message: Message):
-    if not message.from_user or message.from_user.is_bot:
-        return
-    
-    # 检查群组是否启用
-    cfg = get_group_config(message.chat.id)
-    if not cfg.get("enabled", True):
-        return
-    
-    user = message.from_user
-    user_id = user.id
-    
-    async with lock:
-        if user_id in exempt_users:
-            try:
-                chat_info = await bot.get_chat(user_id)
-                current_hash = get_profile_hash(
-                    (chat_info.bio or ""),
-                    user.full_name or "",
-                    user.username or ""
-                )
-                if current_hash == exempt_users[user_id]:
-                    return
-                else:
-                    exempt_users.pop(user_id, None)
-            except Exception:
-                pass
-    
-    try:
-        chat_info = await bot.get_chat(user_id)
-        bio = (chat_info.bio or "").lower()
-        
-        has_link_in_bio = cfg.get("check_bio_link", True) and any(x in bio for x in ["http://", "https://", "t.me/", "@"])
-        has_spam_in_bio = cfg.get("check_bio_keywords", True) and any(kw.lower() in bio for kw in cfg.get("bio_keywords", []))
-        bio_trigger = has_link_in_bio or has_spam_in_bio
-        
-        display_name = (user.full_name or "").lower()
-        has_spam_in_display = cfg.get("check_display_keywords", True) and any(kw.lower() in display_name for kw in cfg.get("display_keywords", []))
-        
-        if bio_trigger or has_spam_in_display:
-            reason_parts = []
-            if has_link_in_bio: 
-                reason_parts.append("简介含链接")
-            if has_spam_in_bio: 
-                reason_parts.append("简介含敏感词")
-            if has_spam_in_display: 
-                reason_parts.append("显示名称含敏感词")
-            
-            reason_text = " + ".join(reason_parts)
-            warning_text = (
-                f"⚠️ 检测到疑似广告引流规避（{reason_text}）\n"
-                f"用户ID: {user.id}\n"
-                f"显示名称: {user.full_name}\n"
-                f"举报数: 0"
-            )
-            
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="举报该用户", callback_data=f"report:{message.message_id}"),
-                InlineKeyboardButton(text="误判/豁免 👮‍♂️", callback_data=f"exempt:{message.message_id}")
-            ]])
-            warning = await message.reply(warning_text, reply_markup=keyboard)
-            
-            async with lock:
-                reports[message.message_id] = {
-                    "warning_id": warning.message_id,
-                    "suspect_id": user.id,
-                    "chat_id": message.chat.id,
-                    "reporters": set(),
-                    "original_text": warning_text,
-                    "original_message_id": message.message_id
-                }
-            await save_data()
-    except Exception as e:
-        print("用户信息检测异常:", e)
+def count_user_reported_messages(user_id: int, group_id: int) -> int:
+    key = f"{group_id}_{user_id}"
+    user_vio = user_violations.get(key, {})
+    reported_count = sum(1 for v in user_vio.values() if v.get("reported"))
+    return reported_count
 
 @router.message(F.chat.id.in_(GROUP_IDS), F.text)
-async def detect_short_or_filled_spam(message: Message):
+async def detect_violations(message: Message):
+    """5层统一检测逻辑（发言时）"""
     if not message.from_user or message.from_user.is_bot:
         return
     
-    # 检查群组是否启用
     cfg = get_group_config(message.chat.id)
     if not cfg.get("enabled", True):
         return
     
     user_id = message.from_user.id
+    group_id = message.chat.id
     
-    async with lock:
-        if user_id in exempt_users:
-            try:
-                chat_info = await bot.get_chat(user_id)
-                bio = (chat_info.bio or "")
-                full_name = message.from_user.full_name or ""
-                username = message.from_user.username
-                current_hash = get_profile_hash(bio, full_name, username)
-                if current_hash == exempt_users[user_id]:
-                    return
-                else:
-                    exempt_users.pop(user_id, None)
-            except Exception:
-                pass
+    # 检查举报禁言
+    reported_count = count_user_reported_messages(user_id, group_id)
+    threshold = cfg.get("reported_message_threshold", 2)
     
-    text = message.text
-    text_len = len(text)
-    now = time.time()
+    if reported_count >= threshold:
+        try:
+            mute_hours = cfg.get("violation_mute_hours", 1)
+            until_date = int(time.time()) + (mute_hours * 3600)
+            await bot.restrict_chat_member(
+                chat_id=group_id,
+                user_id=user_id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until_date
+            )
+            notice = f"您有{reported_count}条消息被举报，已禁言{mute_hours}小时。联系管理员解禁。"
+            await message.reply(notice)
+            return
+        except Exception as e:
+            print(f"禁言失败: {e}")
     
-    reason = None
+    # 统计5层触发
+    triggers = []
     
-    # 填充垃圾检测
-    if cfg.get("fill_garbage_detection", True):
-        min_raw = cfg.get("fill_garbage_min_raw_len", 12)
-        max_clean = cfg.get("fill_garbage_max_clean_len", 8)
-        space_ratio_threshold = cfg.get("fill_space_ratio", 0.30)
-        
-        if text_len >= min_raw:
-            cleaned = ''.join(c for c in text if c not in FILL_CHARS).strip()
-            clean_len = len(cleaned)
-            space_ratio = (text.count(" ") + text.count("　")) / text_len if text_len > 0 else 0
-            if (clean_len <= max_clean) or (space_ratio >= space_ratio_threshold and clean_len <= 12):
-                reason = "单次填充式规避"
-    
-    # 短消息检测
-    if not reason and cfg.get("short_msg_detection", True):
-        threshold = cfg.get("short_msg_threshold", 3)
-        min_count = cfg.get("min_consecutive_count", 2)
-        time_window = cfg.get("time_window_seconds", 60)
-        
-        if user_id not in user_short_msg_history:
-            user_short_msg_history[user_id] = deque(maxlen=15)
-        
-        history = user_short_msg_history[user_id]
-        while history and now - history[0][0] > time_window:
-            history.popleft()
-        history.append((now, text))
-        
-        recent = list(history)[-min_count:]
-        if len(recent) >= min_count and all(len(t.strip()) <= threshold for _, t in recent):
-            reason = "连续极短消息"
-    
-    if reason:
-        await send_warning(message, user_id, reason)
-
-async def send_warning(message: Message, user_id: int, reason: str):
+    # 1. 简介链接检测
     try:
-        warning_text = f"⚠️ 检测到疑似广告引流规避（{reason}）\n用户ID: {user_id}\n举报数: 0"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="举报该用户", callback_data=f"report:{message.message_id}"),
-            InlineKeyboardButton(text="误判/豁免 👮‍♂️", callback_data=f"exempt:{message.message_id}")
-        ]])
-        warning = await message.reply(warning_text, reply_markup=keyboard)
+        if cfg.get("check_bio_link", True):
+            chat_info = await bot.get_chat(user_id)
+            bio = (chat_info.bio or "").lower()
+            if any(x in bio for x in ["http://", "https://", "t.me/", "@"]):
+                triggers.append("简介链接")
+    except Exception:
+        pass
+    
+    # 2. 简介敏感词检测
+    try:
+        if cfg.get("check_bio_keywords", True):
+            chat_info = await bot.get_chat(user_id)
+            bio = (chat_info.bio or "").lower()
+            if any(kw.lower() in bio for kw in cfg.get("bio_keywords", [])):
+                triggers.append("简介敏感词")
+    except Exception:
+        pass
+    
+    # 3. 显示名称敏感词检测
+    if cfg.get("check_display_keywords", True):
+        display_name = (message.from_user.full_name or "").lower()
+        if any(kw.lower() in display_name for kw in cfg.get("display_keywords", [])):
+            triggers.append("名称敏感词")
+    
+    # 4. 消息敏感词检测
+    if cfg.get("check_message_keywords", True):
+        text_lower = message.text.lower()
+        for kw in cfg.get("message_keywords", []):
+            if kw.lower() in text_lower:
+                triggers.append("消息敏感词")
+                break
+    
+    # 5. 连续极短消息检测
+    if cfg.get("short_msg_detection", True):
+        text_len = len(message.text)
+        if text_len <= cfg.get("short_msg_threshold", 3):
+            if user_id not in user_short_msg_history:
+                user_short_msg_history[user_id] = deque(maxlen=15)
+            
+            history = user_short_msg_history[user_id]
+            now = time.time()
+            while history and now - history[0][0] > cfg.get("time_window_seconds", 60):
+                history.popleft()
+            history.append((now, message.text))
+            
+            recent = list(history)[-cfg.get("min_consecutive_count", 2):]
+            if len(recent) >= cfg.get("min_consecutive_count", 2):
+                if all(len(t.strip()) <= cfg.get("short_msg_threshold", 3) for _, t in recent):
+                    triggers.append("连续极短")
+    
+    # 6. 填充垃圾检测
+    if cfg.get("fill_garbage_detection", True):
+        text_len = len(message.text)
+        if text_len >= cfg.get("fill_garbage_min_raw_len", 12):
+            cleaned = ''.join(c for c in message.text if c not in FILL_CHARS).strip()
+            clean_len = len(cleaned)
+            space_ratio = (message.text.count(" ") + message.text.count("　")) / text_len if text_len > 0 else 0
+            if (clean_len <= cfg.get("fill_garbage_max_clean_len", 8)) or (space_ratio >= cfg.get("fill_space_ratio", 0.30)):
+                triggers.append("垃圾填充")
+    
+    # 三层处理逻辑
+    if len(triggers) >= 3:
+        # 3个及以上 → 自动直接封禁所有权限
+        try:
+            reason = "+".join(triggers)
+            await bot.restrict_chat_member(
+                chat_id=group_id,
+                user_id=user_id,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_polls=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                    can_change_info=False,
+                    can_invite_users=False,
+                    can_pin_messages=False
+                )
+            )
+            notice = f"检测到多项违规({reason})，已被自动封禁。有异议联系管理员。"
+            await message.reply(notice)
+        except Exception as e:
+            print(f"自动封禁失败: {e}")
+    
+    elif len(triggers) == 2:
+        # 2个 → 通知管理员处理
+        try:
+            reason = "+".join(triggers)
+            admin_msg = f"⚠️ ID {user_id} 触发多项检测\n\n触发: {reason}\n内容: {message.text[:80]}\n\n请处理"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚫 立即封禁", callback_data=f"admin_ban_user:{group_id}:{user_id}:{message.message_id}")]
+            ])
+            
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, admin_msg, reply_markup=keyboard)
+                except:
+                    pass
+        except Exception as e:
+            print(f"通知管理员失败: {e}")
+    
+    elif len(triggers) == 1:
+        # 1个 → 简洁警告
+        try:
+            reason = triggers[0]
+            warning_text = f"ID: {user_id}\n原因: {reason}"
+            warning = await message.reply(warning_text)
+            
+            async with lock:
+                reports[message.message_id] = {
+                    "warning_id": warning.message_id,
+                    "suspect_id": user_id,
+                    "chat_id": group_id,
+                    "reporters": set(),
+                    "original_text": warning_text,
+                    "original_message_id": message.message_id
+                }
+            await save_data()
+        except Exception as e:
+            print(f"发送警告失败: {e}")
+
+@router.callback_query(F.data.startswith("admin_ban_user:"))
+async def handle_admin_ban_user(callback: CallbackQuery):
+    """管理员点击封禁"""
+    try:
+        parts = callback.data.split(":")
+        group_id = int(parts[1])
+        user_id = int(parts[2])
         
-        async with lock:
-            reports[message.message_id] = {
-                "warning_id": warning.message_id,
-                "suspect_id": user_id,
-                "chat_id": message.chat.id,
-                "reporters": set(),
-                "original_text": warning_text,
-                "original_message_id": message.message_id
-            }
-        await save_data()
+        if callback.from_user.id not in ADMIN_IDS:
+            await callback.answer("仅管理员可操作", show_alert=True)
+            return
+        
+        await bot.restrict_chat_member(
+            chat_id=group_id,
+            user_id=user_id,
+            permissions=ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False
+            )
+        )
+        
+        await callback.answer("✅ 已封禁", show_alert=True)
     except Exception as e:
-        print("发送警告失败:", e)
+        print(f"管理员封禁失败: {e}")
+        await callback.answer("❌ 失败", show_alert=True)
 
 @router.callback_query(F.data.startswith("report:"))
 async def handle_report(callback: CallbackQuery):
@@ -1157,44 +1284,45 @@ async def handle_report(callback: CallbackQuery):
         
         async with lock:
             if original_id not in reports:
-                await callback.answer("该举报已过期", show_alert=True)
+                await callback.answer("已过期", show_alert=True)
                 return
             data = reports[original_id]
             if reporter_id in data["reporters"]:
-                await callback.answer("您已经举报过了", show_alert=True)
+                await callback.answer("已举报过", show_alert=True)
                 return
             data["reporters"].add(reporter_id)
             count = len(data["reporters"])
             suspect_id = data["suspect_id"]
             warning_id = data["warning_id"]
             chat_id = data["chat_id"]
-            original_text = data.get("original_text", "⚠️ 检测到疑似广告引流规避\n用户ID: 未知")
+            original_text = data.get("original_text", "")
         
-        lines = original_text.splitlines()
-        prefix = "\n".join(lines[:2]) if len(lines) >= 2 else original_text
+        # 更新违规记录
+        key = f"{chat_id}_{suspect_id}"
+        if key not in user_violations:
+            user_violations[key] = {}
+        user_violations[key][str(original_id)] = {"reported": True, "time": time.time()}
+        await save_user_violations()
         
-        if count >= 3:
-            status = f"🚨 超3人举报 已通知管理员\n\n举报人数: {count}"
-            await bot.send_message(list(ADMIN_IDS)[0], f"多人举报\n用户ID: {suspect_id}\n群组: {chat_id}")
-        else:
-            status = f"🚨 已有人举报\n\n举报人数: {count}"
+        # 编辑机器人消息
+        lines = original_text.split("\n")
+        new_text = f"{lines[0]}\n{lines[1] if len(lines) > 1 else ''}\n举报: {count}人"
         
-        new_text = f"{prefix}\n{status}"
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=warning_id,
+                text=new_text,
+                reply_markup=None
+            )
+        except:
+            pass
         
-        keyboard_list = callback.message.reply_markup.inline_keyboard[:] if callback.message.reply_markup else []
-        if not any("ban" in str(btn.callback_data) for row in keyboard_list for btn in row):
-            keyboard_list.append([
-                InlineKeyboardButton(text="封禁24小时（👮‍♀️）", callback_data=f"ban24h:{original_id}"),
-                InlineKeyboardButton(text="永久封禁（👮‍♂️）", callback_data=f"banperm:{original_id}")
-            ])
-        new_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_list)
-        
-        await bot.edit_message_text(chat_id=chat_id, message_id=warning_id, text=new_text, reply_markup=new_keyboard)
+        await callback.answer(f"✅ 举报成功({count}人)", show_alert=True)
         await save_data()
-        await callback.answer(f"举报成功！当前 {count} 人")
     except Exception as e:
-        print("举报处理异常:", e)
-        await callback.answer("操作失败", show_alert=True)
+        print("举报异常:", e)
+        await callback.answer("失败", show_alert=True)
 
 @router.callback_query(F.data.startswith(("ban24h:", "banperm:")))
 async def handle_ban(callback: CallbackQuery):
@@ -1210,13 +1338,12 @@ async def handle_ban(callback: CallbackQuery):
         
         async with lock:
             if original_id not in reports:
-                await callback.answer("记录已过期", show_alert=True)
+                await callback.answer("已过期", show_alert=True)
                 return
             data = reports[original_id]
             suspect_id = data["suspect_id"]
             warning_id = data["warning_id"]
-            original_message_id = data.get("original_message_id")
-            original_text = data.get("original_text", "⚠️ 检测到疑似广告引流规避\n用户ID: 未知")
+            original_text = data.get("original_text", "")
         
         until_date = int(time.time()) + 86400 if action == "ban24h" else None
         await bot.restrict_chat_member(
@@ -1235,10 +1362,13 @@ async def handle_ban(callback: CallbackQuery):
             until_date=until_date
         )
         
-        ban_type = "禁言24小时" if action == "ban24h" else "永久限制"
-        lines = original_text.splitlines()
-        prefix = "\n".join(lines[:2]) if len(lines) >= 2 else original_text
-        new_text = f"{prefix}\n🚨 已由管理员{ban_type}\n举报人数: {len(data['reporters'])}"
+        ban_type = "24h禁言" if action == "ban24h" else "永封"
+        lines = original_text.split("\n")
+        id_part = lines[0] if lines else "ID"
+        reason_part = lines[1] if len(lines) > 1 else "违规"
+        report_count = len(data.get("reporters", set()))
+        
+        new_text = f"{id_part}\n{reason_part}\n举报: {report_count}\n已{ban_type}"
         
         await bot.edit_message_text(
             chat_id=chat_id,
@@ -1247,22 +1377,14 @@ async def handle_ban(callback: CallbackQuery):
             reply_markup=None
         )
         
-        await callback.answer(f"已{ban_type}", show_alert=True)
-        print(f"管理员 {caller_id} 对 {suspect_id} 执行 {ban_type} 在群 {chat_id}")
+        await callback.answer(f"✅ 已{ban_type}", show_alert=True)
         
         async def delayed_delete():
             await asyncio.sleep(10)
             try:
                 await bot.delete_message(chat_id, warning_id)
-                print(f"删除警告消息 {warning_id}")
-            except TelegramBadRequest as e:
-                print(f"删除警告失败 {warning_id}: {e}")
-            try:
-                if original_message_id:
-                    await bot.delete_message(chat_id, original_message_id)
-                    print(f"删除用户原消息 {original_message_id}")
-            except TelegramBadRequest as e:
-                print(f"删除用户消息失败 {original_message_id}: {e}")
+            except:
+                pass
         
         asyncio.create_task(delayed_delete())
         
@@ -1271,15 +1393,10 @@ async def handle_ban(callback: CallbackQuery):
         await save_data()
     
     except TelegramBadRequest as e:
-        if "user_not_participant" in str(e).lower():
-            await callback.answer("用户不在群组", show_alert=True)
-        elif "not enough rights" in str(e).lower():
-            await callback.answer("机器人缺少权限", show_alert=True)
-        else:
-            await callback.answer(f"操作失败: {str(e)}", show_alert=True)
+        await callback.answer("失败", show_alert=True)
     except Exception as e:
         print("封禁异常:", e)
-        await callback.answer("操作失败", show_alert=True)
+        await callback.answer("失败", show_alert=True)
 
 @router.callback_query(F.data.startswith("exempt:"))
 async def handle_exempt(callback: CallbackQuery):
@@ -1294,7 +1411,7 @@ async def handle_exempt(callback: CallbackQuery):
         
         async with lock:
             if original_id not in reports:
-                await callback.answer("记录已过期", show_alert=True)
+                await callback.answer("已过期", show_alert=True)
                 return
             data = reports[original_id]
             suspect_id = data["suspect_id"]
@@ -1304,26 +1421,25 @@ async def handle_exempt(callback: CallbackQuery):
         bio = (suspect_user.bio or "")
         full_name = f"{suspect_user.first_name or ''} {suspect_user.last_name or ''}".strip()
         username = suspect_user.username
-        profile_hash = get_profile_hash(bio, full_name, username)
+        profile_hash = hashlib.sha256(f"{bio}|{full_name}|{username or ''}".encode('utf-8')).hexdigest()
         
         async with lock:
             exempt_users[suspect_id] = profile_hash
             await bot.delete_message(chat_id, warning_id)
         
-        await callback.answer("已豁免此人 👮‍♂️\n后续资料不变将不再检测", show_alert=True)
+        await callback.answer("✅ 已豁免", show_alert=True)
         
         async with lock:
             reports.pop(original_id, None)
         await save_data()
     
-    except TelegramBadRequest as e:
-        await callback.answer(f"操作失败: {str(e)}", show_alert=True)
+    except TelegramBadRequest:
+        await callback.answer("失败", show_alert=True)
     except Exception as e:
         print("豁免异常:", e)
-        await callback.answer("操作失败", show_alert=True)
+        await callback.answer("失败", show_alert=True)
 
 async def cleanup_deleted_messages():
-    """定期清理已删除的消息记录"""
     while True:
         await asyncio.sleep(300)
         to_remove = []
@@ -1342,7 +1458,6 @@ async def cleanup_deleted_messages():
                     try:
                         await bot.delete_message(data["chat_id"], data["warning_id"])
                         to_remove.append(orig_id)
-                        print(f"同步删除警告: 原消息 {orig_id} 已删")
                     except Exception:
                         pass
         if to_remove:
@@ -1356,6 +1471,7 @@ async def main():
     print("🚀 机器人启动成功")
     await load_config()
     await load_data()
+    await load_user_violations()
     asyncio.create_task(cleanup_deleted_messages())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
