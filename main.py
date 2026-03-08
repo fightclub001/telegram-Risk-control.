@@ -70,6 +70,10 @@ media_report_day_count = {}  # (uid, date_str) -> count
 # 召唤代发：未解锁用户发「召唤」后下一次媒体由机器人代发（避免炸群）
 summon_pending = {}  # (group_id, user_id) -> timestamp
 SUMMON_TIMEOUT_SEC = 300
+# 举报按钮规则：管理员未点击封禁/误判豁免前，按钮永不过期（不因原消息被删而移除）。
+# (1) 机器人自动封禁 (2) 管理员点击封禁：移除按钮并保留/更新文案；(3) 管理员点击误判豁免：删除警告消息。
+# 超过此时长仍未处理：仅隐藏按钮、保留消息文本，并从内存移除记录。
+REPORT_BUTTON_HIDE_AFTER_SEC = 24 * 3600
 
 # ==================== 配置函数 ====================
 def _default_group_config():
@@ -105,6 +109,7 @@ def _default_group_config():
         "repeat_window_seconds": 2 * 3600,
         "repeat_max_count": 3,
         "repeat_ban_seconds": 86400,
+        "repeat_exempt_keywords": [],  # 含任一词的消息不触发重复发言检测（白名单词）
         "media_unlock_msg_count": 50,
         "media_unlock_boosts": 4,
         "media_unlock_whitelist": [],
@@ -361,6 +366,7 @@ class AdminStates(StatesGroup):
     EditRepeatWindow = State()
     EditRepeatMaxCount = State()
     EditRepeatBanSec = State()
+    EditRepeatExemptKeywords = State()
     EditMediaUnlockMsg = State()
     EditMediaUnlockBoosts = State()
     EditMediaReportCooldown = State()
@@ -509,10 +515,13 @@ def get_repeat_menu_keyboard(group_id: int):
     w = cfg.get("repeat_window_seconds", 7200)
     m = cfg.get("repeat_max_count", 3)
     b = cfg.get("repeat_ban_seconds", 86400)
+    kw = cfg.get("repeat_exempt_keywords", []) or []
+    n_kw = len(kw) if isinstance(kw, list) else 0
     buttons = [
         [InlineKeyboardButton(text=f"⏱ 时间窗口: {fmt_duration(w)}", callback_data=f"edit_repeat_window:{group_id}")],
         [InlineKeyboardButton(text=f"触发次数: {m}次", callback_data=f"edit_repeat_max:{group_id}")],
         [InlineKeyboardButton(text=f"🔇 首次禁言: {fmt_duration(b)}", callback_data=f"edit_repeat_ban:{group_id}")],
+        [InlineKeyboardButton(text=f"📋 豁免词(白名单) ({n_kw})", callback_data=f"edit_repeat_exempt:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1161,12 +1170,47 @@ async def repeat_submenu(callback: CallbackQuery):
         w = cfg.get("repeat_window_seconds", 7200)
         m = cfg.get("repeat_max_count", 3)
         b = cfg.get("repeat_ban_seconds", 86400)
-        text = f"<b>{title}</b> › 重复发言\n\n⏱ 窗口: {fmt_duration(w)}\n触发: {m} 次\n🔇 首次禁言: {fmt_duration(b)}"
+        kw = cfg.get("repeat_exempt_keywords", []) or []
+        n_kw = len(kw) if isinstance(kw, list) else 0
+        text = f"<b>{title}</b> › 重复发言\n\n⏱ 窗口: {fmt_duration(w)}\n触发: {m} 次\n🔇 首次禁言: {fmt_duration(b)}\n📋 豁免词: {n_kw} 个"
         kb = get_repeat_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("edit_repeat_exempt:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_repeat_exempt(callback: CallbackQuery, state: FSMContext):
+    """编辑重复发言豁免词（含任一词的消息不触发重复检测）"""
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        kw = cfg.get("repeat_exempt_keywords", []) or []
+        if not isinstance(kw, list):
+            kw = []
+        text = "编辑重复发言豁免词（白名单）\n含任一词的消息不触发重复检测。一行一个：\n\n" + "\n".join(kw) + "\n\n发送新列表或 /clear 清空"
+        await callback.message.edit_text(text, reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditRepeatExemptKeywords)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditRepeatExemptKeywords), F.from_user.id.in_(ADMIN_IDS))
+async def process_repeat_exempt(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        if message.text and message.text.strip() == "/clear":
+            cfg["repeat_exempt_keywords"] = []
+        else:
+            cfg["repeat_exempt_keywords"] = [x.strip() for x in (message.text or "").strip().splitlines() if x.strip()]
+        await save_config()
+        await message.reply(f"✅ 已更新（{len(cfg['repeat_exempt_keywords'])} 个豁免词）", reply_markup=get_repeat_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except Exception as e:
+        await message.reply(f"❌ {str(e)}")
 
 @router.callback_query(F.data.startswith("edit_repeat_window:"), F.from_user.id.in_(ADMIN_IDS))
 async def edit_repeat_window(callback: CallbackQuery, state: FSMContext):
@@ -1861,6 +1905,11 @@ async def handle_repeat_message(message: Message) -> bool:
     user_id = message.from_user.id
     group_id = message.chat.id
     cfg = get_group_config(group_id)
+    exempt_kw = cfg.get("repeat_exempt_keywords", []) or []
+    if isinstance(exempt_kw, list) and exempt_kw:
+        text_lower = (message.text or "").lower()
+        if any((k or "").strip().lower() in text_lower for k in exempt_kw if k):
+            return False
     window_sec = cfg.get("repeat_window_seconds", 2 * 3600)
     max_count = cfg.get("repeat_max_count", 3)
     ban_sec = cfg.get("repeat_ban_seconds", 86400)
@@ -1998,6 +2047,8 @@ async def load_data():
                 data = json.load(f)
                 for k, v in data.items():
                     v["reporters"] = set(v.get("reporters", []))
+                    if "timestamp" not in v:
+                        v["timestamp"] = time.time()
                     reports[int(k)] = v
     except Exception as e:
         print("数据加载失败（首次正常）:", e)
@@ -2005,7 +2056,10 @@ async def load_data():
 async def save_data():
     async with lock:
         try:
-            data_to_save = {str(k): {**v, "reporters": list(v["reporters"])} for k, v in reports.items()}
+            data_to_save = {
+                str(k): {**v, "reporters": list(v["reporters"]), "timestamp": v.get("timestamp", time.time())}
+                for k, v in reports.items()
+            }
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(data_to_save, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -2324,7 +2378,8 @@ async def detect_and_warn(message: Message):
                     "reason": reason,
                     "trigger_count": len(triggers),
                     "suspect_name": display_name,
-                    "original_message_id": message.message_id
+                    "original_message_id": message.message_id,
+                    "timestamp": time.time(),
                 }
             await save_data()
         except Exception as e:
@@ -2563,7 +2618,7 @@ async def handle_ban(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("exempt:"))
 async def handle_exempt(callback: CallbackQuery):
-    """豁免用户"""
+    """误判豁免：删除警告消息并从 reports 移除"""
     try:
         msg_id = int(callback.data.split(":", 1)[1])
         caller_id = callback.from_user.id
@@ -2580,10 +2635,9 @@ async def handle_exempt(callback: CallbackQuery):
             await callback.answer("仅管理员操作", show_alert=True)
             return
         
-        # 删除警告消息
         try:
             await bot.delete_message(group_id, warning_id)
-        except:
+        except Exception:
             pass
         
         await callback.answer("✅ 已豁免")
@@ -2765,23 +2819,29 @@ async def broadcast_media_rules_every_2h():
                 print(f"广播媒体规则失败 {gid}: {e}")
 
 async def cleanup_deleted_messages():
-    """清理已删除的消息记录（每 10 分钟，降低 API 调用）"""
+    """每 10 分钟检查：仅当举报记录超过 24 小时且未被管理员处理时，隐藏按钮、保留文案并从内存移除。
+    不因原消息是否被删而移除记录；封禁/豁免由各自 handler 编辑文案并去掉按钮。"""
     while True:
         await asyncio.sleep(600)
+        now = time.time()
         to_remove = []
         async with lock:
             check_list = list(reports.items())
         for msg_id, data in check_list:
+            age = now - data.get("timestamp", 0)
+            if age < REPORT_BUTTON_HIDE_AFTER_SEC:
+                continue
+            group_id = data["chat_id"]
+            warning_id = data["warning_id"]
             try:
-                test_msg = await bot.forward_message(
-                    chat_id=list(ADMIN_IDS)[0],
-                    from_chat_id=data["chat_id"],
-                    message_id=msg_id
+                await bot.edit_message_reply_markup(
+                    chat_id=group_id,
+                    message_id=warning_id,
+                    reply_markup=None
                 )
-                await bot.delete_message(list(ADMIN_IDS)[0], test_msg.message_id)
             except TelegramBadRequest:
-                # 仅从内存移除记录，不删除机器人警告消息，保证群内警告始终保留
-                to_remove.append(msg_id)
+                pass
+            to_remove.append(msg_id)
         if to_remove:
             async with lock:
                 for oid in to_remove:
