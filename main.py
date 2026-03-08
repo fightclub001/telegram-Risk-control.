@@ -48,6 +48,7 @@ DATA_FILE = os.path.join(DATA_DIR, "reports.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 USER_VIOLATIONS_FILE = os.path.join(DATA_DIR, "user_violations.json")
 MEDIA_STATS_FILE = os.path.join(DATA_DIR, "media_stats.json")
+REPEAT_LEVEL_FILE = os.path.join(DATA_DIR, "repeat_levels.json")
 
 reports = {}
 lock = asyncio.Lock()
@@ -95,7 +96,7 @@ def _default_group_config():
             "delete_user_sec": 0,
             "delete_bot_sec": 0
         },
-        "exempt_users": {},
+        "exempt_users": [],  # 用户ID列表，豁免后不触发警告
         "repeat_window_seconds": 2 * 3600,
         "repeat_max_count": 3,
         "repeat_ban_seconds": 86400,
@@ -104,6 +105,9 @@ def _default_group_config():
         "media_unlock_whitelist": [],
         "media_report_cooldown_sec": 20 * 60,
         "media_report_max_per_day": 3,
+        "media_report_delete_threshold": 3,
+        "media_rules_broadcast": True,
+        "media_rules_broadcast_interval_minutes": 120,
     }
 
 async def load_config():
@@ -144,8 +148,21 @@ async def load_user_violations():
     except Exception as e:
         print(f"违规记录加载失败: {e}")
 
+def _prune_user_violations():
+    """保留每用户最近 50 条且 30 天内的举报记录，避免文件无限增长"""
+    now = time.time()
+    cutoff = now - 30 * 86400
+    for key in list(user_violations.keys()):
+        entries = user_violations.get(key, {})
+        if not isinstance(entries, dict):
+            continue
+        items = [(k, v) for k, v in entries.items() if (v.get("time") or 0) >= cutoff]
+        items.sort(key=lambda x: x[1].get("time", 0), reverse=True)
+        user_violations[key] = dict(items[:50])
+
 async def save_user_violations():
     try:
+        _prune_user_violations()
         with open(USER_VIOLATIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(user_violations, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -178,8 +195,46 @@ async def save_media_stats():
     except Exception as e:
         print(f"媒体统计保存失败: {e}")
 
+def load_repeat_levels():
+    global repeat_violation_level
+    try:
+        if os.path.exists(REPEAT_LEVEL_FILE):
+            with open(REPEAT_LEVEL_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            repeat_violation_level = {}
+            for k, v in data.items():
+                parts = k.split("_", 1)
+                if len(parts) == 2:
+                    try:
+                        repeat_violation_level[(int(parts[0]), int(parts[1]))] = int(v)
+                    except ValueError:
+                        pass
+    except Exception as e:
+        print(f"重复违规级别加载失败: {e}")
+
+async def save_repeat_levels():
+    try:
+        data = {f"{g}_{u}": v for (g, u), v in repeat_violation_level.items()}
+        with open(REPEAT_LEVEL_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"重复违规级别保存失败: {e}")
+
 def _media_key(group_id: int, user_id: int) -> str:
     return f"{group_id}_{user_id}"
+
+async def _refresh_user_boosts(group_id: int, user_id: int) -> None:
+    """用 Telegram API 拉取用户对本群的助力数并写回 media_stats（仅会员可助力）"""
+    if not media_stats_loaded:
+        return
+    try:
+        res = await bot.get_user_chat_boosts(chat_id=group_id, user_id=user_id)
+        count = len(getattr(res, "boosts", []) or [])
+        key = _media_key(group_id, user_id)
+        media_stats["boosts"][key] = count
+        await save_media_stats()
+    except Exception:
+        pass
 
 def _can_send_media(group_id: int, user_id: int, username: str | None = None) -> bool:
     """是否已解锁发媒体：白名单 / 合规消息数 / 助力次数（助力需 Telegram 会员，仅会员可为群组助力）。"""
@@ -257,6 +312,9 @@ class AdminStates(StatesGroup):
     EditMediaReportMaxDay = State()
     EditMediaWhitelistAdd = State()
     EditMediaWhitelistRemove = State()
+    EditExemptUsers = State()
+    EditMediaDeleteThreshold = State()
+    EditMediaBroadcastInterval = State()
 
 # ==================== UI 键盘 ====================
 def get_main_menu_keyboard():
@@ -365,11 +423,20 @@ def get_autoreply_menu_keyboard(group_id: int):
 def get_basic_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     enabled = "✅" if cfg.get("enabled") else "❌"
+    exempt = cfg.get("exempt_users") or []
+    n = len(exempt) if isinstance(exempt, list) else 0
     buttons = [
         [InlineKeyboardButton(text=f"状态: {enabled}", callback_data=f"toggle_group:{group_id}")],
+        [InlineKeyboardButton(text=f"🛡️ 豁免用户 ({n})", callback_data=f"submenu_exempt:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_exempt_menu_keyboard(group_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 编辑", callback_data=f"edit_exempt:{group_id}")],
+        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_basic:{group_id}")],
+    ])
 
 def get_repeat_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
@@ -390,10 +457,14 @@ def get_media_perm_menu_keyboard(group_id: int):
     boost = cfg.get("media_unlock_boosts", 4)
     wl = cfg.get("media_unlock_whitelist", [])
     n = len(wl) if isinstance(wl, list) else 0
+    broadcast_on = "✅" if cfg.get("media_rules_broadcast", True) else "❌"
+    interval = cfg.get("media_rules_broadcast_interval_minutes", 120)
     buttons = [
         [InlineKeyboardButton(text=f"解锁所需消息数: {msg}", callback_data=f"edit_media_msg:{group_id}")],
         [InlineKeyboardButton(text=f"解锁所需助力: {boost}", callback_data=f"edit_media_boosts:{group_id}")],
         [InlineKeyboardButton(text=f"📋 媒体解锁白名单 ({n})", callback_data=f"submenu_media_whitelist:{group_id}")],
+        [InlineKeyboardButton(text=f"规则广播: {broadcast_on}", callback_data=f"toggle_media_broadcast:{group_id}")],
+        [InlineKeyboardButton(text=f"广播间隔: {interval}分钟", callback_data=f"edit_media_broadcast_interval:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -415,9 +486,11 @@ def get_media_report_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     cooldown = cfg.get("media_report_cooldown_sec", 20 * 60)
     max_day = cfg.get("media_report_max_per_day", 3)
+    del_th = cfg.get("media_report_delete_threshold", 3)
     buttons = [
         [InlineKeyboardButton(text=f"连续举报冷却: {cooldown // 60}分钟", callback_data=f"edit_media_cooldown:{group_id}")],
         [InlineKeyboardButton(text=f"每日举报上限: {max_day}次", callback_data=f"edit_media_maxday:{group_id}")],
+        [InlineKeyboardButton(text=f"举报达多少人删媒体: {del_th}", callback_data=f"edit_media_delete_threshold:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1141,6 +1214,45 @@ async def process_media_boosts(message: Message, state: FSMContext):
     except (ValueError, Exception) as e:
         await message.reply(f"❌ 请输入数字: {e}")
 
+@router.callback_query(F.data.startswith("toggle_media_broadcast:"), F.from_user.id.in_(ADMIN_IDS))
+async def toggle_media_broadcast(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        cfg["media_rules_broadcast"] = not cfg.get("media_rules_broadcast", True)
+        await save_config()
+        on = "✅" if cfg["media_rules_broadcast"] else "❌"
+        await callback.answer(f"规则广播: {on}", show_alert=True)
+        await callback.message.edit_text(callback.message.text or "媒体权限", reply_markup=get_media_perm_menu_keyboard(group_id))
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("edit_media_broadcast_interval:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_media_broadcast_interval(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("media_rules_broadcast_interval_minutes", 120)
+        await callback.message.edit_text(f"规则广播间隔（分钟）（当前: {current}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditMediaBroadcastInterval)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditMediaBroadcastInterval), F.from_user.id.in_(ADMIN_IDS))
+async def process_media_broadcast_interval(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["media_rules_broadcast_interval_minutes"] = max(1, int(message.text.strip()))
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_media_perm_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
 @router.callback_query(F.data.startswith("submenu_media_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
 async def media_whitelist_submenu(callback: CallbackQuery):
     try:
@@ -1214,7 +1326,8 @@ async def media_report_submenu(callback: CallbackQuery):
         cfg = get_group_config(group_id)
         cooldown = cfg.get("media_report_cooldown_sec", 20 * 60)
         max_day = cfg.get("media_report_max_per_day", 3)
-        text = f"媒体举报\n连续举报冷却: {cooldown // 60}分钟\n每日上限: {max_day}次"
+        del_th = cfg.get("media_report_delete_threshold", 3)
+        text = f"媒体举报\n连续举报冷却: {cooldown // 60}分钟\n每日上限: {max_day}次\n举报达{del_th}人删媒体"
         kb = get_media_report_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1267,6 +1380,32 @@ async def process_media_maxday(message: Message, state: FSMContext):
         group_id = data.get("group_id")
         cfg = get_group_config(group_id)
         cfg["media_report_max_per_day"] = int(message.text.strip())
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_media_report_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
+@router.callback_query(F.data.startswith("edit_media_delete_threshold:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_media_delete_threshold(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("media_report_delete_threshold", 3)
+        await callback.message.edit_text(f"举报达多少人删除媒体（当前: {current}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditMediaDeleteThreshold)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditMediaDeleteThreshold), F.from_user.id.in_(ADMIN_IDS))
+async def process_media_delete_threshold(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["media_report_delete_threshold"] = max(1, int(message.text.strip()))
         await save_config()
         await message.reply("✅ 已更新", reply_markup=get_media_report_menu_keyboard(group_id))
         await state.set_state(AdminStates.GroupMenu)
@@ -1483,6 +1622,52 @@ async def toggle_group(callback: CallbackQuery):
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
+@router.callback_query(F.data.startswith("submenu_exempt:"), F.from_user.id.in_(ADMIN_IDS))
+async def exempt_submenu(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        exempt = cfg.get("exempt_users") or []
+        if isinstance(exempt, dict):
+            exempt = list(exempt.keys())
+        text = f"豁免用户（不触发警告）\n当前: " + (", ".join(str(x) for x in exempt) if exempt else "（无）")
+        await callback.message.edit_text(text, reply_markup=get_exempt_menu_keyboard(group_id))
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("edit_exempt:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_exempt(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        exempt = cfg.get("exempt_users") or []
+        if isinstance(exempt, dict):
+            exempt = list(exempt.keys())
+        text = f"编辑豁免用户（用户ID，一行一个）\n\n" + "\n".join(str(x) for x in exempt) + "\n\n发送新列表或 /clear 清空"
+        await callback.message.edit_text(text, reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditExemptUsers)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditExemptUsers), F.from_user.id.in_(ADMIN_IDS))
+async def process_exempt(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        if message.text.strip() == "/clear":
+            cfg["exempt_users"] = []
+        else:
+            cfg["exempt_users"] = [x.strip() for x in message.text.strip().splitlines() if x.strip()]
+        await save_config()
+        await message.reply(f"✅ 已更新（{len(cfg['exempt_users'])} 人）", reply_markup=get_exempt_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except Exception as e:
+        await message.reply(f"❌ {str(e)}")
+
 # ==================== 状态查看 ====================
 @router.callback_query(F.data == "view_status", F.from_user.id.in_(ADMIN_IDS))
 async def view_status(callback: CallbackQuery):
@@ -1502,10 +1687,13 @@ FILL_CHARS = set(r" .,，。！？*\\\~`-_=+[]{}()\"'\\|\n\t\r　")
 
 user_short_msg_history = {}
 
-# key: (group_id, user_id, normalized_text) -> deque[timestamp]
+# key: (group_id, user_id, normalized_text) -> deque[timestamp]；key 数量上限 REPEAT_HISTORY_MAX_KEYS，超则淘汰最久未用
 repeat_message_history = {}
-# key: (group_id, user_id) -> int（0=未因重复违规，1=已因重复违规被禁言 1 次，2=已因重复违规被永封）
+repeat_message_history_last = {}  # key -> last_activity_time，用于淘汰
+REPEAT_HISTORY_MAX_KEYS = 20000
+# key: (group_id, user_id) -> int（0/1/2）；持久化到 REPEAT_LEVEL_FILE）
 repeat_violation_level = {}
+MEDIA_REPORT_LAST_MAX = 5000
 
 
 def _normalize_text(text: str) -> str:
@@ -1546,8 +1734,13 @@ async def handle_repeat_message(message: Message) -> bool:
     now = time.time()
 
     if key not in repeat_message_history:
+        if len(repeat_message_history) >= REPEAT_HISTORY_MAX_KEYS:
+            for k in sorted(repeat_message_history_last.keys(), key=lambda k: repeat_message_history_last.get(k, 0))[:5000]:
+                repeat_message_history.pop(k, None)
+                repeat_message_history_last.pop(k, None)
         repeat_message_history[key] = deque(maxlen=10)
     history = repeat_message_history[key]
+    repeat_message_history_last[key] = now
 
     while history and now - history[0] > window_sec:
         history.popleft()
@@ -1593,6 +1786,7 @@ async def handle_repeat_message(message: Message) -> bool:
                 return False
 
             repeat_violation_level[level_key] = 1
+            await save_repeat_levels()
 
             try:
                 await message.delete()
@@ -1634,6 +1828,7 @@ async def handle_repeat_message(message: Message) -> bool:
                 return False
 
             repeat_violation_level[level_key] = 2
+            await save_repeat_levels()
 
             try:
                 await message.delete()
@@ -1754,6 +1949,7 @@ async def on_media_message(message: Message):
     group_id = message.chat.id
     now = time.time()
     username = message.from_user.username if message.from_user else None
+    await _refresh_user_boosts(group_id, user_id)
     if not _can_send_media(group_id, user_id, username):
         # 召唤代发：用户已发「召唤」则本次由机器人代发
         sk = (group_id, user_id)
@@ -1813,6 +2009,13 @@ async def detect_and_warn(message: Message):
     user_id = message.from_user.id
     group_id = message.chat.id
 
+    # 豁免用户不触发任何警告与检测（名单存 config，持久化）
+    exempt = cfg.get("exempt_users") or []
+    if isinstance(exempt, dict):
+        exempt = list(exempt.keys())
+    if str(user_id) in exempt:
+        return
+
     # 「召唤」：未解锁用户可让机器人代发下一次媒体（为避免炸群）
     if message.text and message.text.strip() == "召唤":
         uname = message.from_user.username if message.from_user else None
@@ -1821,8 +2024,9 @@ async def detect_and_warn(message: Message):
             await message.reply("请直接发送你要发布的图片/视频/语音，我将代你发出（为避免炸群）。")
         return
 
-    # 「权限」查询发媒体进度
+    # 「权限」查询发媒体进度（拉取最新助力数）
     if message.text and message.text.strip() == "权限":
+        await _refresh_user_boosts(group_id, user_id)
         key = _media_key(group_id, user_id)
         count = media_stats["message_counts"].get(key, 0)
         unlocked = media_stats["unlocked"].get(key, False)
@@ -1926,14 +2130,15 @@ async def detect_and_warn(message: Message):
                 triggers.append("内容词汇")
                 break
     
-    # 5. 连续极短消息
+    # 5. 连续极短消息（按群+用户统计，避免跨群误判）
     if cfg.get("short_msg_detection", True):
         text_len = len(message.text)
         if text_len <= cfg.get("short_msg_threshold", 3):
-            if user_id not in user_short_msg_history:
-                user_short_msg_history[user_id] = deque(maxlen=15)
+            short_key = (group_id, user_id)
+            if short_key not in user_short_msg_history:
+                user_short_msg_history[short_key] = deque(maxlen=15)
             
-            history = user_short_msg_history[user_id]
+            history = user_short_msg_history[short_key]
             now = time.time()
             while history and now - history[0][0] > cfg.get("time_window_seconds", 60):
                 history.popleft()
@@ -2278,13 +2483,21 @@ async def handle_media_report(callback: CallbackQuery):
         max_per_day = cfg.get("media_report_max_per_day", 3)
         uid = callback.from_user.id
         now = time.time()
-        day_key = (uid, time.strftime("%Y-%m-%d", time.localtime(now)))
+        today_str = time.strftime("%Y-%m-%d", time.localtime(now))
+        for k in list(media_report_day_count.keys()):
+            if k[1] != today_str:
+                media_report_day_count.pop(k, None)
+        day_key = (uid, today_str)
 
         day_count = media_report_day_count.get(day_key, 0)
         if day_count >= max_per_day:
             await callback.answer("今日举报次数已达上限，如有问题请直接联系管理员。", show_alert=True)
             return
 
+        if len(media_report_last) >= MEDIA_REPORT_LAST_MAX:
+            items = sorted(media_report_last.items(), key=lambda x: x[1][1])[:1000]
+            for u, _ in items:
+                media_report_last.pop(u, None)
         last = media_report_last.get(uid)
         if last:
             last_mid, last_ts = last
@@ -2321,7 +2534,8 @@ async def handle_media_report(callback: CallbackQuery):
             pass
         await callback.answer()
 
-        if report_count == 3:
+        delete_threshold = cfg.get("media_report_delete_threshold", 3)
+        if report_count >= delete_threshold:
             try:
                 await bot.delete_message(chat_id, media_msg_id)
             except Exception:
@@ -2406,22 +2620,26 @@ def _media_rules_text(group_id: int) -> str:
     )
 
 async def broadcast_media_rules_every_2h():
-    """每 2 小时向各群发送一次媒体权限规则"""
+    """按群配置间隔向各群发送媒体权限规则（可关、可调间隔）"""
     while True:
-        await asyncio.sleep(2 * 3600)
+        interval_min = 120
+        for gid in GROUP_IDS:
+            m = get_group_config(gid).get("media_rules_broadcast_interval_minutes", 120)
+            interval_min = min(interval_min, max(1, m))
+        await asyncio.sleep(interval_min * 60)
         for gid in GROUP_IDS:
             try:
                 cfg = get_group_config(gid)
-                if not cfg.get("enabled", True):
+                if not cfg.get("enabled", True) or not cfg.get("media_rules_broadcast", True):
                     continue
                 await bot.send_message(gid, _media_rules_text(gid))
             except Exception as e:
                 print(f"广播媒体规则失败 {gid}: {e}")
 
 async def cleanup_deleted_messages():
-    """清理已删除的消息记录"""
+    """清理已删除的消息记录（每 10 分钟，降低 API 调用）"""
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(600)
         to_remove = []
         async with lock:
             check_list = list(reports.items())
@@ -2446,8 +2664,12 @@ async def cleanup_deleted_messages():
 async def main():
     print("🚀 机器人启动")
     await load_config()
+    for gid in GROUP_IDS:
+        get_group_config(gid)
+    await save_config()
     await load_data()
     await load_user_violations()
+    load_repeat_levels()
     await load_media_stats()
     asyncio.create_task(cleanup_deleted_messages())
     asyncio.create_task(broadcast_media_rules_every_2h())
