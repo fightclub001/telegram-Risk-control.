@@ -100,6 +100,7 @@ def _default_group_config():
         "repeat_ban_seconds": 86400,
         "media_unlock_msg_count": 50,
         "media_unlock_boosts": 4,
+        "media_unlock_whitelist": [],
         "media_report_cooldown_sec": 20 * 60,
         "media_report_max_per_day": 3,
     }
@@ -174,15 +175,23 @@ async def save_media_stats():
 def _media_key(group_id: int, user_id: int) -> str:
     return f"{group_id}_{user_id}"
 
-def _can_send_media(group_id: int, user_id: int, is_premium: bool) -> bool:
-    """是否已解锁发媒体：合规消息数/会员/助力（阈值从群配置读）"""
+def _can_send_media(group_id: int, user_id: int, username: str | None = None) -> bool:
+    """是否已解锁发媒体：白名单 / 合规消息数 / 助力次数（助力需 Telegram 会员，仅会员可为群组助力）。"""
     cfg = get_group_config(group_id)
-    need_boosts = cfg.get("media_unlock_boosts", 4)
+    wl = cfg.get("media_unlock_whitelist", [])
+    if not isinstance(wl, list):
+        wl = []
+    sid = str(user_id)
+    if sid in wl:
+        return True
+    if username:
+        un = (username or "").strip().lstrip("@").lower()
+        if un and any(un == (x.strip().lstrip("@").lower()) for x in wl if isinstance(x, str) and not x.isdigit()):
+            return True
     key = _media_key(group_id, user_id)
     if media_stats["unlocked"].get(key):
         return True
-    if is_premium:
-        return True
+    need_boosts = cfg.get("media_unlock_boosts", 4)
     if media_stats["boosts"].get(key, 0) >= need_boosts:
         return True
     return False
@@ -240,6 +249,8 @@ class AdminStates(StatesGroup):
     EditMediaUnlockBoosts = State()
     EditMediaReportCooldown = State()
     EditMediaReportMaxDay = State()
+    EditMediaWhitelistAdd = State()
+    EditMediaWhitelistRemove = State()
 
 # ==================== UI 键盘 ====================
 def get_main_menu_keyboard():
@@ -371,11 +382,27 @@ def get_media_perm_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     msg = cfg.get("media_unlock_msg_count", 50)
     boost = cfg.get("media_unlock_boosts", 4)
+    wl = cfg.get("media_unlock_whitelist", [])
+    n = len(wl) if isinstance(wl, list) else 0
     buttons = [
         [InlineKeyboardButton(text=f"解锁所需消息数: {msg}", callback_data=f"edit_media_msg:{group_id}")],
         [InlineKeyboardButton(text=f"解锁所需助力: {boost}", callback_data=f"edit_media_boosts:{group_id}")],
+        [InlineKeyboardButton(text=f"📋 媒体解锁白名单 ({n})", callback_data=f"submenu_media_whitelist:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_media_whitelist_keyboard(group_id: int):
+    cfg = get_group_config(group_id)
+    wl = cfg.get("media_unlock_whitelist", [])
+    if not isinstance(wl, list):
+        wl = []
+    buttons = []
+    for i, v in enumerate(wl[:25]):
+        s = str(v)[:30]
+        buttons.append([InlineKeyboardButton(text=f"❌ {s}", callback_data=f"remove_mw:{group_id}:{i}")])
+    buttons.append([InlineKeyboardButton(text="➕ 添加", callback_data=f"add_media_whitelist:{group_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_media_perm:{group_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_media_report_menu_keyboard(group_id: int):
@@ -1108,6 +1135,71 @@ async def process_media_boosts(message: Message, state: FSMContext):
     except (ValueError, Exception) as e:
         await message.reply(f"❌ 请输入数字: {e}")
 
+@router.callback_query(F.data.startswith("submenu_media_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
+async def media_whitelist_submenu(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        wl = cfg.get("media_unlock_whitelist", [])
+        if not isinstance(wl, list):
+            wl = []
+        text = "媒体解锁白名单（用户ID或用户名，满足即无需消息/助力可发媒体）\n当前：" + (", ".join(str(x) for x in wl) if wl else "（空）")
+        await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id))
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("add_media_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
+async def add_media_whitelist(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        await callback.message.edit_text("输入要添加的用户ID或用户名（一行一个，支持多行）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditMediaWhitelistAdd)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditMediaWhitelistAdd), F.from_user.id.in_(ADMIN_IDS))
+async def process_media_whitelist_add(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        wl = cfg.get("media_unlock_whitelist", [])
+        if not isinstance(wl, list):
+            wl = []
+        for line in message.text.strip().splitlines():
+            s = line.strip().lstrip("@")
+            if s and s not in wl:
+                wl.append(s)
+        cfg["media_unlock_whitelist"] = wl
+        await save_config()
+        await message.reply(f"✅ 已添加，当前共 {len(wl)} 项", reply_markup=get_media_whitelist_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except Exception as e:
+        await message.reply(f"❌ {str(e)}")
+
+@router.callback_query(F.data.startswith("remove_mw:"), F.from_user.id.in_(ADMIN_IDS))
+async def remove_media_whitelist(callback: CallbackQuery):
+    try:
+        parts = callback.data.split(":", 2)
+        group_id = int(parts[1])
+        idx = int(parts[2])
+        cfg = get_group_config(group_id)
+        wl = cfg.get("media_unlock_whitelist", [])
+        if not isinstance(wl, list):
+            wl = []
+        if 0 <= idx < len(wl):
+            wl.pop(idx)
+            cfg["media_unlock_whitelist"] = wl
+            await save_config()
+        text = "媒体解锁白名单\n当前：" + (", ".join(str(x) for x in wl) if wl else "（空）")
+        await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id))
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
 # ==================== 媒体举报 ====================
 @router.callback_query(F.data.startswith("submenu_media_report:"), F.from_user.id.in_(ADMIN_IDS))
 async def media_report_submenu(callback: CallbackQuery):
@@ -1655,13 +1747,8 @@ async def on_media_message(message: Message):
     user_id = message.from_user.id
     group_id = message.chat.id
     now = time.time()
-    is_premium = False
-    try:
-        mem = await bot.get_chat_member(group_id, user_id)
-        is_premium = getattr(mem, "is_premium", False) or False
-    except Exception:
-        pass
-    if not _can_send_media(group_id, user_id, is_premium):
+    username = message.from_user.username if message.from_user else None
+    if not _can_send_media(group_id, user_id, username):
         # 召唤代发：用户已发「召唤」则本次由机器人代发
         sk = (group_id, user_id)
         if sk in summon_pending and (now - summon_pending[sk]) <= SUMMON_TIMEOUT_SEC:
@@ -1692,7 +1779,7 @@ async def on_media_message(message: Message):
             await bot.send_message(
                 group_id,
                 f"⚠️ {name} 尚未解锁发媒体权限。\n"
-                f"发送「权限」可查看进度；满 {need_msg} 条合规消息或 Telegram 会员或为群组助力 {need_boosts} 次即可解锁。\n"
+                f"发送「权限」可查看进度；满 {need_msg} 条合规消息即可解锁，或为群组助力 {need_boosts} 次即可解锁（仅 Telegram 会员可为群组助力）。\n"
                 f"现阶段为避免炸群，不满足条件的用户可输入「召唤」后发送图片/视频/语音，由机器人代发。"
             )
         return
@@ -1722,16 +1809,10 @@ async def detect_and_warn(message: Message):
 
     # 「召唤」：未解锁用户可让机器人代发下一次媒体（为避免炸群）
     if message.text and message.text.strip() == "召唤":
-        if not _can_send_media(group_id, user_id, False):
-            is_premium = False
-            try:
-                mem = await bot.get_chat_member(group_id, user_id)
-                is_premium = getattr(mem, "is_premium", False) or False
-            except Exception:
-                pass
-            if not _can_send_media(group_id, user_id, is_premium):
-                summon_pending[(group_id, user_id)] = time.time()
-                await message.reply("请直接发送你要发布的图片/视频/语音，我将代你发出（为避免炸群）。")
+        uname = message.from_user.username if message.from_user else None
+        if not _can_send_media(group_id, user_id, uname):
+            summon_pending[(group_id, user_id)] = time.time()
+            await message.reply("请直接发送你要发布的图片/视频/语音，我将代你发出（为避免炸群）。")
         return
 
     # 「权限」查询发媒体进度
@@ -1740,19 +1821,10 @@ async def detect_and_warn(message: Message):
         count = media_stats["message_counts"].get(key, 0)
         unlocked = media_stats["unlocked"].get(key, False)
         boosts = media_stats["boosts"].get(key, 0)
-        is_premium = False
-        try:
-            mem = await bot.get_chat_member(group_id, user_id)
-            is_premium = getattr(mem, "is_premium", False) or False
-        except Exception:
-            pass
         need_msg = cfg.get("media_unlock_msg_count", 50)
         need_boosts = cfg.get("media_unlock_boosts", 4)
         if unlocked:
             await message.reply(f"✅ 你已解锁在本群直接发送图片/视频/语音（合规消息已满 {need_msg} 条）。")
-            return
-        if is_premium:
-            await message.reply("✅ 你已具备发媒体权限（Telegram 会员）。")
             return
         if boosts >= need_boosts:
             await message.reply(f"✅ 你已解锁发媒体权限（已为群组助力 {boosts} 次）。")
@@ -1760,8 +1832,7 @@ async def detect_and_warn(message: Message):
         await message.reply(
             f"📊 发媒体权限进度\n"
             f"· 合规消息：{count}/{need_msg}（满 {need_msg} 条可解锁）\n"
-            f"· 群组助力：{boosts}/{need_boosts}（满 {need_boosts} 次可解锁）\n"
-            f"· Telegram 会员：{'是' if is_premium else '否'}\n"
+            f"· 群组助力：{boosts}/{need_boosts}（满 {need_boosts} 次可解锁，仅 Telegram 会员可为群组助力）\n"
             f"（刷屏、重复发言、短消息等不计入合规消息）"
         )
         return
@@ -2322,8 +2393,7 @@ def _media_rules_text(group_id: int) -> str:
     return (
         "📋 本群发媒体（图片/视频/语音）规则\n\n"
         f"· 合规消息满 {need_msg} 条可解锁发媒体\n"
-        f"· 为群组助力 {need_boosts} 次可解锁\n"
-        "· Telegram 会员可直接发送\n"
+        f"· 为群组助力 {need_boosts} 次可解锁（仅 Telegram 会员可为群组助力）\n"
         "· 刷屏、重复发言、短消息等不计入合规条数\n"
         "· 未解锁可发「召唤」后发图，由机器人代发\n\n"
         "发送「权限」可随时查询自己的进度。"
