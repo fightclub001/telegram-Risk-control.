@@ -39,6 +39,11 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
+try:
+    from bot_admin import router as admin_router
+    dp.include_router(admin_router)
+except ImportError:
+    admin_router = None
 
 # ==================== 数据文件 ====================
 # 使用环境变量 DATA_DIR；Railway 需将 Volume 挂载到该路径（如 /data），重新部署后配置与关键词才不丢失
@@ -283,6 +288,31 @@ def get_group_config(group_id: int):
         config["groups"][gid] = _default_group_config()
     return config["groups"][gid]
 
+
+def fmt_duration(seconds: int) -> str:
+    """将秒数格式化为人类可读时长"""
+    if seconds == 0:
+        return "永久"
+    if seconds < 60:
+        return f"{seconds}秒"
+    if seconds < 3600:
+        return f"{seconds // 60}分钟"
+    if seconds < 86400:
+        return f"{seconds // 3600}小时"
+    if seconds < 604800:
+        return f"{seconds // 86400}天"
+    return f"{seconds // 604800}周"
+
+
+async def get_chat_title_safe(bot, chat_id: int) -> str:
+    """获取群组/聊天标题，失败时返回 ID"""
+    try:
+        chat = await bot.get_chat(chat_id)
+        return (chat.title or "").strip() or f"ID {chat_id}"
+    except Exception:
+        return str(chat_id)
+
+
 # ==================== FSM 状态 ====================
 class AdminStates(StatesGroup):
     MainMenu = State()
@@ -321,13 +351,21 @@ def get_main_menu_keyboard():
     buttons = [
         [InlineKeyboardButton(text="⚙️ 群组管理", callback_data="choose_group")],
         [InlineKeyboardButton(text="📊 状态查看", callback_data="view_status")],
+        [InlineKeyboardButton(text="🔧 全局系统配置", callback_data="admin:main")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_group_list_keyboard():
+
+async def get_group_list_keyboard(bot):
+    """异步生成群组列表键盘，显示群名 + ID"""
     buttons = []
     for gid in sorted(GROUP_IDS):
-        buttons.append([InlineKeyboardButton(text=f"👥 {gid}", callback_data=f"select_group:{gid}")])
+        title = await get_chat_title_safe(bot, gid)
+        label = f"👥 {title}" if title != str(gid) else f"👥 {gid}"
+        # 标题过长时截断，保留 ID 信息
+        if len(label) > 35:
+            label = label[:32] + "..."
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"select_group:{gid}")])
     buttons.append([InlineKeyboardButton(text="⬅️ 返回", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -386,11 +424,12 @@ def get_short_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
     fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
+    window_sec = cfg.get("time_window_seconds", 60)
     buttons = [
         [InlineKeyboardButton(text=f"短消息 {short_enabled}", callback_data=f"toggle_short:{group_id}")],
         [InlineKeyboardButton(text=f"字数: {cfg.get('short_msg_threshold')}", callback_data=f"edit_threshold:{group_id}")],
         [InlineKeyboardButton(text=f"连续: {cfg.get('min_consecutive_count')}", callback_data=f"edit_consecutive:{group_id}")],
-        [InlineKeyboardButton(text=f"窗口: {cfg.get('time_window_seconds')}s", callback_data=f"edit_window:{group_id}")],
+        [InlineKeyboardButton(text=f"窗口: {fmt_duration(window_sec)}", callback_data=f"edit_window:{group_id}")],
         [InlineKeyboardButton(text=f"垃圾 {fill_enabled}", callback_data=f"toggle_fill:{group_id}")],
         [InlineKeyboardButton(text=f"最小: {cfg.get('fill_garbage_min_raw_len')}", callback_data=f"edit_fill_min:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
@@ -399,8 +438,10 @@ def get_short_menu_keyboard(group_id: int):
 
 def get_violation_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
+    mute_h = cfg.get("violation_mute_hours", 1)
+    mute_sec = mute_h * 3600
     buttons = [
-        [InlineKeyboardButton(text=f"禁言: {cfg.get('violation_mute_hours')}h", callback_data=f"edit_mute:{group_id}")],
+        [InlineKeyboardButton(text=f"🔇 禁言时长: {fmt_duration(mute_sec)}", callback_data=f"edit_mute:{group_id}")],
         [InlineKeyboardButton(text=f"阈值: {cfg.get('reported_message_threshold')}", callback_data=f"edit_report_threshold:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
@@ -444,9 +485,9 @@ def get_repeat_menu_keyboard(group_id: int):
     m = cfg.get("repeat_max_count", 3)
     b = cfg.get("repeat_ban_seconds", 86400)
     buttons = [
-        [InlineKeyboardButton(text=f"时间窗口: {w // 3600}h", callback_data=f"edit_repeat_window:{group_id}")],
+        [InlineKeyboardButton(text=f"⏱ 时间窗口: {fmt_duration(w)}", callback_data=f"edit_repeat_window:{group_id}")],
         [InlineKeyboardButton(text=f"触发次数: {m}次", callback_data=f"edit_repeat_max:{group_id}")],
-        [InlineKeyboardButton(text=f"首次禁言: {b // 3600}h", callback_data=f"edit_repeat_ban:{group_id}")],
+        [InlineKeyboardButton(text=f"🔇 首次禁言: {fmt_duration(b)}", callback_data=f"edit_repeat_ban:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -488,7 +529,7 @@ def get_media_report_menu_keyboard(group_id: int):
     max_day = cfg.get("media_report_max_per_day", 3)
     del_th = cfg.get("media_report_delete_threshold", 3)
     buttons = [
-        [InlineKeyboardButton(text=f"连续举报冷却: {cooldown // 60}分钟", callback_data=f"edit_media_cooldown:{group_id}")],
+        [InlineKeyboardButton(text=f"⏱ 连续举报冷却: {fmt_duration(cooldown)}", callback_data=f"edit_media_cooldown:{group_id}")],
         [InlineKeyboardButton(text=f"每日举报上限: {max_day}次", callback_data=f"edit_media_maxday:{group_id}")],
         [InlineKeyboardButton(text=f"举报达多少人删媒体: {del_th}", callback_data=f"edit_media_delete_threshold:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
@@ -506,8 +547,8 @@ async def admin_panel(message: Message, state: FSMContext):
 # ==================== 回调处理 ====================
 @router.callback_query(F.data == "choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def choose_group_callback(callback: CallbackQuery, state: FSMContext):
-    text = "选择群组"
-    kb = get_group_list_keyboard()
+    text = "📋 选择要管理的群组（名称 + ID）："
+    kb = await get_group_list_keyboard(callback.bot)
     await callback.message.edit_text(text, reply_markup=kb)
     await state.set_state(AdminStates.ChooseGroup)
     await callback.answer()
@@ -518,7 +559,14 @@ async def select_group(callback: CallbackQuery, state: FSMContext):
         group_id = int(callback.data.split(":", 1)[1])
         get_group_config(group_id)
         await state.update_data(group_id=group_id)
-        text = f"群组 {group_id}"
+        title = await get_chat_title_safe(callback.bot, group_id)
+        cfg = get_group_config(group_id)
+        status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
+        text = (
+            f"👥 <b>{title}</b>\n"
+            f"<code>ID: {group_id}</code>  |  状态: {status}\n\n"
+            "选择要管理的功能："
+        )
         kb = get_group_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
@@ -536,8 +584,8 @@ async def back_main(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "back_choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def back_choose_group(callback: CallbackQuery, state: FSMContext):
-    text = "选择群组"
-    kb = get_group_list_keyboard()
+    text = "📋 选择要管理的群组（名称 + ID）："
+    kb = await get_group_list_keyboard(callback.bot)
     await callback.message.edit_text(text, reply_markup=kb)
     await state.set_state(AdminStates.ChooseGroup)
     await callback.answer()
@@ -548,7 +596,14 @@ async def group_menu(callback: CallbackQuery, state: FSMContext):
         group_id = int(callback.data.split(":", 1)[1])
         get_group_config(group_id)
         await state.update_data(group_id=group_id)
-        text = f"群组 {group_id}"
+        title = await get_chat_title_safe(callback.bot, group_id)
+        cfg = get_group_config(group_id)
+        status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
+        text = (
+            f"👥 <b>{title}</b>\n"
+            f"<code>ID: {group_id}</code>  |  状态: {status}\n\n"
+            "选择要管理的功能："
+        )
         kb = get_group_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
@@ -561,10 +616,11 @@ async def group_menu(callback: CallbackQuery, state: FSMContext):
 async def bio_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        text = f"简介检测\n链接: {link_status}\n敏感词: {kw_status}"
+        text = f"<b>{title}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
         kb = get_bio_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -583,7 +639,8 @@ async def toggle_bio_link(callback: CallbackQuery):
         kb = get_bio_menu_keyboard(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        text = f"简介检测\n链接: {link_status}\n敏感词: {kw_status}"
+        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{breadcrumb}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -600,7 +657,8 @@ async def toggle_bio_keywords(callback: CallbackQuery):
         kb = get_bio_menu_keyboard(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        text = f"简介检测\n链接: {link_status}\n敏感词: {kw_status}"
+        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{breadcrumb}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -609,10 +667,11 @@ async def toggle_bio_keywords(callback: CallbackQuery):
 async def edit_bio_keywords(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         keywords = cfg.get("bio_keywords", [])
         kw_text = "\n".join(keywords)
-        text = f"编辑简介敏感词\n\n{kw_text}\n\n发送新词汇（一行一个）或 /clear 清空"
+        text = f"<b>{title}</b> › 编辑简介敏感词\n\n{kw_text}\n\n发送新词汇（一行一个）或 /clear 清空"
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditBioKeywords)
@@ -633,8 +692,9 @@ async def process_bio_keywords(message: Message, state: FSMContext):
             cfg["bio_keywords"] = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
         
         await save_config()
+        title = await get_chat_title_safe(message.bot, group_id)
         kb = get_bio_menu_keyboard(group_id)
-        await message.reply(f"✅ 已更新（{len(cfg['bio_keywords'])}个）", reply_markup=kb)
+        await message.reply(f"✅ 已更新: <b>{title}</b> › 简介敏感词\n共 {len(cfg['bio_keywords'])} 个", reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
     except Exception as e:
         await message.reply(f"❌ {str(e)}")
@@ -656,9 +716,10 @@ async def view_bio_keywords(callback: CallbackQuery):
 async def display_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         status = "✅" if cfg.get("check_display_keywords") else "❌"
-        text = f"名称检测: {status}"
+        text = f"<b>{title}</b> › 名称检测: {status}"
         kb = get_display_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -676,7 +737,8 @@ async def toggle_display(callback: CallbackQuery):
         await callback.answer(f"名称检测: {status}", show_alert=True)
         kb = get_display_menu_keyboard(group_id)
         status_display = "✅" if cfg.get("check_display_keywords") else "❌"
-        text = f"名称检测: {status_display}"
+        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{breadcrumb}</b> › 名称检测: {status_display}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -685,10 +747,11 @@ async def toggle_display(callback: CallbackQuery):
 async def edit_display_keywords(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         keywords = cfg.get("display_keywords", [])
         kw_text = "\n".join(keywords)
-        text = f"编辑名称敏感词\n\n{kw_text}\n\n发送新词汇（一行一个）或 /clear 清空"
+        text = f"<b>{title}</b> › 编辑名称敏感词\n\n{kw_text}\n\n发送新词汇（一行一个）或 /clear 清空"
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditDisplayKeywords)
@@ -732,9 +795,10 @@ async def view_display_keywords(callback: CallbackQuery):
 async def message_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         status = "✅" if cfg.get("check_message_keywords") else "❌"
-        text = f"消息检测: {status}"
+        text = f"<b>{title}</b> › 消息检测: {status}"
         kb = get_message_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -752,7 +816,8 @@ async def toggle_message(callback: CallbackQuery):
         await callback.answer(f"消息检测: {status}", show_alert=True)
         kb = get_message_menu_keyboard(group_id)
         status_display = "✅" if cfg.get("check_message_keywords") else "❌"
-        text = f"消息检测: {status_display}"
+        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{breadcrumb}</b> › 消息检测: {status_display}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -761,10 +826,11 @@ async def toggle_message(callback: CallbackQuery):
 async def edit_message_keywords(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         keywords = cfg.get("message_keywords", [])
         kw_text = "\n".join(keywords)
-        text = f"编辑消息敏感词\n\n{kw_text}\n\n发送新词汇（一行一个）或 /clear 清空"
+        text = f"<b>{title}</b> › 编辑消息敏感词\n\n{kw_text}\n\n发送新词汇（一行一个）或 /clear 清空"
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditMessageKeywords)
@@ -808,10 +874,11 @@ async def view_message_keywords(callback: CallbackQuery):
 async def short_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
         fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-        text = f"短消息: {short_enabled}\n垃圾: {fill_enabled}"
+        text = f"<b>{title}</b> › 短消息/垃圾\n\n短消息: {short_enabled}\n垃圾: {fill_enabled}"
         kb = get_short_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -830,7 +897,8 @@ async def toggle_short_msg(callback: CallbackQuery):
         kb = get_short_menu_keyboard(group_id)
         short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
         fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-        text = f"短消息: {short_enabled}\n垃圾: {fill_enabled}"
+        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{breadcrumb}</b> › 短消息/垃圾\n\n短消息: {short_enabled}\n垃圾: {fill_enabled}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -940,7 +1008,8 @@ async def toggle_fill(callback: CallbackQuery):
         kb = get_short_menu_keyboard(group_id)
         short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
         fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-        text = f"短消息: {short_enabled}\n垃圾: {fill_enabled}"
+        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{breadcrumb}</b> › 短消息/垃圾\n\n短消息: {short_enabled}\n垃圾: {fill_enabled}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -981,10 +1050,12 @@ async def process_fill_min(message: Message, state: FSMContext):
 async def violation_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         mute_hours = cfg.get("violation_mute_hours", 1)
+        mute_sec = mute_hours * 3600
         threshold = cfg.get("reported_message_threshold", 2)
-        text = f"违规处理\n禁言: {mute_hours}h\n触发: {threshold}条举报"
+        text = f"<b>{title}</b> › 违规处理\n\n🔇 禁言: {fmt_duration(mute_sec)}\n触发: {threshold} 条举报"
         kb = get_violation_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1011,11 +1082,13 @@ async def process_mute_hours(message: Message, state: FSMContext):
         data = await state.get_data()
         group_id = data.get("group_id")
         cfg = get_group_config(group_id)
+        old_h = cfg.get("violation_mute_hours", 1)
         value = int(message.text.strip())
         cfg["violation_mute_hours"] = value
         await save_config()
+        title = await get_chat_title_safe(message.bot, group_id)
         kb = get_violation_menu_keyboard(group_id)
-        await message.reply(f"✅ 已设为 {value}h", reply_markup=kb)
+        await message.reply(f"✅ 已更新: <b>{title}</b> › 违规处理\n禁言时长: {old_h}h → {value}h", reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
     except ValueError:
         await message.reply("❌ 请输入数字")
@@ -1058,11 +1131,12 @@ async def process_report_threshold(message: Message, state: FSMContext):
 async def repeat_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         w = cfg.get("repeat_window_seconds", 7200)
         m = cfg.get("repeat_max_count", 3)
         b = cfg.get("repeat_ban_seconds", 86400)
-        text = f"重复发言\n窗口: {w // 3600}h\n触发: {m}次\n首次禁言: {b // 3600}h"
+        text = f"<b>{title}</b> › 重复发言\n\n⏱ 窗口: {fmt_duration(w)}\n触发: {m} 次\n🔇 首次禁言: {fmt_duration(b)}"
         kb = get_repeat_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1152,10 +1226,11 @@ async def process_repeat_ban(message: Message, state: FSMContext):
 async def media_perm_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         msg = cfg.get("media_unlock_msg_count", 50)
         boost = cfg.get("media_unlock_boosts", 4)
-        text = f"媒体权限\n解锁所需消息: {msg}\n解锁所需助力: {boost}"
+        text = f"<b>{title}</b> › 媒体权限\n\n解锁所需消息: {msg}\n解锁所需助力: {boost}"
         kb = get_media_perm_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1223,7 +1298,11 @@ async def toggle_media_broadcast(callback: CallbackQuery):
         await save_config()
         on = "✅" if cfg["media_rules_broadcast"] else "❌"
         await callback.answer(f"规则广播: {on}", show_alert=True)
-        await callback.message.edit_text(callback.message.text or "媒体权限", reply_markup=get_media_perm_menu_keyboard(group_id))
+        title = await get_chat_title_safe(callback.bot, group_id)
+        msg = cfg.get("media_unlock_msg_count", 50)
+        boost = cfg.get("media_unlock_boosts", 4)
+        text = f"<b>{title}</b> › 媒体权限\n\n解锁所需消息: {msg}\n解锁所需助力: {boost}"
+        await callback.message.edit_text(text, reply_markup=get_media_perm_menu_keyboard(group_id))
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
@@ -1257,11 +1336,12 @@ async def process_media_broadcast_interval(message: Message, state: FSMContext):
 async def media_whitelist_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         wl = cfg.get("media_unlock_whitelist", [])
         if not isinstance(wl, list):
             wl = []
-        text = "媒体解锁白名单（用户ID或用户名，满足即无需消息/助力可发媒体）\n当前：" + (", ".join(str(x) for x in wl) if wl else "（空）")
+        text = f"<b>{title}</b> › 媒体解锁白名单\n\n用户ID或用户名，满足即无需消息/助力可发媒体。\n当前：" + (", ".join(str(x) for x in wl) if wl else "（空）")
         await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id))
         await callback.answer()
     except Exception as e:
@@ -1312,7 +1392,8 @@ async def remove_media_whitelist(callback: CallbackQuery):
             wl.pop(idx)
             cfg["media_unlock_whitelist"] = wl
             await save_config()
-        text = "媒体解锁白名单\n当前：" + (", ".join(str(x) for x in wl) if wl else "（空）")
+        title = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{title}</b> › 媒体解锁白名单\n\n当前：" + (", ".join(str(x) for x in wl) if wl else "（空）")
         await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id))
         await callback.answer()
     except Exception as e:
@@ -1323,11 +1404,12 @@ async def remove_media_whitelist(callback: CallbackQuery):
 async def media_report_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         cooldown = cfg.get("media_report_cooldown_sec", 20 * 60)
         max_day = cfg.get("media_report_max_per_day", 3)
         del_th = cfg.get("media_report_delete_threshold", 3)
-        text = f"媒体举报\n连续举报冷却: {cooldown // 60}分钟\n每日上限: {max_day}次\n举报达{del_th}人删媒体"
+        text = f"<b>{title}</b> › 媒体举报\n\n⏱ 连续举报冷却: {fmt_duration(cooldown)}\n每日上限: {max_day} 次\n举报达 {del_th} 人删媒体"
         kb = get_media_report_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1417,11 +1499,12 @@ async def process_media_delete_threshold(message: Message, state: FSMContext):
 async def autoreply_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         ar = cfg.get("autoreply", {})
         enabled = "✅" if ar.get("enabled") else "❌"
         kw_count = len(ar.get("keywords", []))
-        text = f"自动回复\n状态: {enabled}\n关键词: {kw_count}个"
+        text = f"<b>{title}</b> › 自动回复\n\n状态: {enabled}\n关键词: {kw_count} 个"
         kb = get_autoreply_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1441,7 +1524,8 @@ async def toggle_autoreply(callback: CallbackQuery):
         kb = get_autoreply_menu_keyboard(group_id)
         enabled = "✅" if ar.get("enabled") else "❌"
         kw_count = len(ar.get("keywords", []))
-        text = f"自动回复\n状态: {enabled}\n关键词: {kw_count}个"
+        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{breadcrumb}</b> › 自动回复\n\n状态: {enabled}\n关键词: {kw_count} 个"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -1597,9 +1681,10 @@ async def process_ar_delete(message: Message, state: FSMContext):
 async def basic_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
-        status = "✅" if cfg.get("enabled") else "❌"
-        text = f"基础设置\n群组: {group_id}\n状态: {status}"
+        status = "✅ 运行中" if cfg.get("enabled") else "❌ 已停用"
+        text = f"<b>{title}</b> › 基础设置\n\n<code>ID: {group_id}</code>\n状态: {status}"
         kb = get_basic_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1616,8 +1701,9 @@ async def toggle_group(callback: CallbackQuery):
         status = "✅" if cfg["enabled"] else "❌"
         await callback.answer(f"群组状态: {status}", show_alert=True)
         kb = get_basic_menu_keyboard(group_id)
-        status_display = "✅" if cfg.get("enabled") else "❌"
-        text = f"基础设置\n群组: {group_id}\n状态: {status_display}"
+        status_display = "✅ 运行中" if cfg.get("enabled") else "❌ 已停用"
+        title = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{title}</b> › 基础设置\n\n<code>ID: {group_id}</code>\n状态: {status_display}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -1626,11 +1712,12 @@ async def toggle_group(callback: CallbackQuery):
 async def exempt_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         exempt = cfg.get("exempt_users") or []
         if isinstance(exempt, dict):
             exempt = list(exempt.keys())
-        text = f"豁免用户（不触发警告）\n当前: " + (", ".join(str(x) for x in exempt) if exempt else "（无）")
+        text = f"<b>{title}</b> › 豁免用户（不触发警告）\n\n当前: " + (", ".join(str(x) for x in exempt) if exempt else "（无）")
         await callback.message.edit_text(text, reply_markup=get_exempt_menu_keyboard(group_id))
         await callback.answer()
     except Exception as e:
@@ -1669,16 +1756,43 @@ async def process_exempt(message: Message, state: FSMContext):
         await message.reply(f"❌ {str(e)}")
 
 # ==================== 状态查看 ====================
+async def _build_status_text(bot) -> str:
+    """生成状态页完整文案"""
+    admin_count = len(ADMIN_IDS)
+    async with lock:
+        report_count = len(reports)
+    lines = [
+        "📊 <b>系统状态</b>\n",
+        "<b>群组概览</b>:",
+    ]
+    for gid in sorted(GROUP_IDS):
+        title = await get_chat_title_safe(bot, gid)
+        cfg = get_group_config(gid)
+        status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
+        lines.append(f"├ {title} (<code>{gid}</code>)  {status}")
+    lines.append("")
+    lines.append("<b>数据统计</b>:")
+    lines.append(f"├ 进行中举报: {report_count} 条")
+    try:
+        uv_total = len(user_violations) if user_violations else 0
+        lines.append(f"├ 违规用户记录: {uv_total} 条")
+    except Exception:
+        lines.append("├ 违规用户记录: —")
+    lines.append("")
+    lines.append("<b>系统</b>: ✅ 运行正常  |  管理员: %d" % admin_count)
+    return "\n".join(lines)
+
+
 @router.callback_query(F.data == "view_status", F.from_user.id.in_(ADMIN_IDS))
 async def view_status(callback: CallbackQuery):
     try:
-        group_count = len(GROUP_IDS)
-        admin_count = len(ADMIN_IDS)
-        async with lock:
-            report_count = len(reports)
-        
-        text = f"📊 状态\n✅ 运行正常\n管理员: {admin_count}\n群组: {group_count}\n举报: {report_count}"
-        await callback.answer(text, show_alert=True)
+        text = await _build_status_text(callback.bot)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 刷新", callback_data="view_status")],
+            [InlineKeyboardButton(text="⬅️ 返回主菜单", callback_data="back_main")],
+        ])
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
@@ -2663,6 +2777,12 @@ async def cleanup_deleted_messages():
 
 async def main():
     print("🚀 机器人启动")
+    if admin_router is not None:
+        try:
+            from bot_config import validate_immutable_config
+            validate_immutable_config()
+        except Exception as e:
+            print(f"⚠️ 全局配置未加载（全局系统配置面板不可用）: {e}")
     await load_config()
     for gid in GROUP_IDS:
         get_group_config(gid)

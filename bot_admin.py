@@ -41,6 +41,7 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🚫 黑名单管理", callback_data="admin:blacklist_main")],
         [InlineKeyboardButton(text="📊 统计信息", callback_data="admin:stats")],
         [InlineKeyboardButton(text="🔄 数据备份", callback_data="admin:backup")],
+        [InlineKeyboardButton(text="← 返回机器人面板", callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -362,30 +363,47 @@ async def handle_keyword_add(callback: CallbackQuery, state: FSMContext):
         logger.error(f"添加关键词界面失败: {e}")
         await callback.answer(f"❌ 失败: {str(e)}", show_alert=True)
 
+KEYWORD_PAGE_SIZE_REMOVE = 8
+KEYWORD_PAGE_SIZE_LIST = 50
+
+
 @router.callback_query(F.data == "admin:keyword_remove")
+@router.callback_query(F.data.startswith("admin:keyword_remove:"))
 async def handle_keyword_remove(callback: CallbackQuery, state: FSMContext):
-    """删除关键词"""
+    """删除关键词（分页，每页 8 个）"""
     try:
+        page = 0
+        if callback.data.startswith("admin:keyword_remove:"):
+            part = callback.data.split(":", 2)[2]
+            if part.isdigit():
+                page = int(part)
         keywords = await keyword_manager.get_keywords()
         if not keywords:
             await callback.answer("没有可删除的关键词", show_alert=True)
             return
-        
-        # 分页显示（一次最多 10 个）
+        total = len(keywords)
+        total_pages = (total + KEYWORD_PAGE_SIZE_REMOVE - 1) // KEYWORD_PAGE_SIZE_REMOVE
+        page = max(0, min(page, total_pages - 1))
+        start = page * KEYWORD_PAGE_SIZE_REMOVE
+        chunk = keywords[start: start + KEYWORD_PAGE_SIZE_REMOVE]
         buttons = []
-        for kw in keywords[:10]:
+        for kw in chunk:
+            display = (kw[:28] + "…") if len(kw) > 30 else kw
             buttons.append([
-                InlineKeyboardButton(
-                    text=f"❌ {kw}",
-                    callback_data=f"admin:keyword_del:{kw}"
-                )
+                InlineKeyboardButton(text=f"❌ {display}", callback_data=f"admin:keyword_del:{kw}")
             ])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀ 上一页", callback_data=f"admin:keyword_remove:{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="下一页 ▶", callback_data=f"admin:keyword_remove:{page + 1}"))
+        if nav:
+            buttons.append(nav)
         buttons.append([InlineKeyboardButton(text="← 返回", callback_data="admin:keyword_main")])
-        
         text = (
             "➖ <b>删除关键词</b>\n\n"
-            f"共 {len(keywords)} 个，显示前 10 个\n\n"
-            "选择要删除的关键词:"
+            f"共 <b>{total}</b> 个，第 {page + 1}/{total_pages} 页\n\n"
+            "选择要删除的关键词："
         )
         await callback.message.edit_text(
             text,
@@ -444,32 +462,44 @@ async def handle_keyword_input(message: Message, state: FSMContext):
         await message.reply(f"❌ 操作失败: {str(e)}")
 
 @router.callback_query(F.data == "admin:keyword_list")
+@router.callback_query(F.data.startswith("admin:keyword_list:"))
 async def handle_keyword_list(callback: CallbackQuery, state: FSMContext):
-    """列出所有关键词"""
+    """列出关键词（分页，每页 50 个）"""
     try:
+        page = 0
+        if callback.data.startswith("admin:keyword_list:"):
+            part = callback.data.split(":", 2)[2]
+            if part.isdigit():
+                page = int(part)
         keywords = await keyword_manager.get_keywords()
-        
         if not keywords:
             text = "🔍 <b>关键词列表</b>\n\n还没有添加关键词"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="← 返回", callback_data="admin:keyword_main")
+            ]])
         else:
-            # 分组显示（每 20 个为一组）
-            keyword_text = "、".join(keywords[:50])
-            if len(keywords) > 50:
-                keyword_text += f" ... 等共 {len(keywords)} 个"
-            
+            total = len(keywords)
+            total_pages = (total + KEYWORD_PAGE_SIZE_LIST - 1) // KEYWORD_PAGE_SIZE_LIST
+            page = max(0, min(page, total_pages - 1))
+            start = page * KEYWORD_PAGE_SIZE_LIST
+            chunk = keywords[start: start + KEYWORD_PAGE_SIZE_LIST]
+            keyword_text = "、".join(chunk)
             text = (
                 f"🔍 <b>关键词列表</b>\n\n"
-                f"<b>总数:</b> {len(keywords)}\n\n"
+                f"<b>总数:</b> {total}  第 {page + 1}/{total_pages} 页\n\n"
                 f"<b>关键词:</b>\n{keyword_text}"
             )
-        
-        await callback.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="← 返回", callback_data="admin:keyword_main")
-            ]]),
-            parse_mode="HTML"
-        )
+            rows = []
+            nav_row = []
+            if page > 0:
+                nav_row.append(InlineKeyboardButton(text="◀ 上一页", callback_data=f"admin:keyword_list:{page - 1}"))
+            if page < total_pages - 1:
+                nav_row.append(InlineKeyboardButton(text="下一页 ▶", callback_data=f"admin:keyword_list:{page + 1}"))
+            if nav_row:
+                rows.append(nav_row)
+            rows.append([InlineKeyboardButton(text="← 返回", callback_data="admin:keyword_main")])
+            kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         await callback.answer()
     except Exception as e:
         logger.error(f"列出关键词失败: {e}")
@@ -494,23 +524,33 @@ async def handle_blacklist_main(callback: CallbackQuery, state: FSMContext):
         logger.error(f"黑名单菜单失败: {e}")
         await callback.answer(f"❌ 失败: {str(e)}", show_alert=True)
 
+async def _get_chat_title_safe(bot, chat_id: int) -> str:
+    """获取群组标题，失败时返回 ID"""
+    try:
+        chat = await bot.get_chat(chat_id)
+        return (chat.title or "").strip() or str(chat_id)
+    except Exception:
+        return str(chat_id)
+
+
 @router.callback_query(F.data == "admin:blacklist_list")
 async def handle_blacklist_list(callback: CallbackQuery, state: FSMContext):
-    """列出黑名单配置"""
+    """列出黑名单配置（群名 + ID）"""
     try:
         from bot_config import IMMUTABLE_CONFIG
         
         text = "🚫 <b>黑名单配置</b>\n\n"
         
-        for group_id in IMMUTABLE_CONFIG["GROUP_IDS"]:
+        for group_id in sorted(IMMUTABLE_CONFIG["GROUP_IDS"]):
+            title = await _get_chat_title_safe(callback.bot, group_id)
             config = await blacklist_manager.get_blacklist_config(str(group_id))
             if config:
                 enabled = "✅ 启用" if config.get("enabled") else "❌ 禁用"
                 duration = config.get("duration", 0)
                 duration_text = "永久" if duration == 0 else f"{duration} 秒"
-                text += f"\n群 {group_id}: {enabled} - {duration_text}"
+                text += f"\n· <b>{title}</b>\n  <code>ID: {group_id}</code>  {enabled} — {duration_text}"
             else:
-                text += f"\n群 {group_id}: ❌ 未配置"
+                text += f"\n· <b>{title}</b>\n  <code>ID: {group_id}</code>  ❌ 未配置"
         
         await callback.message.edit_text(
             text,
