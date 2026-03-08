@@ -263,11 +263,11 @@ def _can_send_media(group_id: int, user_id: int, username: str | None = None) ->
     return False
 
 async def _increment_media_count(group_id: int, user_id: int, normalized_text: str) -> bool:
-    """合规消息计数（同一条超过 10 次不计数）。返回是否因本次达到阈值而刚解锁。"""
+    """合规消息计数（同一条超过 10 次不计数）。已解锁/已超 50 条的用户不再统计。返回是否因本次达到阈值而刚解锁。"""
     cfg = get_group_config(group_id)
     need_count = cfg.get("media_unlock_msg_count", 50)
     key = _media_key(group_id, user_id)
-    if media_stats["unlocked"].get(key):
+    if media_stats["unlocked"].get(key):  # 已能发媒体，不再统计
         return False
     tc = media_stats["text_counts"].setdefault(key, {})
     if tc.get(normalized_text, 0) >= 10:
@@ -2362,24 +2362,27 @@ async def detect_and_warn(message: Message):
                     pass
         except Exception as e:
             print(f"通知管理员失败: {e}")
-    else:
-        # 合规消息：计入媒体权限进度（同一条超过 10 次不计数）
-        try:
-            norm = _normalize_text(message.text or "")
-            if norm:
-                just_unlocked = await _increment_media_count(group_id, user_id, norm)
-                if just_unlocked:
-                    name = _get_display_name_from_message(message, user_id)
-                    need_msg = cfg.get("media_unlock_msg_count", 50)
-                    try:
-                        await bot.send_message(
-                            group_id,
-                            f"🎉 {name} 已在本群发送合规消息满 {need_msg} 条，解锁直接发送图片/视频/语音的权限。"
-                        )
-                    except Exception:
-                        pass
-        except Exception as e:
-            print(f"媒体计数失败: {e}")
+
+    # 合规消息计入：未达 3 层封禁且尚未解锁发媒体的用户才统计（已超 50 条/已能发媒体的用户不再统计）
+    if len(triggers) < 3:
+        media_key = _media_key(group_id, user_id)
+        if not media_stats["unlocked"].get(media_key):
+            try:
+                norm = _normalize_text(message.text or "")
+                if norm:
+                    just_unlocked = await _increment_media_count(group_id, user_id, norm)
+                    if just_unlocked:
+                        name = _get_display_name_from_message(message, user_id)
+                        need_msg = cfg.get("media_unlock_msg_count", 50)
+                        try:
+                            await bot.send_message(
+                                group_id,
+                                f"🎉 {name} 已在本群发送合规消息满 {need_msg} 条，解锁直接发送图片/视频/语音的权限。"
+                            )
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"媒体计数失败: {e}")
 
 @router.callback_query(F.data.startswith("admin_ban:"))
 async def handle_admin_ban(callback: CallbackQuery):
