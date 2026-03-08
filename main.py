@@ -101,7 +101,7 @@ def _default_group_config():
             "delete_user_sec": 0,
             "delete_bot_sec": 0
         },
-        "exempt_users": [],  # 用户ID列表，豁免后不触发警告
+        "exempt_users": [],  # 用户ID列表，豁免简介/昵称等检测（与发图权限无关，发图另有媒体解锁白名单）
         "repeat_window_seconds": 2 * 3600,
         "repeat_max_count": 3,
         "repeat_ban_seconds": 86400,
@@ -242,7 +242,7 @@ async def _refresh_user_boosts(group_id: int, user_id: int) -> None:
         pass
 
 def _can_send_media(group_id: int, user_id: int, username: str | None = None) -> bool:
-    """是否已解锁发媒体：白名单 / 合规消息数 / 助力次数（助力需 Telegram 会员，仅会员可为群组助力）。"""
+    """是否已解锁发媒体：仅看本处媒体解锁白名单 / 合规消息数 / 助力次数（与豁免检测 exempt_users 无关）。"""
     cfg = get_group_config(group_id)
     wl = cfg.get("media_unlock_whitelist", [])
     if not isinstance(wl, list):
@@ -263,7 +263,7 @@ def _can_send_media(group_id: int, user_id: int, username: str | None = None) ->
     return False
 
 async def _increment_media_count(group_id: int, user_id: int, normalized_text: str) -> bool:
-    """合规消息计数（同一条超过 10 次不计数）。已解锁/已超 50 条的用户不再统计。返回是否因本次达到阈值而刚解锁。"""
+    """合规消息计数（同一条超过 10 次不计数）。已解锁=满50条/白名单/助力的用户不再统计（不含一发图就被删的用户，避免逻辑循环）。返回是否因本次达到阈值而刚解锁。"""
     cfg = get_group_config(group_id)
     need_count = cfg.get("media_unlock_msg_count", 50)
     key = _media_key(group_id, user_id)
@@ -281,6 +281,31 @@ async def _increment_media_count(group_id: int, user_id: int, normalized_text: s
         return True
     await save_media_stats()
     return False
+
+
+async def _try_count_media_and_notify(message: Message, group_id: int, user_id: int, cfg: dict) -> None:
+    """合规消息计入并可能发送解锁贺信。仅对「未解锁」用户统计（已解锁=满50条/白名单/助力，不包含一发图就被删的用户，避免逻辑循环）。"""
+    media_key = _media_key(group_id, user_id)
+    if media_stats["unlocked"].get(media_key):
+        return
+    try:
+        norm = _normalize_text(message.text or "")
+        if not norm:
+            return
+        just_unlocked = await _increment_media_count(group_id, user_id, norm)
+        if just_unlocked:
+            name = _get_display_name_from_message(message, user_id)
+            need_msg = cfg.get("media_unlock_msg_count", 50)
+            try:
+                await bot.send_message(
+                    group_id,
+                    f"🎉 {name} 已在本群发送合规消息满 {need_msg} 条，解锁直接发送图片/视频/语音的权限。"
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"媒体计数失败: {e}")
+
 
 def get_group_config(group_id: int):
     gid = str(group_id)
@@ -1717,7 +1742,7 @@ async def exempt_submenu(callback: CallbackQuery):
         exempt = cfg.get("exempt_users") or []
         if isinstance(exempt, dict):
             exempt = list(exempt.keys())
-        text = f"<b>{title}</b> › 豁免用户（不触发警告）\n\n当前: " + (", ".join(str(x) for x in exempt) if exempt else "（无）")
+        text = f"<b>{title}</b> › 豁免检测（简介/昵称等，与发图白名单无关）\n\n当前: " + (", ".join(str(x) for x in exempt) if exempt else "（无）")
         await callback.message.edit_text(text, reply_markup=get_exempt_menu_keyboard(group_id))
         await callback.answer()
     except Exception as e:
@@ -1731,7 +1756,7 @@ async def edit_exempt(callback: CallbackQuery, state: FSMContext):
         exempt = cfg.get("exempt_users") or []
         if isinstance(exempt, dict):
             exempt = list(exempt.keys())
-        text = f"编辑豁免用户（用户ID，一行一个）\n\n" + "\n".join(str(x) for x in exempt) + "\n\n发送新列表或 /clear 清空"
+        text = f"编辑豁免检测用户（用户ID，一行一个；豁免简介/昵称等检测，发图另有白名单）\n\n" + "\n".join(str(x) for x in exempt) + "\n\n发送新列表或 /clear 清空"
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditExemptUsers)
@@ -2123,11 +2148,12 @@ async def detect_and_warn(message: Message):
     user_id = message.from_user.id
     group_id = message.chat.id
 
-    # 豁免用户不触发任何警告与检测（名单存 config，持久化）
+    # 豁免用户：仅豁免简介/用户名等检测，不触发警告；发图权限另有媒体解锁白名单，二者不同。豁免用户发言仍计入合规条数。
     exempt = cfg.get("exempt_users") or []
     if isinstance(exempt, dict):
         exempt = list(exempt.keys())
     if str(user_id) in exempt:
+        await _try_count_media_and_notify(message, group_id, user_id, cfg)
         return
 
     # 「召唤」：未解锁用户可让机器人代发下一次媒体（为避免炸群）
@@ -2170,6 +2196,8 @@ async def detect_and_warn(message: Message):
     threshold = cfg.get("reported_message_threshold", 2)
     
     if reported_count >= threshold:
+        # 举报达阈值：本条发言仍先计入合规，再禁言/删消息
+        await _try_count_media_and_notify(message, group_id, user_id, cfg)
         try:
             mute_hours = cfg.get("violation_mute_hours", 1)
             until_date = int(time.time()) + (mute_hours * 3600)
@@ -2363,26 +2391,9 @@ async def detect_and_warn(message: Message):
         except Exception as e:
             print(f"通知管理员失败: {e}")
 
-    # 合规消息计入：未达 3 层封禁且尚未解锁发媒体的用户才统计（已超 50 条/已能发媒体的用户不再统计）
+    # 合规消息计入：未达 3 层封禁时计入（已解锁=满50条/白名单/助力才不统计，不含「一发图就被删」的用户，避免逻辑循环）
     if len(triggers) < 3:
-        media_key = _media_key(group_id, user_id)
-        if not media_stats["unlocked"].get(media_key):
-            try:
-                norm = _normalize_text(message.text or "")
-                if norm:
-                    just_unlocked = await _increment_media_count(group_id, user_id, norm)
-                    if just_unlocked:
-                        name = _get_display_name_from_message(message, user_id)
-                        need_msg = cfg.get("media_unlock_msg_count", 50)
-                        try:
-                            await bot.send_message(
-                                group_id,
-                                f"🎉 {name} 已在本群发送合规消息满 {need_msg} 条，解锁直接发送图片/视频/语音的权限。"
-                            )
-                        except Exception:
-                            pass
-            except Exception as e:
-                print(f"媒体计数失败: {e}")
+        await _try_count_media_and_notify(message, group_id, user_id, cfg)
 
 @router.callback_query(F.data.startswith("admin_ban:"))
 async def handle_admin_ban(callback: CallbackQuery):
