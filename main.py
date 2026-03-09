@@ -2435,7 +2435,9 @@ async def detect_and_warn(message: Message):
             chat_info = await bot.get_chat(user_id)
             bio = (chat_info.bio or "").strip()
             bio_lower = bio.lower()
-            if "双向" in bio and "bot" in bio_lower:
+            # 简介链接数量≥2 时，不适用「bot+双向」豁免
+            bio_link_count = len(re.findall(r"https?://[^\s]+|t\.me/[^\s]+", bio_lower))
+            if "双向" in bio and "bot" in bio_lower and bio_link_count < 2:
                 bio_exempt = True
             if not bio_exempt:
                 if cfg.get("check_bio_link", True) and any(x in bio_lower for x in ["http://", "https://", "t.me/", "@"]):
