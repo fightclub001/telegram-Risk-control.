@@ -83,6 +83,8 @@ SUMMON_TIMEOUT_SEC = 300
 # 无权限发媒体警告：同用户删上一条；(group_id, user_id) -> 上一条机器人警告 message_id
 last_media_no_perm_msg = {}
 MEDIA_NO_PERM_DELETE_AFTER_SEC = 60  # 不同用户的警告 1 分钟后自动删除
+media_no_perm_strikes = {}  # (group_id, user_id) -> (count, last_time) 连续无权限发媒体计数
+MEDIA_NO_PERM_STRIKE_RESET_SEC = 300  # 超过此时间未再触发则视为重新计算连续次数
 # 举报按钮规则：管理员未点击封禁/误判豁免前，按钮永不过期（不因原消息被删而移除）。
 # (1) 机器人自动封禁 (2) 管理员点击封禁：移除按钮并保留/更新文案；(3) 管理员点击误判豁免：删除警告消息。
 # 超过此时长仍未处理：仅隐藏按钮、保留消息文本，并从内存移除记录。
@@ -325,6 +327,31 @@ async def _refresh_user_boosts(group_id: int, user_id: int) -> None:
         key = _media_key(group_id, user_id)
         media_stats["boosts"][key] = count
         await save_media_stats()
+
+        # 如果助力数已达到解锁条件，则标记为已解锁并尝试恢复其发媒体权限
+        cfg = get_group_config(group_id)
+        need_boosts = cfg.get("media_unlock_boosts", 4)
+        if count >= need_boosts and not media_stats["unlocked"].get(key):
+            media_stats["unlocked"][key] = True
+            await save_media_stats()
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=True,
+                        can_send_media_messages=True,
+                        can_send_polls=True,
+                        can_send_other_messages=True,
+                        can_add_web_page_previews=True,
+                        can_change_info=False,
+                        can_invite_users=True,
+                        can_pin_messages=False,
+                    ),
+                )
+            except Exception:
+                # 恢复权限失败不会影响后续解锁判断
+                pass
     except Exception:
         pass
 
@@ -389,6 +416,25 @@ async def _try_count_media_and_notify(message: Message, group_id: int, user_id: 
                     f"🎉 {name} 已在本群发送合规消息满 {need_msg} 条，解锁直接发送图片/视频/语音的权限。"
                 )
             except Exception:
+                pass
+            # 若该用户此前因多次违规被关闭媒体权限，则在达到解锁条件后自动恢复其发媒体权限
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=True,
+                        can_send_media_messages=True,
+                        can_send_polls=True,
+                        can_send_other_messages=True,
+                        can_add_web_page_previews=True,
+                        can_change_info=False,
+                        can_invite_users=True,
+                        can_pin_messages=False,
+                    ),
+                )
+            except Exception:
+                # 如果恢复权限失败，不影响解锁逻辑本身
                 pass
     except Exception as e:
         print(f"媒体计数失败: {e}")
@@ -2386,6 +2432,40 @@ async def on_media_message(message: Message):
         boosts = media_stats["boosts"].get(key, 0)
         name = _get_display_name_from_message(message, user_id)
         sk = (group_id, user_id)
+        # 计算连续无权限发媒体次数（超过一定时间未再触发则重置）
+        strike_count, last_ts = media_no_perm_strikes.get(sk, (0, 0))
+        if now - last_ts > MEDIA_NO_PERM_STRIKE_RESET_SEC:
+            strike_count = 0
+        strike_count += 1
+        media_no_perm_strikes[sk] = (strike_count, now)
+
+        if strike_count >= 2:
+            # 连续两次以上触发无权限发媒体，直接关闭其发媒体权限，防止继续刷屏
+            prev_msg_id = last_media_no_perm_msg.pop(sk, None)
+            if prev_msg_id is not None:
+                try:
+                    await bot.delete_message(group_id, prev_msg_id)
+                except Exception:
+                    pass
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=group_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=True,
+                        can_send_media_messages=False,
+                        can_send_polls=True,
+                        can_send_other_messages=True,
+                        can_add_web_page_previews=True,
+                        can_change_info=False,
+                        can_invite_users=True,
+                        can_pin_messages=False,
+                    ),
+                )
+            except Exception as e:
+                print(f"关闭媒体权限失败: {e}")
+            return
+
         prev_msg_id = last_media_no_perm_msg.get(sk)
         if prev_msg_id is not None:
             try:
