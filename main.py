@@ -2692,14 +2692,24 @@ async def detect_and_warn(message: Message):
                 chat_info = await bot.get_chat(user_id)
                 bio = (chat_info.bio or "").strip()
                 bio_lower = bio.lower()
+                # 局部豁免：如果简介包含 t.me/fast_telegram，则本用户本次消息跳过「简介链接」和「简介词汇」检测
+                fast_telegram_bio_exempt = "t.me/fast_telegram" in bio_lower
                 # 统计所有引流链接形式（http/https/t.me/@），数量>=2 时不适用「bot+双向」豁免
                 bio_ref_count = len(re.findall(r"https?://[^\s]+|t\.me/[^\s]+|@\w+", bio_lower))
                 if "双向" in bio and "bot" in bio_lower and bio_ref_count < 2:
                     bio_exempt = True
                 if not bio_exempt:
-                    if cfg.get("check_bio_link", True) and any(x in bio_lower for x in ["http://", "https://", "t.me/", "@"]):
+                    if (
+                        not fast_telegram_bio_exempt
+                        and cfg.get("check_bio_link", True)
+                        and any(x in bio_lower for x in ["http://", "https://", "t.me/", "@"])
+                    ):
                         triggers.append("简介链接")
-                    if cfg.get("check_bio_keywords", True) and any(kw.lower() in bio_lower for kw in cfg.get("bio_keywords", [])):
+                    if (
+                        not fast_telegram_bio_exempt
+                        and cfg.get("check_bio_keywords", True)
+                        and any(kw.lower() in bio_lower for kw in cfg.get("bio_keywords", []))
+                    ):
                         triggers.append("简介词汇")
                     # 检测用户主页是否有频道（personal_chat 属性）
                     personal_chat = getattr(chat_info, "personal_chat", None)
