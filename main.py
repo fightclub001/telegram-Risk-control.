@@ -138,6 +138,7 @@ def _default_group_config():
         },
         "exempt_users": [],  # 管理员手动维护的豁免（与发图权限无关）
         "misjudge_whitelist": [],  # 仅管理员点击「误判」后加入，豁免多层内容检测
+        "mild_exempt_whitelist": [],  # 轻度触发豁免名单（管理员通过私聊按钮设置）
         "repeat_window_seconds": 2 * 3600,
         "repeat_max_count": 3,
         "repeat_ban_seconds": 86400,
@@ -2618,6 +2619,9 @@ async def detect_and_warn(message: Message):
     misjudge_wl = cfg.get("misjudge_whitelist") or []
     misjudge_exempt = isinstance(misjudge_wl, list) and str(user_id) in misjudge_wl
 
+    mild_wl = cfg.get("mild_exempt_whitelist") or []
+    mild_exempt = isinstance(mild_wl, list) and str(user_id) in mild_wl
+
     # 「召唤」：本机器人不做任何动作，由群内其他机器人处理
     if message.text and message.text.strip() == "召唤":
         return
@@ -2910,7 +2914,7 @@ async def detect_and_warn(message: Message):
                 auto_delete_sec=10)
         except Exception as e:
             print(f"自动封禁失败: {e}")
-    elif len(triggers) <= 2 and len(triggers) > 0:
+    elif len(triggers) <= 2 and len(triggers) > 0 and not mild_exempt:
         mild_key = (group_id, user_id)
         entries = mild_trigger_entries.get(mild_key, [])
         rk = _report_key(group_id, message.message_id)
@@ -2919,38 +2923,19 @@ async def detect_and_warn(message: Message):
             entries = (entries + [(message.message_id, warning_id)])[-3:]
         mild_trigger_entries[mild_key] = entries
         if len(entries) >= 3:
-            try:
-                until_date = int(time.time()) + 3 * 3600
-                await bot.restrict_chat_member(
-                    chat_id=group_id,
-                    user_id=user_id,
-                    permissions=ChatPermissions(
-                        can_send_messages=False,
-                        can_send_media_messages=False,
-                        can_send_polls=False,
-                        can_send_other_messages=False,
-                        can_add_web_page_previews=False,
-                        can_change_info=False,
-                        can_invite_users=False,
-                        can_pin_messages=False
-                    ),
-                    until_date=until_date
-                )
-            except Exception as e:
-                print(f"轻度触发3次禁言失败: {e}")
-            for orig_id, wid in entries[:2]:
-                try:
-                    await bot.delete_message(group_id, orig_id)
-                except Exception:
-                    pass
-                try:
-                    await bot.delete_message(group_id, wid)
-                except Exception:
-                    pass
             link = _message_link(group_id, entries[2][0])
             for admin_id in ADMIN_IDS:
                 try:
-                    await bot.send_message(admin_id, f"⚠️ 用户 {user_id} 已第三次触发轻度警告，已禁言3小时。\n定位: {link}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="定位到消息", url=link)]]))
+                    await bot.send_message(
+                        admin_id,
+                        f"⚠️ 用户 {user_id} 已第三次触发轻度警告。\n定位: {link}",
+                        reply_markup=InlineKeyboardMarkup(
+                            inline_keyboard=[[
+                                InlineKeyboardButton(text="定位到消息", url=link),
+                                InlineKeyboardButton(text="豁免轻度", callback_data=f"mild_exempt:{group_id}:{user_id}")
+                            ]]
+                        ),
+                    )
                 except Exception:
                     pass
             mild_trigger_entries[mild_key] = [entries[2]]
@@ -2958,6 +2943,20 @@ async def detect_and_warn(message: Message):
     # 重复发言检测（多层之后执行）
     if await handle_repeat_message(message):
         return
+
+
+@router.message(F.chat.id.in_(GROUP_IDS), F.left_chat_member)
+async def on_member_left(message: Message):
+    """成员退群：删除其在本群的最近消息和全部警告"""
+    try:
+        if not message.left_chat_member or message.left_chat_member.is_bot:
+            return
+        group_id = message.chat.id
+        user_id = message.left_chat_member.id
+        # 利用已有工具函数：删除最近24小时内消息 + 所有警告记录
+        await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
+    except Exception as e:
+        print(f"处理退群用户消息清理失败: {e}")
 
     # 合规消息：仅当 triggers<=1 且本条未受任何处罚时计入
     if len(triggers) <= 1:
@@ -3261,6 +3260,37 @@ async def handle_exempt(callback: CallbackQuery):
         await save_data()
     except Exception as e:
         print("豁免异常:", e)
+        await callback.answer("❌ 失败", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("mild_exempt:"))
+async def handle_mild_exempt(callback: CallbackQuery):
+    """轻度触发豁免：仅关闭该用户的轻度检测，不影响其他检测"""
+    try:
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("已过期")
+            return
+        group_id = int(parts[1])
+        user_id = int(parts[2])
+        caller_id = callback.from_user.id
+        if caller_id not in ADMIN_IDS:
+            await callback.answer("仅管理员操作", show_alert=True)
+            return
+
+        cfg = get_group_config(group_id)
+        wl = cfg.get("mild_exempt_whitelist") or []
+        if not isinstance(wl, list):
+            wl = []
+        sid = str(user_id)
+        if sid not in wl:
+            wl.append(sid)
+            cfg["mild_exempt_whitelist"] = wl
+            await save_config()
+
+        await callback.answer("✅ 已豁免该用户的轻度检测")
+    except Exception as e:
+        print("轻度豁免异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
 
 @router.callback_query(F.data.startswith("mr:"))
