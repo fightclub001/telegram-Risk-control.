@@ -3164,12 +3164,10 @@ async def on_forward_learn_ad(message: Message):
     try:
         f_user = getattr(message, "forward_from", None)
         f_chat = getattr(message, "forward_from_chat", None)
-        if not f_user or not f_chat:
-            # 无法同时获取原用户与原群，放弃处理，避免误删
+        if not f_chat:
             return
 
         group_id = f_chat.id
-        user_id = f_user.id
         # 仅处理配置中的受控群
         if group_id not in GROUP_IDS:
             return
@@ -3180,6 +3178,28 @@ async def on_forward_learn_ad(message: Message):
                 semantic_ad_detector.add_ad_sample(text)
             except Exception as e:
                 print(f"转发学习广告样本失败: {e}")
+        # 1) 优先使用 forward_from 的 uid
+        user_id = None
+        if f_user:
+            user_id = f_user.id
+        else:
+            # 2) 无 uid 时，根据最近缓存按文本匹配尝试推断用户
+            now = time.time()
+            cutoff = now - USER_MSG_24H_SEC
+            best_uid = None
+            best_ts = 0.0
+            for (gid, uid), msgs in user_recent_message_ids.items():
+                if gid != group_id:
+                    continue
+                for msg_id, t, txt in msgs:
+                    if t < cutoff or not txt:
+                        continue
+                    if txt == text and t > best_ts:
+                        best_ts = t
+                        best_uid = uid
+            user_id = best_uid
+        if not user_id:
+            return
 
         try:
             await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
