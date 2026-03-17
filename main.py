@@ -2623,6 +2623,7 @@ async def on_media_message(message: Message):
     user_id = message.from_user.id
     group_id = message.chat.id
     now = time.time()
+    _track_user_message(group_id, user_id, message.message_id, message.caption or "")
     username = message.from_user.username if message.from_user else None
     await _refresh_user_boosts(group_id, user_id)
     if not _can_send_media(group_id, user_id, username):
@@ -3154,7 +3155,7 @@ async def cmd_mark_ad(message: Message):
         await message.reply("❌ 失败", reply_markup=ReplyKeyboardRemove())
 
 
-@router.message((F.forward_from | F.forward_from_chat), F.from_user.id.in_(ADMIN_IDS))
+@router.message(F.from_user.id.in_(ADMIN_IDS))
 async def on_forward_learn_ad(message: Message):
     """
     管理员转发用户消息给机器人：
@@ -3164,6 +3165,14 @@ async def on_forward_learn_ad(message: Message):
     try:
         f_user = getattr(message, "forward_from", None)
         f_chat = getattr(message, "forward_from_chat", None)
+        f_origin = getattr(message, "forward_origin", None)
+
+        # 兼容新版 forward_origin（user/chat/channel）
+        if not f_user and f_origin is not None:
+            f_user = getattr(f_origin, "sender_user", None)
+            if f_chat is None:
+                f_chat = getattr(f_origin, "sender_chat", None)
+
         if not f_chat:
             return
 
@@ -3178,7 +3187,7 @@ async def on_forward_learn_ad(message: Message):
                 semantic_ad_detector.add_ad_sample(text)
             except Exception as e:
                 print(f"转发学习广告样本失败: {e}")
-        # 1) 优先使用 forward_from 的 uid
+        # 1) 优先使用 forward_from / forward_origin 的 uid
         user_id = None
         if f_user:
             user_id = f_user.id
