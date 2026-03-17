@@ -3497,7 +3497,7 @@ async def handle_mark_ad(callback: CallbackQuery):
         try:
             await _delete_user_recent_and_warnings(group_id, suspect_id, orig_msg_id)
         except Exception as e:
-            print(f\"标记广告时删除消息失败: {e}\")
+            print(f"标记广告时删除消息失败: {e}")
 
         async with lock:
             reports.pop(rk, None)
@@ -3505,8 +3505,8 @@ async def handle_mark_ad(callback: CallbackQuery):
         # 不弹窗，仅静默确认
         await callback.answer()
     except Exception as e:
-        print(\"标记广告异常:\", e)
-        await callback.answer(\"❌ 失败\", show_alert=True)
+        print("标记广告异常:", e)
+        await callback.answer("❌ 失败", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("mild_exempt:"))
