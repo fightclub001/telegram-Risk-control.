@@ -3502,7 +3502,8 @@ async def handle_mark_ad(callback: CallbackQuery):
         async with lock:
             reports.pop(rk, None)
         await save_data()
-        await callback.answer("✅ 已标记为广告并删除", show_alert=True)
+        # 不弹窗，仅静默确认
+        await callback.answer()
     except Exception as e:
         print(\"标记广告异常:\", e)
         await callback.answer(\"❌ 失败\", show_alert=True)
