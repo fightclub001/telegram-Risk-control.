@@ -98,6 +98,8 @@ BOT_MSG_AUTO_DELETE_SEC = 24 * 3600  # 机器人消息24小时后自动删除
 
 # 机器人消息跟踪：(group_id, msg_id) -> timestamp
 bot_sent_messages = {}
+# 机器人在群里的“引用回复”跟踪：(group_id, bot_reply_msg_id) -> (original_msg_id, created_ts)
+bot_reply_links = {}
 # 同用户连续触发警告防刷屏：(group_id, user_id) -> (last_warning_time, last_warning_msg_id)
 user_last_warning = {}
 USER_WARNING_COOLDOWN_SEC = 60  # 同用户60秒内只发一条警告
@@ -2179,6 +2181,7 @@ async def handle_repeat_message(message: Message) -> bool:
         try:
             w = await message.reply(warn_text)
             repeat_warning_msg_id[(group_id, user_id)] = w.message_id
+            _track_group_reply(message, w)
         except Exception:
             pass
         return False
@@ -2501,6 +2504,7 @@ async def on_media_message(message: Message):
             asyncio.create_task(_delete_after())
         return
     reply = await message.reply("📎 媒体消息", reply_markup=_media_reply_buttons(group_id, message.message_id, 0, 0))
+    _track_group_reply(message, reply)
     async with media_reports_lock:
         media_reports[(group_id, message.message_id)] = {
             "chat_id": group_id,
@@ -2532,6 +2536,17 @@ def _track_bot_message(group_id: int, msg_id: int, auto_delete_sec: int = BOT_MS
         bot_sent_messages.pop((group_id, msg_id), None)
     
     asyncio.create_task(_auto_delete())
+
+
+def _track_group_reply(message: Message, reply: Message):
+    """仅记录在目标群里的引用回复，后续做补偿删除"""
+    try:
+        chat = message.chat
+        if not chat or chat.id not in GROUP_IDS:
+            return
+        bot_reply_links[(chat.id, reply.message_id)] = (message.message_id, time.time())
+    except Exception:
+        pass
 
 
 def _should_send_warning(group_id: int, user_id: int) -> bool:
@@ -2854,6 +2869,7 @@ async def detect_and_warn(message: Message):
             try:
                 kb = build_warning_buttons(group_id, message.message_id, 0)
                 warning = await message.reply(warning_text, reply_markup=kb)
+                _track_group_reply(message, warning)
                 rk = _report_key(group_id, message.message_id)
                 async with lock:
                     reports[rk] = {
@@ -3431,35 +3447,6 @@ async def handle_media_like(callback: CallbackQuery):
         print("媒体点赞异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
 
-def _media_rules_text(group_id: int) -> str:
-    """缩略版发媒体规则（广播用，无用户上下文故不含个人进度）"""
-    cfg = get_group_config(group_id)
-    need_msg = cfg.get("media_unlock_msg_count", 50)
-    need_boosts = cfg.get("media_unlock_boosts", 4)
-    return (
-        f"📋 发媒体规则：合规消息发送满 {need_msg} 条或助力 {need_boosts} 次可解锁；"
-        "刷屏/重复/短消息不计入。输入「权限」查进度。"
-    )
-
-async def broadcast_media_rules_every_2h():
-    """按群配置间隔向各群发送媒体权限规则（可关、可调间隔），发出后10分钟自动删除"""
-    while True:
-        interval_min = 120
-        for gid in GROUP_IDS:
-            m = get_group_config(gid).get("media_rules_broadcast_interval_minutes", 120)
-            interval_min = min(interval_min, max(1, m))
-        await asyncio.sleep(interval_min * 60)
-        for gid in GROUP_IDS:
-            try:
-                cfg = get_group_config(gid)
-                if not cfg.get("enabled", True) or not cfg.get("media_rules_broadcast", True):
-                    continue
-                sent = await bot.send_message(gid, _media_rules_text(gid))
-                # 10分钟后自动删除
-                _track_bot_message(gid, sent.message_id, 10 * 60)
-            except Exception as e:
-                print(f"广播媒体规则失败 {gid}: {e}")
-
 async def cleanup_deleted_messages():
     """每 10 分钟检查：举报记录超过 24 小时未处理则隐藏按钮并从内存移除。"""
     while True:
@@ -3490,6 +3477,27 @@ async def cleanup_deleted_messages():
             await save_data()
         await asyncio.sleep(1)
 
+
+async def cleanup_orphan_replies():
+    """每小时清理一次机器人在群里的引用回复，避免漏杀"""
+    while True:
+        await asyncio.sleep(3600)
+        # 拷贝一份当前列表，避免遍历时修改
+        items = list(bot_reply_links.items())
+        if not items:
+            continue
+        for (group_id, bot_msg_id), (orig_msg_id, created_ts) in items:
+            try:
+                await bot.delete_message(group_id, bot_msg_id)
+            except TelegramBadRequest:
+                # 已经被删就忽略
+                pass
+            except Exception:
+                # 其他错误也不影响继续
+                pass
+            finally:
+                bot_reply_links.pop((group_id, bot_msg_id), None)
+
 async def main():
     print("🚀 机器人启动")
     if admin_router is not None:
@@ -3508,7 +3516,7 @@ async def main():
     load_link_ref_levels()
     await load_media_stats()
     asyncio.create_task(cleanup_deleted_messages())
-    asyncio.create_task(broadcast_media_rules_every_2h())
+    asyncio.create_task(cleanup_orphan_replies())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
