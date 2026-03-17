@@ -145,7 +145,7 @@ class SemanticAdDetector:
         now = time.time()
         cur = conn.execute(
             "INSERT INTO ads (text, simhash, fingerprint, created_at) VALUES (?, ?, ?, ?)",
-            (norm, sh, fp_str, now),
+            (norm, str(sh), fp_str, now),
         )
         conn.commit()
         new_id = int(cur.lastrowid)
