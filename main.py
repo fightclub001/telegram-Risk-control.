@@ -2517,6 +2517,10 @@ def build_warning_buttons(group_id: int, msg_id: int, report_count: int):
             InlineKeyboardButton(text="禁24h👮‍♂️", callback_data=f"ban24h:{group_id}:{msg_id}"),
             InlineKeyboardButton(text="永封👮‍♂️", callback_data=f"banperm:{group_id}:{msg_id}")
         ])
+    # 管理员标记广告并删除：学习广告样本 + 删除该用户近期全部消息
+    buttons.append([
+        InlineKeyboardButton(text="标记广告并删除👮‍♂️", callback_data=f"markad:{group_id}:{msg_id}")
+    ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def _media_reply_buttons(chat_id: int, media_msg_id: int, report_count: int, like_count: int) -> InlineKeyboardMarkup:
@@ -2814,7 +2818,7 @@ async def detect_and_warn(message: Message):
 
     # 语义广告检测（优先级最高；仅文本消息，白名单用户/词汇跳过；命中后直接删除不做提醒）
     text = message.text or ""
-    if cfg.get("semantic_ad_enabled", False):
+    if cfg.get("semantic_ad_enabled", False) and len((message.text or "").strip()) >= 4:
         exempt_users = cfg.get("exempt_users") or []
         if isinstance(exempt_users, list) and str(user_id) in exempt_users:
             is_semantic_ad = False
@@ -3036,6 +3040,7 @@ async def detect_and_warn(message: Message):
                         "trigger_count": len(triggers),
                         "suspect_name": display_name,
                         "original_message_id": message.message_id,
+                        "original_text": message.text or "",
                         "timestamp": time.time(),
                     }
                 await save_data()
@@ -3057,6 +3062,7 @@ async def detect_and_warn(message: Message):
                     "trigger_count": len(triggers),
                     "suspect_name": display_name,
                     "original_message_id": message.message_id,
+                    "original_text": message.text or "",
                     "timestamp": time.time(),
                 }
             await save_data()
@@ -3114,6 +3120,32 @@ async def detect_and_warn(message: Message):
     # 重复发言检测（多层之后执行）
     if await handle_repeat_message(message):
         return
+
+
+@router.message(Command("ad"), F.chat.id.in_(GROUP_IDS), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
+async def cmd_mark_ad(message: Message):
+    """管理员命令：/ad，回复一条广告消息，学习并删除该用户最近消息。"""
+    try:
+        target = message.reply_to_message
+        if not target or not target.from_user or target.from_user.is_bot:
+            await message.reply("请回复真实用户的广告消息使用 /ad。")
+            return
+        group_id = message.chat.id
+        user_id = target.from_user.id
+        text = target.text or target.caption or ""
+        if text:
+            try:
+                semantic_ad_detector.add_ad_sample(text)
+            except Exception as e:
+                print(f\"/ad 学习广告样本失败: {e}\")
+        try:
+            await _delete_user_recent_and_warnings(group_id, user_id, target.message_id)
+        except Exception as e:
+            print(f\"/ad 删除用户消息失败: {e}\")
+        await message.reply("✅ 已学习并删除该用户近期发言。")
+    except Exception as e:
+        print(\"/ad 命令异常:\", e)
+        await message.reply("❌ 失败", reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(F.chat.id.in_(GROUP_IDS), F.left_chat_member)
@@ -3432,6 +3464,48 @@ async def handle_exempt(callback: CallbackQuery):
     except Exception as e:
         print("豁免异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("markad:"), F.from_user.id.in_(ADMIN_IDS))
+async def handle_mark_ad(callback: CallbackQuery):
+    """标记广告并删除：学习广告样本 + 删除该用户最近消息和全部警告"""
+    try:
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("已过期", show_alert=True)
+            return
+        group_id = int(parts[1])
+        msg_id = int(parts[2])
+        rk = _report_key(group_id, msg_id)
+        async with lock:
+            data = reports.get(rk)
+        if not data:
+            await callback.answer("记录已过期", show_alert=True)
+            return
+        suspect_id = data.get("suspect_id")
+        orig_msg_id = data.get("original_message_id")
+        orig_text = data.get("original_text") or ""
+
+        # 学习广告样本（仅使用当前触发的原始文本）
+        if orig_text:
+            try:
+                semantic_ad_detector.add_ad_sample(orig_text)
+            except Exception as e:
+                print(f"学习广告样本失败: {e}")
+
+        # 删除该用户最近消息和全部警告
+        try:
+            await _delete_user_recent_and_warnings(group_id, suspect_id, orig_msg_id)
+        except Exception as e:
+            print(f\"标记广告时删除消息失败: {e}\")
+
+        async with lock:
+            reports.pop(rk, None)
+        await save_data()
+        await callback.answer("✅ 已标记为广告并删除", show_alert=True)
+    except Exception as e:
+        print(\"标记广告异常:\", e)
+        await callback.answer(\"❌ 失败\", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("mild_exempt:"))
