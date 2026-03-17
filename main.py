@@ -3128,7 +3128,7 @@ async def detect_and_warn(message: Message):
         return
 
 
-@router.message(Command(commands=["ad", "AD", "Ad"]), F.chat.id.in_(GROUP_IDS), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
+@router.message(Command(commands=["ad", "AD", "Ad"]), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
 async def cmd_mark_ad(message: Message):
     """管理员命令：/ad，回复一条广告消息，学习并删除该用户最近消息。"""
     try:
