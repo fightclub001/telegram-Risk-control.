@@ -63,7 +63,7 @@ LINK_REF_LEVELS_FILE = os.path.join(DATA_DIR, "link_ref_levels.json")
 reports = {}  # key: (group_id, message_id)
 lock = asyncio.Lock()
 user_violations = {}  # key: "gid_uid" -> { msg_id: { "time", "reporters": [] } }
-user_recent_message_ids = {}  # (group_id, user_id) -> deque of (msg_id, time), for 24h delete
+user_recent_message_ids = {}  # (group_id, user_id) -> deque of (msg_id, time, text), for 24h delete & learning
 mild_trigger_entries = {}  # (group_id, user_id) -> list of (orig_msg_id, warning_msg_id), max 3
 repeat_warning_msg_id = {}  # (group_id, user_id) -> msg_id of "2次" repeat warning, delete if orig deleted
 # 外部引用 / 消息链接：0=未触发过，1=已触发一次（下次永封）
@@ -2543,8 +2543,14 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
     now = time.time()
     cutoff = now - USER_MSG_24H_SEC
     if key in user_recent_message_ids:
-        for msg_id, t in list(user_recent_message_ids[key]):
+        for msg_id, t, txt in list(user_recent_message_ids[key]):
             if t >= cutoff:
+                # 被机器人删除的消息也作为广告样本学习
+                if txt:
+                    try:
+                        semantic_ad_detector.add_ad_sample(txt)
+                    except Exception as e:
+                        print(f"删除用户消息时学习样本失败: {e}")
                 try:
                     await bot.delete_message(group_id, msg_id)
                 except Exception:
@@ -2701,12 +2707,12 @@ async def on_media_message(message: Message):
             "deleted": False,
         }
 
-def _track_user_message(group_id: int, user_id: int, msg_id: int):
-    """记录用户消息 id 用于 24 小时内可删"""
+def _track_user_message(group_id: int, user_id: int, msg_id: int, text: str = ""):
+    """记录用户消息 id 和文本，用于 24 小时内可删并可学习"""
     key = (group_id, user_id)
     if key not in user_recent_message_ids:
         user_recent_message_ids[key] = deque(maxlen=USER_MSG_TRACK_MAXLEN)
-    user_recent_message_ids[key].append((msg_id, time.time()))
+    user_recent_message_ids[key].append((msg_id, time.time(), text or ""))
 
 
 def _track_bot_message(group_id: int, msg_id: int, auto_delete_sec: int = BOT_MSG_AUTO_DELETE_SEC):
@@ -2814,10 +2820,10 @@ async def detect_and_warn(message: Message):
         return
     user_id = message.from_user.id
     group_id = message.chat.id
-    _track_user_message(group_id, user_id, message.message_id)
+    text = message.text or ""
+    _track_user_message(group_id, user_id, message.message_id, text)
 
     # 语义广告检测（优先级最高；仅文本消息，白名单用户/词汇跳过；命中后直接删除不做提醒）
-    text = message.text or ""
     if cfg.get("semantic_ad_enabled", False) and len((message.text or "").strip()) >= 4:
         exempt_users = cfg.get("exempt_users") or []
         if isinstance(exempt_users, list) and str(user_id) in exempt_users:
