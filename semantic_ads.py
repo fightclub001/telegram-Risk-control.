@@ -1,242 +1,257 @@
+from __future__ import annotations
+
+"""
+轻量级广告检测模块（替换原来的深度学习方案）
+
+约束：
+- 只能使用轻量依赖：simhash / rapidfuzz / jieba / sqlite3 / re / collections / time 等
+- 不依赖 torch / transformers / sentence-transformers / faiss
+
+接口保持与原先 SemanticAdDetector 一致：
+- normalize_text(raw) -> str
+- class SemanticAdDetector(data_dir):
+    - add_ad_sample(raw_text) -> AdSample | None
+    - list_samples() -> List[AdSample]
+    - remove_sample(sample_id) -> bool
+    - check_text(raw_text, min_len=4) -> (is_ad: bool, score: float, matched_id: Optional[int])
+"""
+
 import os
-import json
+import re
+import sqlite3
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import faiss  # type: ignore
-import numpy as np
-from sentence_transformers import SentenceTransformer  # type: ignore
+import jieba  # type: ignore
+from rapidfuzz import fuzz  # type: ignore
+from simhash import Simhash  # type: ignore
 
 
 @dataclass
 class AdSample:
     id: int
     text: str
-    vector: List[float]
-    timestamp: float
+    simhash: int
+    fingerprint: List[str]
+    created_at: float
+
+
+_RE_KEEP = re.compile(r"[0-9a-z\u4e00-\u9fff]")
+_RE_REPEAT = re.compile(r"(.)\1+")
 
 
 def normalize_text(raw: str) -> str:
-    """多阶段广告检测 - 第一阶段：文本归一化."""
+    """文本归一化：只保留中英数字、小写、去标点空格、合并重复字符."""
     if not raw:
         return ""
-    # 统一为小写
     s = raw.lower()
-    # 只保留中文、字母、数字
-    filtered_chars: List[str] = []
+    kept: List[str] = []
     for ch in s:
-        # 中文
-        if "\u4e00" <= ch <= "\u9fff":
-            filtered_chars.append(ch)
-            continue
-        # 英文
-        if "a" <= ch <= "z":
-            filtered_chars.append(ch)
-            continue
-        # 数字
-        if "0" <= ch <= "9":
-            filtered_chars.append(ch)
-            continue
-        # 其他全部丢弃（包括符号、空格等）
-    if not filtered_chars:
+        if _RE_KEEP.match(ch):
+            kept.append(ch)
+    if not kept:
         return ""
-    # 删除连续重复字符
-    result = [filtered_chars[0]]
-    for ch in filtered_chars[1:]:
-        if ch != result[-1]:
-            result.append(ch)
-    return "".join(result)
+    s2 = "".join(kept)
+    s3 = _RE_REPEAT.sub(r"\1", s2)
+    return s3
+
+
+def _ngrams(text: str, n: int = 3) -> List[str]:
+    if len(text) < n:
+        return []
+    return [text[i : i + n] for i in range(len(text) - n + 1)]
+
+
+def _jaccard(a: List[str], b: List[str]) -> float:
+    if not a or not b:
+        return 0.0
+    sa, sb = set(a), set(b)
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    if union == 0:
+        return 0.0
+    return inter / union
+
+
+def _simhash_from_tokens(tokens: List[str]) -> int:
+    if not tokens:
+        return 0
+    return int(Simhash(tokens).value)
+
+
+def _hamming(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
 
 
 class SemanticAdDetector:
-    """多阶段广告检测系统（语义向量 + FAISS 检索）."""
+    """轻量级组合算法广告检测（SimHash + Ngram + RapidFuzz + 关键词权重）."""
 
-    def __init__(self, data_dir: str, model_name: str = "shibing624/text2vec-base-chinese") -> None:
+    def __init__(self, data_dir: str) -> None:
         self.data_dir = data_dir
         os.makedirs(self.data_dir, exist_ok=True)
-        self.db_path = os.path.join(self.data_dir, "semantic_ads.json")
-        self.index_path = os.path.join(self.data_dir, "semantic_ads.index")
-        self.model_name = model_name
+        self.db_path = os.path.join(self.data_dir, "semantic_ads.db")
+        self._conn: Optional[sqlite3.Connection] = None
+        self._ensure_db()
 
-        self._model: Optional[SentenceTransformer] = None
-        self._index: Optional[faiss.IndexFlatIP] = None
-        self._dim: int = 768
-        self._next_id: int = 1
-        self._samples: List[AdSample] = []
+    # ---------- DB ----------
 
-        self._load_state()
+    def _ensure_db(self) -> None:
+        self._conn = sqlite3.connect(self.db_path)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                simhash INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
 
-    # ---------- 模型与索引 ----------
-
-    def _ensure_model(self) -> SentenceTransformer:
-        if self._model is None:
-            self._model = SentenceTransformer(self.model_name)
-        return self._model
-
-    def _ensure_index(self) -> faiss.IndexFlatIP:
-        if self._index is None:
-            self._index = faiss.IndexFlatIP(self._dim)
-            if self._samples:
-                vecs = np.array([s.vector for s in self._samples], dtype="float32")
-                self._index.add(vecs)
-        return self._index
-
-    # ---------- 状态持久化 ----------
-
-    def _load_state(self) -> None:
-        # 加载广告样本
-        if os.path.exists(self.db_path):
-            try:
-                with open(self.db_path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                self._samples = [
-                    AdSample(
-                        id=it["id"],
-                        text=it["text"],
-                        vector=it["vector"],
-                        timestamp=it.get("timestamp", time.time()),
-                    )
-                    for it in raw
-                ]
-                if self._samples:
-                    self._dim = len(self._samples[0].vector)
-                    self._next_id = max(s.id for s in self._samples) + 1
-            except Exception:
-                self._samples = []
-                self._next_id = 1
-
-        # 加载 FAISS 索引（如果存在）
-        if os.path.exists(self.index_path):
-            try:
-                self._index = faiss.read_index(self.index_path)
-                self._dim = self._index.d
-            except Exception:
-                self._index = None
-
-    def _save_state(self) -> None:
-        try:
-            with open(self.db_path, "w", encoding="utf-8") as f:
-                json.dump([asdict(s) for s in self._samples], f, ensure_ascii=False)
-        except Exception:
-            # 持久化失败不影响在线检测
-            pass
-
-        if self._index is not None:
-            try:
-                faiss.write_index(self._index, self.index_path)
-            except Exception:
-                pass
-
-    # ---------- 查询与维护 ----------
-
-    def list_samples(self) -> List[AdSample]:
-        """返回当前广告样本列表（按时间排序，新的在后）."""
-        return sorted(self._samples, key=lambda s: s.timestamp)
-
-    def remove_sample(self, sample_id: int) -> bool:
-        """删除指定广告样本，并重建索引."""
-        idx = None
-        for i, s in enumerate(self._samples):
-            if s.id == sample_id:
-                idx = i
-                break
-        if idx is None:
-            return False
-        self._samples.pop(idx)
-
-        # 重建索引
-        if self._samples:
-            self._dim = len(self._samples[0].vector)
-            self._index = faiss.IndexFlatIP(self._dim)
-            vecs = np.array([s.vector for s in self._samples], dtype="float32")
-            self._index.add(vecs)
-        else:
-            self._index = faiss.IndexFlatIP(self._dim)
-
-        self._save_state()
-        return True
-
-    # ---------- 语义向量 ----------
-
-    def _encode(self, text: str) -> np.ndarray:
-        """第二阶段：生成语义向量，并做 L2 归一化."""
-        model = self._ensure_model()
-        emb = model.encode(text, normalize_embeddings=True)
-        if emb.ndim == 1:
-            return emb.astype("float32")
-        return emb[0].astype("float32")
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._ensure_db()
+        assert self._conn is not None
+        return self._conn
 
     # ---------- 广告样本管理 ----------
 
     def add_ad_sample(self, raw_text: str) -> Optional[AdSample]:
-        """管理员删除消息时调用：写入广告样本库（带相似度去重）."""
+        """加入广告样本（带 SimHash 去重，与现有样本汉明距离≤1视为重复）."""
         norm = normalize_text(raw_text)
-        if not norm:
+        if not norm or len(norm) < 4:
             return None
 
-        vec = self._encode(norm)
+        grams = _ngrams(norm, 3)
+        if not grams:
+            return None
 
-        # 去重检测：与现有广告最高相似度 >= 0.995 则视为重复，不再入库
-        if self._samples:
-            sim, _ = self._search_single(vec)
-            if sim is not None and sim >= 0.995:
+        sh = _simhash_from_tokens(grams)
+        if sh == 0:
+            return None
+
+        conn = self._get_conn()
+        cur = conn.execute("SELECT id, simhash FROM ads")
+        rows = cur.fetchall()
+        for sid, existing_sh in rows:
+            d = _hamming(int(existing_sh), sh)
+            if d <= 1:
                 return None
 
-        sample = AdSample(
-            id=self._next_id,
-            text=norm,
-            vector=vec.tolist(),
-            timestamp=time.time(),
+        fp_str = "|".join(grams)
+        now = time.time()
+        cur = conn.execute(
+            "INSERT INTO ads (text, simhash, fingerprint, created_at) VALUES (?, ?, ?, ?)",
+            (norm, sh, fp_str, now),
         )
-        self._next_id += 1
-        self._samples.append(sample)
+        conn.commit()
+        new_id = int(cur.lastrowid)
+        return AdSample(
+            id=new_id,
+            text=norm,
+            simhash=sh,
+            fingerprint=grams,
+            created_at=now,
+        )
 
-        index = self._ensure_index()
-        index.add(vec.reshape(1, -1))
+    def list_samples(self) -> List[AdSample]:
+        conn = self._get_conn()
+        cur = conn.execute(
+            "SELECT id, text, simhash, fingerprint, created_at FROM ads ORDER BY created_at ASC"
+        )
+        rows = cur.fetchall()
+        samples: List[AdSample] = []
+        for sid, text, sh, fp_str, ts in rows:
+            grams = fp_str.split("|") if fp_str else []
+            samples.append(
+                AdSample(
+                    id=int(sid),
+                    text=str(text),
+                    simhash=int(sh),
+                    fingerprint=grams,
+                    created_at=float(ts),
+                )
+            )
+        return samples
 
-        self._save_state()
-        return sample
-
-    # ---------- 相似度搜索 ----------
-
-    def _search_single(self, vec: np.ndarray) -> Tuple[Optional[float], Optional[int]]:
-        """在广告库中搜索最近邻，返回 (similarity, sample_id)."""
-        if not self._samples:
-            return None, None
-
-        index = self._ensure_index()
-        # FAISS 接口：输入 shape (n, d)
-        D, I = index.search(vec.reshape(1, -1), 1)
-        sim = float(D[0][0])
-        idx = int(I[0][0])
-        if idx < 0 or idx >= len(self._samples):
-            return None, None
-        return sim, self._samples[idx].id
+    def remove_sample(self, sample_id: int) -> bool:
+        conn = self._get_conn()
+        cur = conn.execute("DELETE FROM ads WHERE id = ?", (sample_id,))
+        conn.commit()
+        return cur.rowcount > 0
 
     # ---------- 新消息检测 ----------
 
     def check_text(self, raw_text: str, min_len: int = 4) -> Tuple[bool, float, Optional[int]]:
         """
         新消息检测：
-        1. 归一化
-        2. 文本长度过滤
-        3. 生成语义向量
-        4. 向量相似度搜索
-        5. 阈值判定
-
-        返回: (is_ad, similarity, matched_sample_id)
+        1. 归一化 + 文本长度过滤
+        2. N-gram 指纹 + SimHash
+        3. RapidFuzz 文本相似度
+        4. 关键词权重
+        5. 综合评分
         """
         norm = normalize_text(raw_text)
         if not norm or len(norm) < min_len:
             return False, 0.0, None
 
-        vec = self._encode(norm)
-        sim, sid = self._search_single(vec)
-        if sim is None:
+        conn = self._get_conn()
+        cur = conn.execute("SELECT id, text, simhash, fingerprint FROM ads")
+        rows = cur.fetchall()
+        if not rows:
             return False, 0.0, None
 
-        # 最终判定条件
-        is_ad = sim >= 0.98
-        return is_ad, sim, sid
+        grams_new = _ngrams(norm, 3)
+        sh_new = _simhash_from_tokens(grams_new if grams_new else [norm])
+
+        best_score = 0.0
+        best_id: Optional[int] = None
+
+        for sid, text_old, sh_old, fp_str in rows:
+            sid = int(sid)
+            text_old = str(text_old)
+            sh_old = int(sh_old)
+            grams_old = fp_str.split("|") if fp_str else _ngrams(text_old, 3)
+
+            ngram_sim = _jaccard(grams_new, grams_old)
+            d = _hamming(sh_new, sh_old)
+            simhash_similarity = 1.0 - d / 64.0
+
+            if simhash_similarity <= 0.8 and ngram_sim <= 0.75:
+                continue
+
+            text_similarity = fuzz.ratio(norm, text_old) / 100.0
+
+            keyword_weights = {
+                "免费": 0.2,
+                "下载": 0.2,
+                "破解": 0.3,
+                "频道": 0.2,
+                "福利": 0.1,
+                "tg": 0.2,
+                "加群": 0.2,
+            }
+            keyword_score = 0.0
+            for kw, w in keyword_weights.items():
+                if kw in raw_text or kw in norm:
+                    keyword_score += w
+            if keyword_score > 1.0:
+                keyword_score = 1.0
+
+            score = (
+                0.35 * simhash_similarity
+                + 0.30 * text_similarity
+                + 0.20 * ngram_sim
+                + 0.15 * keyword_score
+            )
+
+            if score > best_score:
+                best_score = score
+                best_id = sid
+
+        is_ad = best_score >= 0.90 and best_id is not None
+        return is_ad, best_score, best_id
 
