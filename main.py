@@ -3137,14 +3137,14 @@ async def cmd_mark_ad(message: Message):
             try:
                 semantic_ad_detector.add_ad_sample(text)
             except Exception as e:
-                print(f\"/ad 学习广告样本失败: {e}\")
+                print(f"/ad 学习广告样本失败: {e}")
         try:
             await _delete_user_recent_and_warnings(group_id, user_id, target.message_id)
         except Exception as e:
-            print(f\"/ad 删除用户消息失败: {e}\")
+            print(f"/ad 删除用户消息失败: {e}")
         await message.reply("✅ 已学习并删除该用户近期发言。")
     except Exception as e:
-        print(\"/ad 命令异常:\", e)
+        print("/ad 命令异常:", e)
         await message.reply("❌ 失败", reply_markup=ReplyKeyboardRemove())
 
 
