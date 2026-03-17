@@ -3154,6 +3154,41 @@ async def cmd_mark_ad(message: Message):
         await message.reply("❌ 失败", reply_markup=ReplyKeyboardRemove())
 
 
+@router.message((F.forward_from | F.forward_from_chat), F.from_user.id.in_(ADMIN_IDS))
+async def on_forward_learn_ad(message: Message):
+    """
+    管理员转发用户消息给机器人：
+    1) 学习该条广告文本
+    2) 根据原始群ID和用户ID，删除其最近24小时内的全部消息和警告，并学习这些文本
+    """
+    try:
+        f_user = getattr(message, "forward_from", None)
+        f_chat = getattr(message, "forward_from_chat", None)
+        if not f_user or not f_chat:
+            # 无法同时获取原用户与原群，放弃处理，避免误删
+            return
+
+        group_id = f_chat.id
+        user_id = f_user.id
+        # 仅处理配置中的受控群
+        if group_id not in GROUP_IDS:
+            return
+
+        text = message.text or message.caption or ""
+        if text:
+            try:
+                semantic_ad_detector.add_ad_sample(text)
+            except Exception as e:
+                print(f"转发学习广告样本失败: {e}")
+
+        try:
+            await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
+        except Exception as e:
+            print(f"转发学习时删除用户消息失败: {e}")
+    except Exception as e:
+        print("转发学习命令异常:", e)
+
+
 @router.message(F.chat.id.in_(GROUP_IDS), F.left_chat_member)
 async def on_member_left(message: Message):
     """成员退群：删除其在本群的最近消息和全部警告"""
