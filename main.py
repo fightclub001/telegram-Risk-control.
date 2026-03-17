@@ -14,6 +14,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from semantic_ads import SemanticAdDetector
 
 # ==================== 环境配置 ====================
 GROUP_IDS = set()
@@ -77,6 +78,8 @@ media_reports = {}
 media_reports_lock = asyncio.Lock()
 media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
+SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
+semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
 # 召唤代发：未解锁用户发「召唤」后下一次媒体由机器人代发（避免炸群）
 summon_pending = {}  # (group_id, user_id) -> timestamp
 SUMMON_TIMEOUT_SEC = 300
@@ -153,6 +156,7 @@ def _default_group_config():
         "media_report_delete_threshold": 3,
         "media_rules_broadcast": True,
         "media_rules_broadcast_interval_minutes": 120,
+        "semantic_ad_enabled": False,
     }
 
 async def load_config():
@@ -517,6 +521,8 @@ class AdminStates(StatesGroup):
     EditExemptUsers = State()
     EditMediaDeleteThreshold = State()
     EditMediaBroadcastInterval = State()
+    EditSemanticAdAdd = State()
+    EditSemanticAdRemove = State()
 
 # ==================== UI 键盘 ====================
 def get_main_menu_keyboard():
@@ -547,6 +553,7 @@ def get_group_menu_keyboard(group_id: int):
         [InlineKeyboardButton(text="👤 名称检测", callback_data=f"submenu_display:{group_id}")],
         [InlineKeyboardButton(text="💬 消息检测", callback_data=f"submenu_message:{group_id}")],
         [InlineKeyboardButton(text="⏱️ 短消息/垃圾", callback_data=f"submenu_short:{group_id}")],
+        [InlineKeyboardButton(text="🧠 AD机器学习", callback_data=f"submenu_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="⚠️ 违规处理", callback_data=f"submenu_violation:{group_id}")],
         [InlineKeyboardButton(text="🔁 重复发言", callback_data=f"submenu_repeat:{group_id}")],
         [InlineKeyboardButton(text="📎 媒体权限", callback_data=f"submenu_media_perm:{group_id}")],
@@ -608,6 +615,19 @@ def get_short_menu_keyboard(group_id: int):
         [InlineKeyboardButton(text=f"窗口: {fmt_duration(window_sec)}", callback_data=f"edit_window:{group_id}")],
         [InlineKeyboardButton(text=f"垃圾 {fill_enabled}", callback_data=f"toggle_fill:{group_id}")],
         [InlineKeyboardButton(text=f"最小: {cfg.get('fill_garbage_min_raw_len')}", callback_data=f"edit_fill_min:{group_id}")],
+        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_semantic_ad_menu_keyboard(group_id: int):
+    cfg = get_group_config(group_id)
+    enabled = "✅" if cfg.get("semantic_ad_enabled", False) else "❌"
+    buttons = [
+        [InlineKeyboardButton(text=f"开关 {enabled}", callback_data=f"toggle_semantic_ad:{group_id}")],
+        [InlineKeyboardButton(text="➕ 增加广告语句", callback_data=f"add_semantic_ad:{group_id}")],
+        [InlineKeyboardButton(text="➖ 减少广告语句", callback_data=f"remove_semantic_ad:{group_id}")],
+        [InlineKeyboardButton(text="📂 广告词库展示", callback_data=f"view_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -805,6 +825,168 @@ async def bio_submenu(callback: CallbackQuery):
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("submenu_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
+async def semantic_ad_submenu(callback: CallbackQuery):
+    """AD机器学习子菜单."""
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
+        cfg = get_group_config(group_id)
+        enabled = "✅" if cfg.get("semantic_ad_enabled", False) else "❌"
+        text = f"<b>{title}</b> › AD机器学习\n\n当前状态: {enabled}"
+        kb = get_semantic_ad_menu_keyboard(group_id)
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("toggle_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
+async def toggle_semantic_ad(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("semantic_ad_enabled", False)
+        cfg["semantic_ad_enabled"] = not current
+        await save_config()
+        enabled = "✅" if cfg["semantic_ad_enabled"] else "❌"
+        await callback.answer(f"AD机器学习: {enabled}", show_alert=True)
+        kb = get_semantic_ad_menu_keyboard(group_id)
+        title = await get_chat_title_safe(callback.bot, group_id)
+        text = f"<b>{title}</b> › AD机器学习\n\n当前状态: {enabled}"
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("add_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
+async def add_semantic_ad_callback(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
+        text = (
+            f"<b>{title}</b> › AD机器学习 › 增加广告语句\n\n"
+            "请发送一条广告样本文本（仅内容部分），我会将其加入广告语义库。\n"
+            "发送 /cancel 取消。"
+        )
+        await callback.message.edit_text(text, reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditSemanticAdAdd)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.message(StateFilter(AdminStates.EditSemanticAdAdd), F.from_user.id.in_(ADMIN_IDS))
+async def process_semantic_ad_add(message: Message, state: FSMContext):
+    try:
+        if not message.text:
+            await message.reply("❌ 请输入文本。发送 /cancel 取消。")
+            return
+        if message.text.strip() == "/cancel":
+            data = await state.get_data()
+            group_id = data.get("group_id")
+            kb = get_semantic_ad_menu_keyboard(group_id)
+            await message.reply("已取消。", reply_markup=kb)
+            await state.set_state(AdminStates.GroupMenu)
+            return
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        kb = get_semantic_ad_menu_keyboard(group_id)
+        lines = [ln.strip() for ln in message.text.split("\n") if ln.strip()]
+        added_ids = []
+        skipped = 0
+        for ln in lines:
+            sample = semantic_ad_detector.add_ad_sample(ln)
+            if sample is None:
+                skipped += 1
+            else:
+                added_ids.append(sample.id)
+        if added_ids:
+            await message.reply(f"✅ 已添加 {len(added_ids)} 条广告样本，ID: {', '.join(map(str, added_ids))}。", reply_markup=kb)
+        if skipped and not added_ids:
+            await message.reply("✅ 所有行与现有样本高度相似，已视为重复，未新增。", reply_markup=kb)
+        elif skipped:
+            await message.reply(f"ℹ️ 其中 {skipped} 行与现有样本高度相似，已跳过。", reply_markup=kb)
+        await state.set_state(AdminStates.GroupMenu)
+    except Exception as e:
+        await message.reply(f"❌ 添加失败: {e}")
+
+
+@router.callback_query(F.data.startswith("view_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
+async def view_semantic_ad(callback: CallbackQuery):
+    try:
+        samples = semantic_ad_detector.list_samples()
+        if not samples:
+            await callback.answer("当前广告语义库为空。", show_alert=True)
+            return
+        # 仅展示前 20 条，避免过长
+        head = samples[-20:]
+        lines = [f"{s.id}: {s.text}" for s in head]
+        text = "广告语义库（最近 20 条，ID: 文本）：\n\n" + "\n".join(lines)
+        await callback.answer(text, show_alert=True)
+    except Exception as e:
+        await callback.answer(f"❌ 查看失败: {e}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("remove_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
+async def remove_semantic_ad_callback(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
+        text = (
+            f"<b>{title}</b> › AD机器学习 › 减少广告语句\n\n"
+            "请发送要删除的广告样本 ID（数字）。可以先点击「广告词库展示」查看 ID。\n"
+            "发送 /cancel 取消。"
+        )
+        await callback.message.edit_text(text, reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditSemanticAdRemove)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.message(StateFilter(AdminStates.EditSemanticAdRemove), F.from_user.id.in_(ADMIN_IDS))
+async def process_semantic_ad_remove(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        if not message.text:
+            await message.reply("❌ 请输入要删除的样本 ID（数字）。发送 /cancel 取消。")
+            return
+        if message.text.strip() == "/cancel":
+            kb = get_semantic_ad_menu_keyboard(group_id)
+            await message.reply("已取消。", reply_markup=kb)
+            await state.set_state(AdminStates.GroupMenu)
+            return
+        kb = get_semantic_ad_menu_keyboard(group_id)
+        lines = [ln.strip() for ln in message.text.split("\n") if ln.strip()]
+        removed = []
+        not_found = []
+        invalid = 0
+        for ln in lines:
+            try:
+                sid = int(ln)
+            except ValueError:
+                invalid += 1
+                continue
+            ok = semantic_ad_detector.remove_sample(sid)
+            if ok:
+                removed.append(sid)
+            else:
+                not_found.append(sid)
+        if removed:
+            await message.reply(f"✅ 已删除广告样本 ID: {', '.join(map(str, removed))}", reply_markup=kb)
+        if not_found:
+            await message.reply(f"ℹ️ 未找到样本 ID: {', '.join(map(str, not_found))}", reply_markup=kb)
+        if invalid and not removed and not not_found:
+            await message.reply("❌ 请输入有效的数字 ID（每行一个）。发送 /cancel 取消。", reply_markup=kb)
+        await state.set_state(AdminStates.GroupMenu)
+    except Exception as e:
+        await message.reply(f"❌ 删除失败: {e}")
 
 @router.callback_query(F.data.startswith("toggle_bio_link:"), F.from_user.id.in_(ADMIN_IDS))
 async def toggle_bio_link(callback: CallbackQuery):
@@ -2630,6 +2812,25 @@ async def detect_and_warn(message: Message):
     group_id = message.chat.id
     _track_user_message(group_id, user_id, message.message_id)
 
+    # 语义广告检测（优先级最高；仅文本消息，白名单用户/词汇跳过；命中后直接删除不做提醒）
+    text = message.text or ""
+    if cfg.get("semantic_ad_enabled", False):
+        exempt_users = cfg.get("exempt_users") or []
+        if isinstance(exempt_users, list) and str(user_id) in exempt_users:
+            is_semantic_ad = False
+        else:
+            wl_words = cfg.get("repeat_exempt_keywords") or []
+            if any(w and w in text for w in wl_words):
+                is_semantic_ad = False
+            else:
+                is_semantic_ad, sim, _ = semantic_ad_detector.check_text(text)
+        if is_semantic_ad:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
+
     # 误判豁免：仅不做多层内容检测，举报阈值/外部引用/5.1/重复等检测仍执行
     misjudge_wl = cfg.get("misjudge_whitelist") or []
     misjudge_exempt = isinstance(misjudge_wl, list) and str(user_id) in misjudge_wl
@@ -2744,53 +2945,7 @@ async def detect_and_warn(message: Message):
             if any(kw.lower() in display_name for kw in cfg.get("display_keywords", [])):
                 triggers.append("昵称词汇")
     
-    # 4. 消息敏感词（可选防拼字：忽略空格标点后匹配）- 误判白名单也检
-    if cfg.get("check_message_keywords", True) and message.text:
-        use_normalize = cfg.get("message_keyword_normalize", True)
-        text_lower = message.text.lower()
-        text_to_match = _normalize_for_keyword(message.text) if use_normalize else text_lower
-        for kw in cfg.get("message_keywords", []):
-            if not kw:
-                continue
-            kw_lower = kw.lower()
-            if use_normalize:
-                kw_norm = _normalize_for_keyword(kw_lower)
-                if kw_norm and kw_norm in text_to_match:
-                    triggers.append("内容词汇")
-                    break
-            else:
-                if kw_lower in text_lower:
-                    triggers.append("内容词汇")
-                    break
-    
-    # 5. 连续极短消息 - 误判白名单也检
-    if cfg.get("short_msg_detection", True) and message.text is not None:
-        th = cfg.get("short_msg_threshold", 3)
-        n_consec = cfg.get("min_consecutive_count", 2)
-        window_sec = cfg.get("time_window_seconds", 60)
-        text_len = len(message.text)
-        if text_len <= th:
-            short_key = (group_id, user_id)
-            if short_key not in user_short_msg_history:
-                user_short_msg_history[short_key] = deque(maxlen=15)
-            history = user_short_msg_history[short_key]
-            now = time.time()
-            while history and now - history[0][0] > window_sec:
-                history.popleft()
-            history.append((now, message.text))
-            recent = list(history)[-n_consec:]
-            if len(recent) >= n_consec and all(len((t or "").strip()) <= th for _, t in recent):
-                triggers.append("连续短消息")
-    
-    # 6. 垃圾填充 - 误判白名单也检
-    if cfg.get("fill_garbage_detection", True):
-        text_len = len(message.text)
-        if text_len >= cfg.get("fill_garbage_min_raw_len", 12):
-            cleaned = ''.join(c for c in message.text if c not in FILL_CHARS).strip()
-            clean_len = len(cleaned)
-            space_ratio = (message.text.count(" ") + message.text.count("　")) / text_len if text_len > 0 else 0
-            if (clean_len <= cfg.get("fill_garbage_max_clean_len", 8)) or (space_ratio >= cfg.get("fill_space_ratio", 0.30)):
-                triggers.append("垃圾填充")
+    # 4~6 功能（消息敏感词 / 连续短消息 / 垃圾填充）暂时下线，不再参与触发
     
     # 消息链接/@引流：误判白名单也检，以便 5.1/5.3 仍执行
     if cfg.get("check_message_link", True) and message.text and _message_has_link_or_external_at(message.text):
