@@ -549,9 +549,7 @@ async def get_group_list_keyboard(bot):
 
 def get_group_menu_keyboard(group_id: int):
     buttons = [
-        [InlineKeyboardButton(text="🔍 简介检测", callback_data=f"submenu_bio:{group_id}")],
-        [InlineKeyboardButton(text="👤 名称检测", callback_data=f"submenu_display:{group_id}")],
-        [InlineKeyboardButton(text="💬 消息检测", callback_data=f"submenu_message:{group_id}")],
+        [InlineKeyboardButton(text="🛡 多层风控检测", callback_data=f"submenu_bio:{group_id}")],
         [InlineKeyboardButton(text="⏱️ 短消息/垃圾", callback_data=f"submenu_short:{group_id}")],
         [InlineKeyboardButton(text="🧠 AD机器学习", callback_data=f"submenu_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="⚠️ 违规处理", callback_data=f"submenu_violation:{group_id}")],
@@ -819,7 +817,7 @@ async def bio_submenu(callback: CallbackQuery):
         cfg = get_group_config(group_id)
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        text = f"<b>{title}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
+        text = f"<b>{title}</b> › 多层风控检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}"
         kb = get_bio_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -918,17 +916,55 @@ async def process_semantic_ad_add(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("view_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
 async def view_semantic_ad(callback: CallbackQuery):
     try:
+        # 解析页码（默认第 0 页 = 最新一页）
+        parts = callback.data.split(":", 1)
+        page = 0
+        if len(parts) == 2:
+            try:
+                page = int(parts[1])
+            except ValueError:
+                page = 0
+        if page < 0:
+            page = 0
+
         samples = semantic_ad_detector.list_samples()
         if not samples:
-            await callback.answer("当前广告语义库为空。", show_alert=True)
+            await callback.answer("当前广告语义库为空。", show_alert=False)
             return
-        # 仅展示前 20 条，避免过长
-        head = samples[-20:]
-        lines = [f"{s.id}: {s.text}" for s in head]
-        text = "广告语义库（最近 20 条，ID: 文本）：\n\n" + "\n".join(lines)
-        await callback.answer(text, show_alert=True)
+
+        PAGE_SIZE = 20
+        total = len(samples)
+        # 按时间排序后，最新在最后一条；分页时从最新往前翻
+        samples_sorted = samples
+        max_page = (total - 1) // PAGE_SIZE
+        if page > max_page:
+            page = max_page
+
+        start = total - (page + 1) * PAGE_SIZE
+        end = total - page * PAGE_SIZE
+        if start < 0:
+            start = 0
+        page_items = samples_sorted[start:end]
+
+        lines = [f"{s.id}: {s.text}" for s in page_items]
+        header = f"广告语义库（共 {total} 条，当前第 {page + 1}/{max_page + 1} 页，ID: 文本）\n"
+        text = header + "\n".join(lines)
+
+        buttons = []
+        if page > 0:
+            buttons.append(InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"view_semantic_ad:{page-1}"))
+        if page < max_page:
+            buttons.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"view_semantic_ad:{page+1}"))
+        rows = []
+        if buttons:
+            rows.append(buttons)
+        # 返回 AD 菜单
+        rows.append([InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_semantic_ad:{callback.message.chat.id}")])
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+        await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
-        await callback.answer(f"❌ 查看失败: {e}", show_alert=True)
+        await callback.answer(f"❌ 查看失败: {e}", show_alert=False)
 
 
 @router.callback_query(F.data.startswith("remove_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
@@ -1001,7 +1037,7 @@ async def toggle_bio_link(callback: CallbackQuery):
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
         breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
+        text = f"<b>{breadcrumb}</b> › 多层风控检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -1019,7 +1055,7 @@ async def toggle_bio_keywords(callback: CallbackQuery):
         link_status = "✅" if cfg.get("check_bio_link") else "❌"
         kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
         breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 简介检测\n\n链接: {link_status}\n敏感词: {kw_status}"
+        text = f"<b>{breadcrumb}</b> › 多层风控检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}"
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
