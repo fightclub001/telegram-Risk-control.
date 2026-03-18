@@ -526,10 +526,9 @@ class AdminStates(StatesGroup):
 
 # ==================== UI 键盘 ====================
 def get_main_menu_keyboard():
+    """单群模式：保留占位，不再使用旧首页键盘。"""
     buttons = [
-        [InlineKeyboardButton(text="⚙️ 群组管理", callback_data="choose_group")],
-        [InlineKeyboardButton(text="📊 状态查看", callback_data="view_status")],
-        [InlineKeyboardButton(text="🔧 全局系统配置", callback_data="admin:main")],
+        [InlineKeyboardButton(text="⚙️ 进入本群控制台", callback_data="group_menu_single")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -550,15 +549,15 @@ async def get_group_list_keyboard(bot):
 def get_group_menu_keyboard(group_id: int):
     buttons = [
         [InlineKeyboardButton(text="🛡 多层风控检测", callback_data=f"submenu_bio:{group_id}")],
-        [InlineKeyboardButton(text="⏱️ 短消息/垃圾", callback_data=f"submenu_short:{group_id}")],
         [InlineKeyboardButton(text="🧠 AD机器学习", callback_data=f"submenu_semantic_ad:{group_id}")],
+        [InlineKeyboardButton(text="⏱️ 短消息/垃圾", callback_data=f"submenu_short:{group_id}")],
         [InlineKeyboardButton(text="⚠️ 违规处理", callback_data=f"submenu_violation:{group_id}")],
         [InlineKeyboardButton(text="🔁 重复发言", callback_data=f"submenu_repeat:{group_id}")],
         [InlineKeyboardButton(text="📎 媒体权限", callback_data=f"submenu_media_perm:{group_id}")],
         [InlineKeyboardButton(text="📣 媒体举报", callback_data=f"submenu_media_report:{group_id}")],
         [InlineKeyboardButton(text="🤖 自动回复", callback_data=f"submenu_autoreply:{group_id}")],
         [InlineKeyboardButton(text="🎛️ 基础设置", callback_data=f"submenu_basic:{group_id}")],
-        [InlineKeyboardButton(text="⬅️ 返回", callback_data="back_choose_group")],
+        [InlineKeyboardButton(text="🔗 多功能叠加规则", callback_data=f"submenu_multi_rules:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -736,18 +735,47 @@ def get_media_report_menu_keyboard(group_id: int):
 # ==================== 管理员命令 ====================
 @router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_panel(message: Message, state: FSMContext):
-    text = "👮 管理员面板"
-    kb = get_main_menu_keyboard()
+    """单群模式：直接进入唯一群组的功能面板。"""
+    if not GROUP_IDS:
+        await message.reply("当前未配置任何受控群组（GROUP_IDS 为空）。")
+        return
+    # 取第一个群ID作为当前控制对象
+    group_id = list(GROUP_IDS)[0]
+    await state.update_data(group_id=group_id)
+    title = await get_chat_title_safe(message.bot, group_id)
+    cfg = get_group_config(group_id)
+    status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
+    text = (
+        f"👮 管理员面板（单群模式）\n\n"
+        f"👥 <b>{title}</b>\n"
+        f"<code>ID: {group_id}</code>  |  状态: {status}\n\n"
+        "请选择要管理的功能："
+    )
+    kb = get_group_menu_keyboard(group_id)
     await message.reply(text, reply_markup=kb)
-    await state.set_state(AdminStates.MainMenu)
+    await state.set_state(AdminStates.GroupMenu)
 
 # ==================== 回调处理 ====================
 @router.callback_query(F.data == "choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def choose_group_callback(callback: CallbackQuery, state: FSMContext):
-    text = "📋 选择要管理的群组（名称 + ID）："
-    kb = await get_group_list_keyboard(callback.bot)
+    """兼容旧入口：在单群模式下直接跳回本群控制台。"""
+    if not GROUP_IDS:
+        await callback.answer("未配置受控群组。", show_alert=True)
+        return
+    group_id = list(GROUP_IDS)[0]
+    await state.update_data(group_id=group_id)
+    title = await get_chat_title_safe(callback.bot, group_id)
+    cfg = get_group_config(group_id)
+    status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
+    text = (
+        f"👮 管理员面板（单群模式）\n\n"
+        f"👥 <b>{title}</b>\n"
+        f"<code>ID: {group_id}</code>  |  状态: {status}\n\n"
+        "请选择要管理的功能："
+    )
+    kb = get_group_menu_keyboard(group_id)
     await callback.message.edit_text(text, reply_markup=kb)
-    await state.set_state(AdminStates.ChooseGroup)
+    await state.set_state(AdminStates.GroupMenu)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("select_group:"), F.from_user.id.in_(ADMIN_IDS))
@@ -781,11 +809,8 @@ async def back_main(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "back_choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def back_choose_group(callback: CallbackQuery, state: FSMContext):
-    text = "📋 选择要管理的群组（名称 + ID）："
-    kb = await get_group_list_keyboard(callback.bot)
-    await callback.message.edit_text(text, reply_markup=kb)
-    await state.set_state(AdminStates.ChooseGroup)
-    await callback.answer()
+    """单群模式下，返回即回到本群控制台。"""
+    await choose_group_callback(callback, state)
 
 @router.callback_query(F.data.startswith("group_menu:"), F.from_user.id.in_(ADMIN_IDS))
 async def group_menu(callback: CallbackQuery, state: FSMContext):
@@ -804,6 +829,38 @@ async def group_menu(callback: CallbackQuery, state: FSMContext):
         kb = get_group_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("submenu_multi_rules:"), F.from_user.id.in_(ADMIN_IDS))
+async def multi_rules_submenu(callback: CallbackQuery):
+    """多功能叠加规则：展示当前各模块的触发顺序与优先级。"""
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
+        cfg = get_group_config(group_id)
+        text = (
+            f"<b>{title}</b> › 多功能叠加规则\n\n"
+            "当前触发顺序（从上到下，前者优先）：\n"
+            "1️⃣ AD 语义广告检测：命中后直接删除该条消息，不再执行后续检测。\n"
+            "2️⃣ 举报阈值禁言：被非管理员举报消息数 ≥ 阈值 "
+            f"（当前: {cfg.get('reported_message_threshold', 3)}）时按次数封禁并删除消息。\n"
+            "3️⃣ 多层风控检测：简介/昵称/链接等命中形成多层触发，3 层及以上直接封禁并清理 24 小时内消息。\n"
+            "4️⃣ 轻度触发累计：1～2 层触发计入轻度警告，达到 3 次时仅通知管理员，可在 AD 面板中豁免轻度。\n"
+            "5️⃣ 重复发言检测：在配置窗口内多次重复同一内容，按违规等级禁言并清理近期消息。\n\n"
+            "当前策略为：\n"
+            "- AD 命中后，不再进入举报、多层、重复检测（避免多次处罚）。\n"
+            "- 当多层风控和重复发言同时满足时，以多层风控结果为准（更重的处罚覆盖较轻处罚）。\n\n"
+            "后续如果需要，可以在这里增加可调策略，例如切换优先级或是否让 AD 命中也计入其它统计。"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")]
+            ]
+        )
+        await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
