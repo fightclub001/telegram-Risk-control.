@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove, BufferedInputFile
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -108,6 +108,46 @@ user_last_warning = {}
 USER_WARNING_COOLDOWN_SEC = 60  # 同用户60秒内只发一条警告
 # 已封禁警告消息列表：group_id -> list of warning_msg_id（用于一次性删除所有已封禁警告）
 banned_warning_messages = {}
+
+# ==================== 监听决策日志（仅保留最近10条） ====================
+listen_decision_logs = deque(maxlen=10)  # newest appended to right
+
+
+def _clip_text(s: str, n: int = 80) -> str:
+    s = (s or "").replace("\n", " ").strip()
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
+
+
+def _push_listen_log(
+    *,
+    group_id: int | None,
+    user_id: int | None,
+    msg_id: int | None,
+    text: str,
+    verdict: str,
+    details: str = "",
+) -> None:
+    """
+    记录一次“收到消息→决策路径→结果”的摘要。
+    verdict 示例：SKIP / PASS / AD_DELETE / RULE_DELETE / RULE_BAN / ERROR 等
+    """
+    try:
+        ts = int(time.time())
+        listen_decision_logs.append(
+            {
+                "ts": ts,
+                "group_id": group_id,
+                "user_id": user_id,
+                "msg_id": msg_id,
+                "text": _clip_text(text, 120),
+                "verdict": verdict,
+                "details": _clip_text(details, 300),
+            }
+        )
+    except Exception:
+        pass
 
 # ==================== 配置函数 ====================
 def _default_group_config():
@@ -662,6 +702,7 @@ def get_basic_menu_keyboard(group_id: int):
     buttons = [
         [InlineKeyboardButton(text=f"状态: {enabled}", callback_data=f"toggle_group:{group_id}")],
         [InlineKeyboardButton(text=f"🛡️ 豁免用户 ({n})", callback_data=f"submenu_exempt:{group_id}")],
+        [InlineKeyboardButton(text="📄 导出监听日志（近10条）", callback_data=f"export_listen_log:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -959,6 +1000,12 @@ async def process_semantic_ad_add(message: Message, state: FSMContext):
                 skipped += 1
             else:
                 added_ids.append(sample.id)
+        # 只要成功学习到样本，就自动开启该群的 AD 语义检测，避免“只收录不生效”
+        if added_ids and group_id:
+            cfg = get_group_config(group_id)
+            if not cfg.get("semantic_ad_enabled", False):
+                cfg["semantic_ad_enabled"] = True
+                await save_config()
         if added_ids:
             await message.reply(f"✅ 已添加 {len(added_ids)} 条广告样本，ID: {', '.join(map(str, added_ids))}。", reply_markup=kb)
         if skipped and not added_ids:
@@ -2274,6 +2321,58 @@ async def toggle_group(callback: CallbackQuery):
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
+
+@router.callback_query(F.data.startswith("export_listen_log:"), F.from_user.id.in_(ADMIN_IDS))
+async def export_listen_log(callback: CallbackQuery):
+    """导出最近 10 条监听决策日志（用于定位：是否收到群消息、为何未触发 AD/规则）。"""
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
+        rows = list(listen_decision_logs)
+        if not rows:
+            text = (
+                f"<b>{title}</b> › 监听日志（近10条）\n\n"
+                "当前没有任何监听记录。\n\n"
+                "这通常意味着：机器人没有收到群消息更新。\n"
+                "请优先检查：\n"
+                "1) BotFather 隐私模式（/setprivacy）是否关闭\n"
+                "2) 机器人是否是群管理员 & 有读取/删除权限\n"
+                "3) 环境变量 GROUP_IDS 是否包含该群真实 chat.id（常见为 -100…）"
+            )
+            await callback.message.reply(text)
+            await callback.answer()
+            return
+
+        # 最新在后，导出时按“新→旧”
+        lines = [f"{title} 监听日志（近10条，新→旧）", f"导出时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}", ""]
+        for it in reversed(rows):
+            gid = it.get("group_id")
+            uid = it.get("user_id")
+            mid = it.get("msg_id")
+            ts = it.get("ts", 0)
+            tstr = time.strftime("%m-%d %H:%M:%S", time.localtime(ts)) if ts else "??"
+            verdict = it.get("verdict", "")
+            txt = it.get("text", "")
+            details = it.get("details", "")
+            lines.append(f"[{tstr}] gid={gid} uid={uid} mid={mid} => {verdict}")
+            if txt:
+                lines.append(f"  msg: {txt}")
+            if details:
+                lines.append(f"  why: {details}")
+            lines.append("")
+        out = "\n".join(lines).strip()
+
+        # 1) 先发一份文本（便于快速看）
+        await callback.message.reply(f"<pre>{out}</pre>")
+
+        # 2) 再发一份 txt 作为“导出”
+        buf = out.encode("utf-8")
+        filename = f"listen_log_{int(time.time())}.txt"
+        await callback.message.reply_document(BufferedInputFile(buf, filename=filename))
+        await callback.answer("✅ 已导出")
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
 @router.callback_query(F.data.startswith("submenu_exempt:"), F.from_user.id.in_(ADMIN_IDS))
 async def exempt_submenu(callback: CallbackQuery):
     try:
@@ -2908,9 +3007,25 @@ def _has_external_reference(message: Message) -> bool:
 async def detect_and_warn(message: Message):
     """发言时检测并发送警告。顺序：豁免 -> 召唤(无操作) -> 权限 -> 举报阈值 -> 多层 -> 5.1 -> 5.3 -> 重复；合规仅当 triggers<=1 且无处罚。"""
     if not message.from_user or message.from_user.is_bot:
+        _push_listen_log(
+            group_id=getattr(message.chat, "id", None),
+            user_id=getattr(getattr(message, "from_user", None), "id", None),
+            msg_id=getattr(message, "message_id", None),
+            text=(message.text or ""),
+            verdict="SKIP",
+            details="from_user 为空或消息来自机器人",
+        )
         return
     cfg = get_group_config(message.chat.id)
     if not cfg.get("enabled", True):
+        _push_listen_log(
+            group_id=message.chat.id,
+            user_id=message.from_user.id,
+            msg_id=message.message_id,
+            text=(message.text or ""),
+            verdict="SKIP",
+            details="群组总开关 enabled=false，未执行任何检测",
+        )
         return
     user_id = message.from_user.id
     group_id = message.chat.id
@@ -2922,18 +3037,66 @@ async def detect_and_warn(message: Message):
         exempt_users = cfg.get("exempt_users") or []
         if isinstance(exempt_users, list) and str(user_id) in exempt_users:
             is_semantic_ad = False
+            _push_listen_log(
+                group_id=group_id,
+                user_id=user_id,
+                msg_id=message.message_id,
+                text=text,
+                verdict="PASS",
+                details="进入AD检测但命中豁免用户 exempt_users，跳过AD匹配",
+            )
         else:
             wl_words = cfg.get("repeat_exempt_keywords") or []
             if any(w and w in text for w in wl_words):
                 is_semantic_ad = False
+                _push_listen_log(
+                    group_id=group_id,
+                    user_id=user_id,
+                    msg_id=message.message_id,
+                    text=text,
+                    verdict="PASS",
+                    details="进入AD检测但命中豁免词 repeat_exempt_keywords，跳过AD匹配",
+                )
             else:
                 is_semantic_ad, sim, _ = semantic_ad_detector.check_text(text)
+                _push_listen_log(
+                    group_id=group_id,
+                    user_id=user_id,
+                    msg_id=message.message_id,
+                    text=text,
+                    verdict="AD_HIT" if is_semantic_ad else "AD_MISS",
+                    details=f"AD匹配结果: is_ad={is_semantic_ad}, score={sim:.3f}",
+                )
         if is_semantic_ad:
             try:
                 await message.delete()
             except Exception:
                 pass
+            _push_listen_log(
+                group_id=group_id,
+                user_id=user_id,
+                msg_id=message.message_id,
+                text=text,
+                verdict="AD_DELETE",
+                details="命中AD语义库，已执行删除（当前策略：仅删不提示/不禁言）",
+            )
             return
+    else:
+        # 记录为什么没有进入 AD 检测（方便排查“优先级最高但不执行”）
+        reason = []
+        if not cfg.get("semantic_ad_enabled", False):
+            reason.append("semantic_ad_enabled=false")
+        if len((message.text or "").strip()) < 4:
+            reason.append("文本长度<4")
+        if reason:
+            _push_listen_log(
+                group_id=group_id,
+                user_id=user_id,
+                msg_id=message.message_id,
+                text=text,
+                verdict="PASS",
+                details="未进入AD检测: " + "，".join(reason),
+            )
 
     # 误判豁免：仅不做多层内容检测，举报阈值/外部引用/5.1/重复等检测仍执行
     misjudge_wl = cfg.get("misjudge_whitelist") or []
@@ -3062,6 +3225,14 @@ async def detect_and_warn(message: Message):
             await message.delete()
         except Exception:
             pass
+        _push_listen_log(
+            group_id=group_id,
+            user_id=user_id,
+            msg_id=message.message_id,
+            text=text,
+            verdict="RULE_DELETE",
+            details="多层规则命中: 消息链接/@引流，已执行删除并进入封禁流程",
+        )
         # 发送引流提示（10秒后自动删除）
         try:
             sent = await bot.send_message(group_id, f"用户 {display_name} 违规引流。")
@@ -3219,7 +3390,35 @@ async def detect_and_warn(message: Message):
 
     # 重复发言检测（多层之后执行）
     if await handle_repeat_message(message):
+        _push_listen_log(
+            group_id=group_id,
+            user_id=user_id,
+            msg_id=message.message_id,
+            text=text,
+            verdict="RULE_ACTION",
+            details="重复发言检测已触发并执行处罚/提醒（详见重复发言模块）",
+        )
         return
+
+    # 走到这里说明没有触发任何处罚型规则
+    if triggers:
+        _push_listen_log(
+            group_id=group_id,
+            user_id=user_id,
+            msg_id=message.message_id,
+            text=text,
+            verdict="PASS",
+            details="多层监听触发项: " + "、".join(triggers),
+        )
+    else:
+        _push_listen_log(
+            group_id=group_id,
+            user_id=user_id,
+            msg_id=message.message_id,
+            text=text,
+            verdict="PASS",
+            details="未命中AD语义库；多层监听无触发项",
+        )
 
 
 @router.message(Command(commands=["ad", "AD", "Ad"]), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
@@ -3236,6 +3435,10 @@ async def cmd_mark_ad(message: Message):
         if text:
             try:
                 semantic_ad_detector.add_ad_sample(text)
+                cfg = get_group_config(group_id)
+                if not cfg.get("semantic_ad_enabled", False):
+                    cfg["semantic_ad_enabled"] = True
+                    await save_config()
             except Exception as e:
                 print(f"/ad 学习广告样本失败: {e}")
         try:
@@ -3266,20 +3469,33 @@ async def on_forward_learn_ad(message: Message):
             if f_chat is None:
                 f_chat = getattr(f_origin, "sender_chat", None)
 
+        text = message.text or message.caption or ""
+        learned = False
+        if text:
+            try:
+                semantic_ad_detector.add_ad_sample(text)
+                learned = True
+            except Exception as e:
+                print(f"转发学习广告样本失败: {e}")
+        # 即使拿不到原群信息，也允许“仅学习入库”，并给管理员回执
         if not f_chat:
+            if learned:
+                await message.reply("✅ 已学习该转发消息内容（未包含原群信息，无法回群批量删除）。")
             return
 
         group_id = f_chat.id
         # 仅处理配置中的受控群
         if group_id not in GROUP_IDS:
+            if learned:
+                await message.reply("✅ 已学习该转发消息内容（原群不在 GROUP_IDS，未执行回群删除）。")
             return
 
-        text = message.text or message.caption or ""
-        if text:
-            try:
-                semantic_ad_detector.add_ad_sample(text)
-            except Exception as e:
-                print(f"转发学习广告样本失败: {e}")
+        # 学习成功则自动开启该群的 AD 语义检测
+        if learned:
+            cfg = get_group_config(group_id)
+            if not cfg.get("semantic_ad_enabled", False):
+                cfg["semantic_ad_enabled"] = True
+                await save_config()
         # 1) 优先使用 forward_from / forward_origin 的 uid
         user_id = None
         if f_user:
@@ -3301,6 +3517,8 @@ async def on_forward_learn_ad(message: Message):
                         best_uid = uid
             user_id = best_uid
         if not user_id:
+            if learned:
+                await message.reply("✅ 已学习该转发消息内容（未能解析原发送用户ID，无法回群批量删除）。")
             return
 
         try:
