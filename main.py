@@ -2565,7 +2565,7 @@ async def handle_repeat_message(message: Message) -> bool:
         current_level = repeat_violation_level.get(level_key, 0)
         display_name = _get_display_name_from_message(message, user_id)
         try:
-            await message.delete()
+            await _delete_original_and_linked_reply(group_id, message.message_id)
         except TelegramBadRequest:
             wid = repeat_warning_msg_id.pop((group_id, user_id), None)
             if wid:
@@ -2743,10 +2743,7 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
                         semantic_ad_detector.add_ad_sample(txt)
                     except Exception as e:
                         print(f"删除用户消息时学习样本失败: {e}")
-                try:
-                    await bot.delete_message(group_id, msg_id)
-                except Exception:
-                    pass
+                await _delete_original_and_linked_reply(group_id, msg_id)
     to_remove = []
     async with lock:
         for (gid, mid), data in list(reports.items()):
@@ -2760,10 +2757,7 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
             reports.pop(k, None)
     await save_data()
     if orig_msg_id:
-        try:
-            await bot.delete_message(group_id, orig_msg_id)
-        except Exception:
-            pass
+        await _delete_original_and_linked_reply(group_id, orig_msg_id)
     if keep_one_text:
         try:
             sent = await bot.send_message(group_id, keep_one_text)
@@ -2816,13 +2810,14 @@ async def on_media_message(message: Message):
     group_id = message.chat.id
     now = time.time()
     _track_user_message(group_id, user_id, message.message_id, message.caption or "")
+    semantic_text = (message.caption or "").strip()
+    if semantic_text:
+        if await _check_and_delete_semantic_ad_message(message, semantic_text, group_id=group_id, user_id=user_id):
+            return
     username = message.from_user.username if message.from_user else None
     await _refresh_user_boosts(group_id, user_id)
     if not _can_send_media(group_id, user_id, username):
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        await _delete_original_and_linked_reply(group_id, message.message_id)
         need_msg = cfg.get("media_unlock_msg_count", 50)
         need_boosts = cfg.get("media_unlock_boosts", 4)
         key = _media_key(group_id, user_id)
@@ -2934,6 +2929,109 @@ def _track_group_reply(message: Message, reply: Message):
         pass
 
 
+async def _delete_linked_bot_replies(group_id: int, original_msg_id: int | None):
+    """删除引用了某条原消息的机器人回复，避免原消息删除后群里残留机器人的告警。"""
+    if not original_msg_id:
+        return
+    linked = [
+        (bot_msg_id, created_ts)
+        for (gid, bot_msg_id), (orig_msg_id, created_ts) in list(bot_reply_links.items())
+        if gid == group_id and orig_msg_id == original_msg_id
+    ]
+    for bot_msg_id, _ in linked:
+        try:
+            await bot.delete_message(group_id, bot_msg_id)
+        except Exception:
+            pass
+        finally:
+            bot_reply_links.pop((group_id, bot_msg_id), None)
+
+
+async def _delete_original_and_linked_reply(group_id: int, original_msg_id: int | None):
+    """删除原消息，并同步删除机器人对该消息的引用回复。"""
+    if not original_msg_id:
+        return
+    try:
+        await bot.delete_message(group_id, original_msg_id)
+    except Exception:
+        pass
+    await _delete_linked_bot_replies(group_id, original_msg_id)
+
+
+def _semantic_detection_enabled_for_group(group_id: int) -> bool:
+    cfg = get_group_config(group_id)
+    return bool(cfg.get("semantic_ad_enabled", False))
+
+
+async def _enable_semantic_detection_for_group(group_id: int) -> bool:
+    """学习到广告样本后，确保对应群组开启语义广告检测。"""
+    cfg = get_group_config(group_id)
+    if cfg.get("semantic_ad_enabled", False):
+        return False
+    cfg["semantic_ad_enabled"] = True
+    await save_config()
+    return True
+
+
+async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, group_id: int, user_id: int) -> bool:
+    """
+    用已学习的广告库主动匹配当前消息。
+    命中后直接删除原消息和相关机器人回复。
+    """
+    if not _semantic_detection_enabled_for_group(group_id):
+        return False
+    if len((text or "").strip()) < 4:
+        return False
+
+    cfg = get_group_config(group_id)
+    exempt_users = cfg.get("exempt_users") or []
+    if isinstance(exempt_users, list) and str(user_id) in exempt_users:
+        _push_listen_log(
+            group_id=group_id,
+            user_id=user_id,
+            msg_id=message.message_id,
+            text=text,
+            verdict="PASS",
+            details="进入AD检测但命中豁免用户 exempt_users，跳过AD匹配",
+        )
+        return False
+
+    wl_words = cfg.get("repeat_exempt_keywords") or []
+    if any(w and w in text for w in wl_words):
+        _push_listen_log(
+            group_id=group_id,
+            user_id=user_id,
+            msg_id=message.message_id,
+            text=text,
+            verdict="PASS",
+            details="进入AD检测但命中豁免词 repeat_exempt_keywords，跳过AD匹配",
+        )
+        return False
+
+    is_semantic_ad, sim, _ = semantic_ad_detector.check_text(text)
+    _push_listen_log(
+        group_id=group_id,
+        user_id=user_id,
+        msg_id=message.message_id,
+        text=text,
+        verdict="AD_HIT" if is_semantic_ad else "AD_MISS",
+        details=f"AD匹配结果: is_ad={is_semantic_ad}, score={sim:.3f}",
+    )
+    if not is_semantic_ad:
+        return False
+
+    await _delete_original_and_linked_reply(group_id, message.message_id)
+    _push_listen_log(
+        group_id=group_id,
+        user_id=user_id,
+        msg_id=message.message_id,
+        text=text,
+        verdict="AD_DELETE",
+        details="命中AD语义库，已执行删除",
+    )
+    return True
+
+
 def _should_send_warning(group_id: int, user_id: int) -> bool:
     """检查是否应该为该用户发送新警告（防止刷屏）"""
     key = (group_id, user_id)
@@ -3032,54 +3130,9 @@ async def detect_and_warn(message: Message):
     text = message.text or ""
     _track_user_message(group_id, user_id, message.message_id, text)
 
-    # 语义广告检测（优先级最高；仅文本消息，白名单用户/词汇跳过；命中后直接删除不做提醒）
+    # 语义广告检测（优先级最高；命中后直接删除不做提醒）
     if cfg.get("semantic_ad_enabled", False) and len((message.text or "").strip()) >= 4:
-        exempt_users = cfg.get("exempt_users") or []
-        if isinstance(exempt_users, list) and str(user_id) in exempt_users:
-            is_semantic_ad = False
-            _push_listen_log(
-                group_id=group_id,
-                user_id=user_id,
-                msg_id=message.message_id,
-                text=text,
-                verdict="PASS",
-                details="进入AD检测但命中豁免用户 exempt_users，跳过AD匹配",
-            )
-        else:
-            wl_words = cfg.get("repeat_exempt_keywords") or []
-            if any(w and w in text for w in wl_words):
-                is_semantic_ad = False
-                _push_listen_log(
-                    group_id=group_id,
-                    user_id=user_id,
-                    msg_id=message.message_id,
-                    text=text,
-                    verdict="PASS",
-                    details="进入AD检测但命中豁免词 repeat_exempt_keywords，跳过AD匹配",
-                )
-            else:
-                is_semantic_ad, sim, _ = semantic_ad_detector.check_text(text)
-                _push_listen_log(
-                    group_id=group_id,
-                    user_id=user_id,
-                    msg_id=message.message_id,
-                    text=text,
-                    verdict="AD_HIT" if is_semantic_ad else "AD_MISS",
-                    details=f"AD匹配结果: is_ad={is_semantic_ad}, score={sim:.3f}",
-                )
-        if is_semantic_ad:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            _push_listen_log(
-                group_id=group_id,
-                user_id=user_id,
-                msg_id=message.message_id,
-                text=text,
-                verdict="AD_DELETE",
-                details="命中AD语义库，已执行删除（当前策略：仅删不提示/不禁言）",
-            )
+        if await _check_and_delete_semantic_ad_message(message, text, group_id=group_id, user_id=user_id):
             return
     else:
         # 记录为什么没有进入 AD 检测（方便排查“优先级最高但不执行”）
@@ -3154,10 +3207,7 @@ async def detect_and_warn(message: Message):
                 ),
                 until_date=until_date
             )
-            try:
-                await message.delete()
-            except Exception:
-                pass
+            await _delete_original_and_linked_reply(group_id, message.message_id)
             display_name = _get_display_name_from_message(message, user_id)
             await bot.send_message(
                 group_id,
@@ -3221,10 +3271,7 @@ async def detect_and_warn(message: Message):
     # 5.1 消息链接/@引流即时动作：首次禁言1小时，第二次永封；封禁消息10秒后自动删除
     if "消息链接/@引流" in triggers:
         display_name = _get_display_name_from_message(message, user_id)
-        try:
-            await message.delete()
-        except Exception:
-            pass
+        await _delete_original_and_linked_reply(group_id, message.message_id)
         _push_listen_log(
             group_id=group_id,
             user_id=user_id,
@@ -3435,10 +3482,7 @@ async def cmd_mark_ad(message: Message):
         if text:
             try:
                 semantic_ad_detector.add_ad_sample(text)
-                cfg = get_group_config(group_id)
-                if not cfg.get("semantic_ad_enabled", False):
-                    cfg["semantic_ad_enabled"] = True
-                    await save_config()
+                await _enable_semantic_detection_for_group(group_id)
             except Exception as e:
                 print(f"/ad 学习广告样本失败: {e}")
         try:
@@ -3492,10 +3536,7 @@ async def on_forward_learn_ad(message: Message):
 
         # 学习成功则自动开启该群的 AD 语义检测
         if learned:
-            cfg = get_group_config(group_id)
-            if not cfg.get("semantic_ad_enabled", False):
-                cfg["semantic_ad_enabled"] = True
-                await save_config()
+            await _enable_semantic_detection_for_group(group_id)
         # 1) 优先使用 forward_from / forward_origin 的 uid
         user_id = None
         if f_user:
@@ -3767,10 +3808,7 @@ async def handle_ban(callback: CallbackQuery):
                 pass
         else:
             # 24小时禁言：删除源消息，更新警告
-            try:
-                await bot.delete_message(group_id, msg_id)
-            except Exception:
-                pass
+            await _delete_original_and_linked_reply(group_id, msg_id)
             final_text = (
                 f"🚫 用户 {display_name}\n"
                 f"📌 触发原因：{reason}（已被 {report_count} 位成员举报）\n"
@@ -3871,6 +3909,7 @@ async def handle_mark_ad(callback: CallbackQuery):
         if orig_text:
             try:
                 semantic_ad_detector.add_ad_sample(orig_text)
+                await _enable_semantic_detection_for_group(group_id)
             except Exception as e:
                 print(f"学习广告样本失败: {e}")
 
@@ -3988,10 +4027,7 @@ async def handle_media_report(callback: CallbackQuery):
 
         delete_threshold = cfg.get("media_report_delete_threshold", 3)
         if report_count >= delete_threshold:
-            try:
-                await bot.delete_message(chat_id, media_msg_id)
-            except Exception:
-                pass
+            await _delete_original_and_linked_reply(chat_id, media_msg_id)
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
