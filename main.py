@@ -3035,9 +3035,12 @@ async def cmd_set_boost(message: Message):
     except Exception as e:
         await message.reply(f"设置失败: {e}")
 
-@router.message(F.chat.id.in_(GROUP_IDS), F.photo | F.video | F.voice | F.video_note)
+@router.message(
+    F.chat.id.in_(GROUP_IDS),
+    F.photo | F.video | F.voice | F.video_note | F.document | F.animation | F.audio,
+)
 async def on_media_message(message: Message):
-    """媒体消息：先检外部引用；无权限则删除并提示；有权限则回复举报/点赞按钮"""
+    """媒体消息统一入口：先跑广告匹配，再做媒体权限拦截，最后挂举报/点赞按钮。"""
     if not message.from_user or message.from_user.is_bot:
         return
     cfg = get_group_config(message.chat.id)
