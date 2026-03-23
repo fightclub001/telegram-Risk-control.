@@ -110,12 +110,46 @@ class SemanticAdDetector:
             """
         )
         self._conn.commit()
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ads_created_at ON ads(created_at)"
+        )
+        self._conn.commit()
+        self._dedupe_existing_samples()
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ads_text_unique ON ads(text)"
+        )
+        self._conn.commit()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
             self._ensure_db()
         assert self._conn is not None
         return self._conn
+
+    def _dedupe_existing_samples(self) -> int:
+        """清理历史重复样本：相同 text 或相同 simhash 仅保留最早一条。"""
+        conn = self._conn
+        assert conn is not None
+        cur = conn.execute(
+            "SELECT id, text, simhash, created_at FROM ads ORDER BY created_at ASC, id ASC"
+        )
+        rows = cur.fetchall()
+        seen_text: set[str] = set()
+        seen_simhash: set[int] = set()
+        delete_ids: List[int] = []
+        for sid, text, simhash, _created_at in rows:
+            norm_text = str(text or "")
+            sh = int(simhash)
+            if norm_text in seen_text or sh in seen_simhash:
+                delete_ids.append(int(sid))
+                continue
+            seen_text.add(norm_text)
+            seen_simhash.add(sh)
+        if not delete_ids:
+            return 0
+        conn.executemany("DELETE FROM ads WHERE id = ?", [(sid,) for sid in delete_ids])
+        conn.commit()
+        return len(delete_ids)
 
     # ---------- 广告样本管理 ----------
 
@@ -134,6 +168,9 @@ class SemanticAdDetector:
             return None
 
         conn = self._get_conn()
+        cur = conn.execute("SELECT id FROM ads WHERE text = ?", (norm,))
+        if cur.fetchone() is not None:
+            return None
         cur = conn.execute("SELECT id, simhash FROM ads")
         rows = cur.fetchall()
         for sid, existing_sh in rows:
@@ -143,10 +180,13 @@ class SemanticAdDetector:
 
         fp_str = "|".join(grams)
         now = time.time()
-        cur = conn.execute(
-            "INSERT INTO ads (text, simhash, fingerprint, created_at) VALUES (?, ?, ?, ?)",
-            (norm, str(sh), fp_str, now),
-        )
+        try:
+            cur = conn.execute(
+                "INSERT INTO ads (text, simhash, fingerprint, created_at) VALUES (?, ?, ?, ?)",
+                (norm, str(sh), fp_str, now),
+            )
+        except sqlite3.IntegrityError:
+            return None
         conn.commit()
         new_id = int(cur.lastrowid)
         return AdSample(
