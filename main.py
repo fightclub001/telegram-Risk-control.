@@ -4,6 +4,7 @@ import os
 import re
 import time
 import hashlib
+from copy import deepcopy
 from collections import deque
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -61,6 +62,7 @@ REPEAT_LEVEL_FILE = os.path.join(DATA_DIR, "repeat_levels.json")
 LINK_REF_LEVELS_FILE = os.path.join(DATA_DIR, "link_ref_levels.json")
 FORWARD_MATCH_FILE = os.path.join(DATA_DIR, "forward_match_memory.json")
 RECENT_MESSAGES_FILE = os.path.join(DATA_DIR, "recent_messages.json")
+REPORT_ACTIONS_FILE = os.path.join(DATA_DIR, "report_actions.json")
 
 reports = {}  # key: (group_id, message_id)
 lock = asyncio.Lock()
@@ -73,6 +75,7 @@ external_ref_level = {}  # (group_id, user_id) -> 0|1
 message_link_level = {}  # (group_id, user_id) -> 0|1
 config = {}
 forward_match_memory = {}  # normalized_text -> {"group_id": int, "user_id": int, "updated_at": int}
+report_action_state = {}  # key: "gid_uid" -> {"last_trigger_count": int, "last_trigger_at": int}
 # 媒体权限统计：合规消息数、同条超过10次不计数、已解锁名单、助力数（持久化到 MEDIA_STATS_FILE，重新部署须保留 DATA_DIR 卷）
 media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}, "boosts": {}}
 media_stats_loaded = False
@@ -157,10 +160,6 @@ def _default_group_config():
     """单群默认配置（关键词等会随管理员编辑持久化到 CONFIG_FILE）"""
     return {
         "enabled": True,
-        "check_bio_link": True,
-        "bio_keywords": ["qq:", "qq：", "qq号", "加qq", "扣扣", "微信", "wx:", "weixin", "加我微信", "wxid_", "幼女", "福利", "约炮", "onlyfans", "小红书", "抖音", "纸飞机", "机场", "1v1", "看片", "集中营", "门槛"],
-        "check_bio_keywords": True,
-        "check_message_link": True,  # 消息内链接/@引流（归属消息检测，与简介/名称同级）
         "display_keywords": ["加v", "加微信", "加qq", "加扣", "福利加", "约", "约炮", "资源私聊", "私我", "私聊我", "飞机", "纸飞机", "福利", "外围", "反差", "嫩模", "学生妹", "空姐", "人妻", "熟女", "onlyfans", "of", "leak", "nudes", "十八+", "av"],
         "check_display_keywords": True,
         "message_keywords": ["qq:", "qq号", "微信", "wx:", "幼女", "萝莉", "福利", "约炮", "onlyfans"],
@@ -174,16 +173,9 @@ def _default_group_config():
         "fill_garbage_min_raw_len": 12,
         "fill_garbage_max_clean_len": 8,
         "fill_space_ratio": 0.30,
-        "violation_mute_hours": 1,
-        "reported_message_threshold": 3,
-        "autoreply": {
-            "enabled": False,
-            "keywords": [],
-            "reply_text": "",
-            "buttons": [],
-            "delete_user_sec": 0,
-            "delete_bot_sec": 0
-        },
+        "report_history_threshold": 3,
+        "report_history_mute_hours": 24,
+        "report_history_whitelist": [],
         "exempt_users": [],  # 管理员手动维护的豁免（与发图权限无关）
         "misjudge_whitelist": [],  # 仅管理员点击「误判」后加入，豁免多层内容检测
         "mild_exempt_whitelist": [],  # 轻度触发豁免名单（管理员通过私聊按钮设置）
@@ -216,6 +208,16 @@ async def load_config():
                 for k, v in default.items():
                     if k not in saved:
                         saved[k] = v
+                for obsolete_key in (
+                    "check_bio_link",
+                    "bio_keywords",
+                    "check_bio_keywords",
+                    "check_message_link",
+                    "violation_mute_hours",
+                    "reported_message_threshold",
+                    "autoreply",
+                ):
+                    saved.pop(obsolete_key, None)
                 config["groups"][gid] = saved
         else:
             config = {"groups": {}}
@@ -227,6 +229,13 @@ async def load_config():
 async def save_config():
     """保存配置到 CONFIG_FILE，豁免名单/白名单/豁免词等所有名单均在此持久化，重启不丢失"""
     try:
+        if GROUP_IDS:
+            primary_gid = get_primary_group_id()
+            primary_cfg = deepcopy(get_group_config(primary_gid))
+            if "groups" not in config:
+                config["groups"] = {}
+            for gid in GROUP_IDS:
+                config["groups"][str(gid)] = deepcopy(primary_cfg)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -310,6 +319,26 @@ async def save_forward_match_memory():
             json.dump(forward_match_memory, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"forward match memory save failed: {e}")
+
+async def load_report_action_state():
+    global report_action_state
+    try:
+        if os.path.exists(REPORT_ACTIONS_FILE):
+            with open(REPORT_ACTIONS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            report_action_state = raw if isinstance(raw, dict) else {}
+        else:
+            report_action_state = {}
+    except Exception as e:
+        print(f"report action state load failed: {e}")
+        report_action_state = {}
+
+async def save_report_action_state():
+    try:
+        with open(REPORT_ACTIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(report_action_state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"report action state save failed: {e}")
 
 def _prune_recent_messages_cache():
     cutoff = time.time() - USER_MSG_24H_SEC
@@ -592,6 +621,25 @@ def get_group_config(group_id: int):
         config["groups"][gid] = _default_group_config()
     return config["groups"][gid]
 
+def get_primary_group_id() -> int:
+    if not GROUP_IDS:
+        raise ValueError("GROUP_IDS is empty")
+    return sorted(GROUP_IDS)[0]
+
+def get_global_config():
+    return get_group_config(get_primary_group_id())
+
+def apply_global_config_value(key: str, value):
+    for gid in GROUP_IDS:
+        cfg = get_group_config(gid)
+        cfg[key] = deepcopy(value)
+
+def apply_global_config_updates(updates: dict):
+    for gid in GROUP_IDS:
+        cfg = get_group_config(gid)
+        for key, value in updates.items():
+            cfg[key] = deepcopy(value)
+
 
 def fmt_duration(seconds: int) -> str:
     """将秒数格式化为人类可读时长"""
@@ -637,6 +685,7 @@ class AdminStates(StatesGroup):
     EditFillSpaceRatio = State()
     EditMuteHours = State()
     EditReportedThreshold = State()
+    EditReportHistoryWhitelist = State()
     EditRepeatWindow = State()
     EditRepeatMaxCount = State()
     EditRepeatBanSec = State()
@@ -655,9 +704,9 @@ class AdminStates(StatesGroup):
 
 # ==================== UI 键盘 ====================
 def get_main_menu_keyboard():
-    """单群模式：保留占位，不再使用旧首页键盘。"""
+    """保留旧入口，统一跳到全局控制台。"""
     buttons = [
-        [InlineKeyboardButton(text="⚙️ 进入本群控制台", callback_data="group_menu_single")],
+        [InlineKeyboardButton(text="⚙️ 进入全局控制台", callback_data="group_menu_single")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -677,16 +726,13 @@ async def get_group_list_keyboard(bot):
 
 def get_group_menu_keyboard(group_id: int):
     buttons = [
-        [InlineKeyboardButton(text="🛡 多层风控检测", callback_data=f"submenu_bio:{group_id}")],
         [InlineKeyboardButton(text="🧠 AD机器学习", callback_data=f"submenu_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="⏱️ 短消息/垃圾", callback_data=f"submenu_short:{group_id}")],
-        [InlineKeyboardButton(text="⚠️ 违规处理", callback_data=f"submenu_violation:{group_id}")],
+        [InlineKeyboardButton(text="⚠️ 举报处罚", callback_data=f"submenu_violation:{group_id}")],
         [InlineKeyboardButton(text="🔁 重复发言", callback_data=f"submenu_repeat:{group_id}")],
         [InlineKeyboardButton(text="📎 媒体权限", callback_data=f"submenu_media_perm:{group_id}")],
         [InlineKeyboardButton(text="📣 媒体举报", callback_data=f"submenu_media_report:{group_id}")],
-        [InlineKeyboardButton(text="🤖 自动回复", callback_data=f"submenu_autoreply:{group_id}")],
         [InlineKeyboardButton(text="🎛️ 基础设置", callback_data=f"submenu_basic:{group_id}")],
-        [InlineKeyboardButton(text="🔗 多功能叠加规则", callback_data=f"submenu_multi_rules:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -760,25 +806,14 @@ def get_semantic_ad_menu_keyboard(group_id: int):
 
 def get_violation_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
-    mute_h = cfg.get("violation_mute_hours", 1)
+    mute_h = cfg.get("report_history_mute_hours", 24)
     mute_sec = mute_h * 3600
+    whitelist = cfg.get("report_history_whitelist", []) or []
+    whitelist_count = len(whitelist) if isinstance(whitelist, list) else 0
     buttons = [
         [InlineKeyboardButton(text=f"🔇 禁言时长: {fmt_duration(mute_sec)}", callback_data=f"edit_mute:{group_id}")],
-        [InlineKeyboardButton(text=f"阈值: {cfg.get('reported_message_threshold')}", callback_data=f"edit_report_threshold:{group_id}")],
-        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_autoreply_menu_keyboard(group_id: int):
-    cfg = get_group_config(group_id)
-    ar = cfg.get("autoreply", {})
-    enabled = "✅" if ar.get("enabled") else "❌"
-    buttons = [
-        [InlineKeyboardButton(text=f"启用 {enabled}", callback_data=f"toggle_ar:{group_id}")],
-        [InlineKeyboardButton(text="🔑 关键词", callback_data=f"edit_ar_kw:{group_id}")],
-        [InlineKeyboardButton(text="📝 文本", callback_data=f"edit_ar_text:{group_id}")],
-        [InlineKeyboardButton(text="🔘 按钮", callback_data=f"edit_ar_btn:{group_id}")],
-        [InlineKeyboardButton(text="⏱️ 延时", callback_data=f"edit_ar_del:{group_id}")],
+        [InlineKeyboardButton(text=f"阈值: {cfg.get('report_history_threshold', 3)}", callback_data=f"edit_report_threshold:{group_id}")],
+        [InlineKeyboardButton(text=f"豁免白名单: {whitelist_count}", callback_data=f"edit_report_whitelist:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -865,21 +900,20 @@ def get_media_report_menu_keyboard(group_id: int):
 # ==================== 管理员命令 ====================
 @router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_panel(message: Message, state: FSMContext):
-    """单群模式：直接进入唯一群组的功能面板。"""
+    """进入全局控制台，配置同步应用到全部受控群组。"""
     if not GROUP_IDS:
         await message.reply("当前未配置任何受控群组（GROUP_IDS 为空）。")
         return
-    # 取第一个群ID作为当前控制对象
-    group_id = list(GROUP_IDS)[0]
+    group_id = get_primary_group_id()
     await state.update_data(group_id=group_id)
-    title = await get_chat_title_safe(message.bot, group_id)
     cfg = get_group_config(group_id)
     status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
     text = (
-        f"👮 管理员面板（单群模式）\n\n"
-        f"👥 <b>{title}</b>\n"
-        f"<code>ID: {group_id}</code>  |  状态: {status}\n\n"
-        "请选择要管理的功能："
+        "👮 管理员面板\n\n"
+        f"状态: {status}\n"
+        f"受控群组数: {len(GROUP_IDS)}\n"
+        f"主配置群ID: <code>{group_id}</code>\n\n"
+        "所有参数都会同步应用到全部群组。"
     )
     kb = get_group_menu_keyboard(group_id)
     await message.reply(text, reply_markup=kb)
@@ -888,25 +922,29 @@ async def admin_panel(message: Message, state: FSMContext):
 # ==================== 回调处理 ====================
 @router.callback_query(F.data == "choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def choose_group_callback(callback: CallbackQuery, state: FSMContext):
-    """兼容旧入口：在单群模式下直接跳回本群控制台。"""
+    """兼容旧入口：统一跳到全局控制台。"""
     if not GROUP_IDS:
         await callback.answer("未配置受控群组。", show_alert=True)
         return
-    group_id = list(GROUP_IDS)[0]
+    group_id = get_primary_group_id()
     await state.update_data(group_id=group_id)
-    title = await get_chat_title_safe(callback.bot, group_id)
     cfg = get_group_config(group_id)
     status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
     text = (
-        f"👮 管理员面板（单群模式）\n\n"
-        f"👥 <b>{title}</b>\n"
-        f"<code>ID: {group_id}</code>  |  状态: {status}\n\n"
-        "请选择要管理的功能："
+        "👮 管理员面板\n\n"
+        f"状态: {status}\n"
+        f"受控群组数: {len(GROUP_IDS)}\n"
+        f"主配置群ID: <code>{group_id}</code>\n\n"
+        "所有参数都会同步应用到全部群组。"
     )
     kb = get_group_menu_keyboard(group_id)
     await callback.message.edit_text(text, reply_markup=kb)
     await state.set_state(AdminStates.GroupMenu)
     await callback.answer()
+
+@router.callback_query(F.data == "group_menu_single", F.from_user.id.in_(ADMIN_IDS))
+async def group_menu_single(callback: CallbackQuery, state: FSMContext):
+    await choose_group_callback(callback, state)
 
 @router.callback_query(F.data.startswith("select_group:"), F.from_user.id.in_(ADMIN_IDS))
 async def select_group(callback: CallbackQuery, state: FSMContext):
@@ -948,13 +986,14 @@ async def group_menu(callback: CallbackQuery, state: FSMContext):
         group_id = int(callback.data.split(":", 1)[1])
         get_group_config(group_id)
         await state.update_data(group_id=group_id)
-        title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
         text = (
-            f"👥 <b>{title}</b>\n"
-            f"<code>ID: {group_id}</code>  |  状态: {status}\n\n"
-            "选择要管理的功能："
+            "👮 管理员面板\n\n"
+            f"状态: {status}\n"
+            f"受控群组数: {len(GROUP_IDS)}\n"
+            f"主配置群ID: <code>{group_id}</code>\n\n"
+            "所有参数都会同步应用到全部群组。"
         )
         kb = get_group_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
@@ -1000,12 +1039,10 @@ async def multi_rules_submenu(callback: CallbackQuery):
 async def bio_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        link_status = "✅" if cfg.get("check_bio_link") else "❌"
-        kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        text = f"<b>{title}</b> › 多层风控检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}"
-        kb = get_bio_menu_keyboard(group_id)
+        text = "该功能已下线。\n当前不再检测简介链接或简介敏感词。"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")]]
+        )
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
     except Exception as e:
@@ -1711,10 +1748,17 @@ async def violation_submenu(callback: CallbackQuery):
         group_id = int(callback.data.split(":", 1)[1])
         title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
-        mute_hours = cfg.get("violation_mute_hours", 1)
+        mute_hours = cfg.get("report_history_mute_hours", 24)
         mute_sec = mute_hours * 3600
-        threshold = cfg.get("reported_message_threshold", 2)
-        text = f"<b>{title}</b> › 违规处理\n\n🔇 禁言: {fmt_duration(mute_sec)}\n触发: {threshold} 条举报"
+        threshold = cfg.get("report_history_threshold", 3)
+        whitelist = cfg.get("report_history_whitelist", []) or []
+        whitelist_count = len(whitelist) if isinstance(whitelist, list) else 0
+        text = (
+            f"<b>{title}</b> › 举报处罚\n\n"
+            f"🔇 禁言: {fmt_duration(mute_sec)}\n"
+            f"触发: {threshold} 条历史举报\n"
+            f"📋 豁免白名单: {whitelist_count} 人"
+        )
         kb = get_violation_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1726,7 +1770,7 @@ async def edit_mute_hours(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
         cfg = get_group_config(group_id)
-        current = cfg.get("violation_mute_hours", 1)
+        current = cfg.get("report_history_mute_hours", 24)
         text = f"禁言时长小时数（当前: {current}）："
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
@@ -1741,13 +1785,12 @@ async def process_mute_hours(message: Message, state: FSMContext):
         data = await state.get_data()
         group_id = data.get("group_id")
         cfg = get_group_config(group_id)
-        old_h = cfg.get("violation_mute_hours", 1)
+        old_h = cfg.get("report_history_mute_hours", 24)
         value = int(message.text.strip())
-        cfg["violation_mute_hours"] = value
+        apply_global_config_value("report_history_mute_hours", value)
         await save_config()
-        title = await get_chat_title_safe(message.bot, group_id)
         kb = get_violation_menu_keyboard(group_id)
-        await message.reply(f"✅ 已更新: <b>{title}</b> › 违规处理\n禁言时长: {old_h}h → {value}h", reply_markup=kb)
+        await message.reply(f"✅ 已更新全局举报禁言时长: {old_h}h → {value}h", reply_markup=kb)
         await state.set_state(AdminStates.GroupMenu)
     except ValueError:
         await message.reply("❌ 请输入数字")
@@ -1759,7 +1802,7 @@ async def edit_report_threshold(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
         cfg = get_group_config(group_id)
-        current = cfg.get("reported_message_threshold", 2)
+        current = cfg.get("report_history_threshold", 3)
         text = f"触发禁言的举报数（当前: {current}）："
         await callback.message.edit_text(text, reply_markup=None)
         await state.update_data(group_id=group_id)
@@ -1773,12 +1816,62 @@ async def process_report_threshold(message: Message, state: FSMContext):
     try:
         data = await state.get_data()
         group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
         value = int(message.text.strip())
-        cfg["reported_message_threshold"] = value
+        apply_global_config_value("report_history_threshold", value)
         await save_config()
         kb = get_violation_menu_keyboard(group_id)
-        await message.reply(f"✅ 已设为 {value}", reply_markup=kb)
+        await message.reply(f"✅ 已更新全局举报触发阈值为 {value}", reply_markup=kb)
+        await state.set_state(AdminStates.GroupMenu)
+    except ValueError:
+        await message.reply("❌ 请输入数字")
+    except Exception as e:
+        await message.reply(f"❌ {str(e)}")
+
+@router.callback_query(F.data.startswith("edit_report_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_report_whitelist(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        whitelist = cfg.get("report_history_whitelist", []) or []
+        if not isinstance(whitelist, list):
+            whitelist = []
+        current = "\n".join(str(item) for item in whitelist) if whitelist else "（空）"
+        text = (
+            "编辑举报处罚豁免白名单\n"
+            "每行一个用户ID或用户名，发送 /clear 可清空。\n\n"
+            f"当前列表：\n{current}"
+        )
+        await callback.message.edit_text(text, reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditReportHistoryWhitelist)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditReportHistoryWhitelist), F.from_user.id.in_(ADMIN_IDS))
+async def process_report_history_whitelist(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        if (message.text or "").strip() == "/clear":
+            apply_global_config_value("report_history_whitelist", [])
+            await save_config()
+            await message.reply("✅ 已清空举报处罚豁免白名单", reply_markup=get_violation_menu_keyboard(group_id))
+        else:
+            current = get_global_config().get("report_history_whitelist", []) or []
+            if not isinstance(current, list):
+                current = []
+            additions = [line.strip() for line in (message.text or "").splitlines() if line.strip()]
+            merged = list(current)
+            for item in additions:
+                if item not in merged:
+                    merged.append(item)
+            apply_global_config_value("report_history_whitelist", merged)
+            await save_config()
+            await message.reply(
+                f"✅ 已更新举报处罚豁免白名单，当前 {len(merged)} 项",
+                reply_markup=get_violation_menu_keyboard(group_id),
+            )
         await state.set_state(AdminStates.GroupMenu)
     except ValueError:
         await message.reply("❌ 请输入数字")
@@ -2201,13 +2294,10 @@ async def process_media_delete_threshold(message: Message, state: FSMContext):
 async def autoreply_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        enabled = "✅" if ar.get("enabled") else "❌"
-        kw_count = len(ar.get("keywords", []))
-        text = f"<b>{title}</b> › 自动回复\n\n状态: {enabled}\n关键词: {kw_count} 个"
-        kb = get_autoreply_menu_keyboard(group_id)
+        text = "自动回复功能已下线。"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")]]
+        )
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
     except Exception as e:
@@ -2822,6 +2912,22 @@ def count_user_reported_messages(user_id: int, group_id: int) -> int:
             count += 1
     return count
 
+def _report_action_key(group_id: int, user_id: int) -> str:
+    return f"{group_id}_{user_id}"
+
+def get_report_history_action_count(group_id: int, user_id: int) -> int:
+    data = report_action_state.get(_report_action_key(group_id, user_id), {})
+    if not isinstance(data, dict):
+        return 0
+    return int(data.get("last_trigger_count", 0) or 0)
+
+def build_report_history_exempt_keyboard(group_id: int, user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="举报处罚豁免👮‍♂️", callback_data=f"report_history_exempt:{group_id}:{user_id}")]
+        ]
+    )
+
 def build_warning_buttons(group_id: int, msg_id: int, report_count: int):
     """构建警告消息按钮；callback 带 group_id 避免多群串案；举报按钮显示当前人数"""
     report_text = f"举报 ({report_count}人)" if report_count > 0 else "举报"
@@ -3401,12 +3507,31 @@ async def detect_and_warn(message: Message):
         )
         return
 
-    # 举报阈值禁言（在多层检测前）：仅统计非管理员举报，N 条则禁言 min(N,72) 小时
+    report_history_whitelist = cfg.get("report_history_whitelist", []) or []
+    report_history_exempt = (
+        isinstance(report_history_whitelist, list)
+        and (
+            str(user_id) in report_history_whitelist
+            or (
+                message.from_user.username
+                and any(
+                    isinstance(item, str)
+                    and item.strip().lstrip("@").lower() == message.from_user.username.lower()
+                    for item in report_history_whitelist
+                )
+            )
+        )
+    )
     reported_count = count_user_reported_messages(user_id, group_id)
-    threshold = cfg.get("reported_message_threshold", 3)
-    if reported_count >= threshold:
+    threshold = cfg.get("report_history_threshold", 3)
+    last_action_count = get_report_history_action_count(group_id, user_id)
+    if (
+        not report_history_exempt
+        and reported_count >= threshold
+        and reported_count > last_action_count
+    ):
         try:
-            mute_hours = min(reported_count, REPORT_BAN_HOURS_CAP)
+            mute_hours = min(cfg.get("report_history_mute_hours", 24), REPORT_BAN_HOURS_CAP)
             until_date = int(time.time()) + (mute_hours * 3600)
             await bot.restrict_chat_member(
                 chat_id=group_id,
@@ -3424,127 +3549,32 @@ async def detect_and_warn(message: Message):
                 until_date=until_date
             )
             await _delete_original_and_linked_reply(group_id, message.message_id)
+            report_action_state[_report_action_key(group_id, user_id)] = {
+                "last_trigger_count": reported_count,
+                "last_trigger_at": int(time.time()),
+            }
+            await save_report_action_state()
             display_name = _get_display_name_from_message(message, user_id)
-            await bot.send_message(
+            warning = await bot.send_message(
                 group_id,
                 f"🚫 用户 {display_name}\n"
-                f"📌 触发原因：在本群多次垃圾消息被其他成员举报（累计 {reported_count} 条）。\n"
+                f"📌 触发原因：历史被举报消息累计 {reported_count} 条。\n"
                 f"🔒 处理结果：已被限制发言 {mute_hours} 小时。\n"
-                f"{MISJUDGE_BOT_MENTION}"
+                "如需取消这条历史举报处罚，管理员可点下方豁免。",
+                reply_markup=build_report_history_exempt_keyboard(group_id, user_id),
             )
+            _track_bot_message(group_id, warning.message_id)
             return
         except Exception as e:
-            print(f"举报阈值禁言失败: {e}")
+            print(f"历史举报处罚失败: {e}")
 
-    # 多层内容检测：误判豁免仅跳过「简介链接、简介词汇、昵称词汇、主页频道」，其余项所有人均检
+    # 多层内容检测：当前仅保留昵称敏感词
     triggers = []
     if not misjudge_exempt:
-        bio_exempt = False
-        try:
-            if cfg.get("check_bio_link", True) or cfg.get("check_bio_keywords", True):
-                chat_info = await bot.get_chat(user_id)
-                bio = (chat_info.bio or "").strip()
-                bio_lower = bio.lower()
-                # 局部豁免：如果简介包含 t.me/fast_telegram，则本用户本次消息跳过「简介链接」和「简介词汇」检测
-                fast_telegram_bio_exempt = "t.me/fast_telegram" in bio_lower
-                # 统计所有引流链接形式（http/https/t.me/@），数量>=2 时不适用「bot+双向」豁免
-                bio_ref_count = len(re.findall(r"https?://[^\s]+|t\.me/[^\s]+|@\w+", bio_lower))
-                if "双向" in bio and "bot" in bio_lower and bio_ref_count < 2:
-                    bio_exempt = True
-                if not bio_exempt:
-                    if (
-                        not fast_telegram_bio_exempt
-                        and cfg.get("check_bio_link", True)
-                        and any(x in bio_lower for x in ["http://", "https://", "t.me/", "@"])
-                    ):
-                        triggers.append("简介链接")
-                    if (
-                        not fast_telegram_bio_exempt
-                        and cfg.get("check_bio_keywords", True)
-                        and any(kw.lower() in bio_lower for kw in cfg.get("bio_keywords", []))
-                    ):
-                        triggers.append("简介词汇")
-                    # 检测用户主页是否有频道（personal_chat 属性）
-                    personal_chat = getattr(chat_info, "personal_chat", None)
-                    if personal_chat:
-                        # 用户主页设置了个人频道，视为潜在引流
-                        triggers.append("主页频道")
-        except Exception:
-            pass
-
-        # 3. 名称敏感词（bio_exempt 时一并跳过）
-        if not bio_exempt and cfg.get("check_display_keywords", True):
+        if cfg.get("check_display_keywords", True):
             display_name = (message.from_user.full_name or "").lower()
             if any(kw.lower() in display_name for kw in cfg.get("display_keywords", [])):
                 triggers.append("昵称词汇")
-    
-    # 4~6 功能（消息敏感词 / 连续短消息 / 垃圾填充）暂时下线，不再参与触发
-    
-    # 消息链接/@引流：误判白名单也检，以便 5.1/5.3 仍执行
-    if cfg.get("check_message_link", True) and message.text and _message_has_link_or_external_at(message.text):
-        triggers.append("消息链接/@引流")
-    
-    # 5.1 消息链接/@引流即时动作：首次禁言1小时，第二次永封；封禁消息10秒后自动删除
-    if "消息链接/@引流" in triggers:
-        display_name = _get_display_name_from_message(message, user_id)
-        await _delete_original_and_linked_reply(group_id, message.message_id)
-        _push_listen_log(
-            group_id=group_id,
-            user_id=user_id,
-            msg_id=message.message_id,
-            text=text,
-            verdict="RULE_DELETE",
-            details="多层规则命中: 消息链接/@引流，已执行删除并进入封禁流程",
-        )
-        # 发送引流提示（10秒后自动删除）
-        try:
-            sent = await bot.send_message(group_id, f"用户 {display_name} 违规引流。")
-            _track_bot_message(group_id, sent.message_id, 10)
-        except Exception:
-            pass
-        level_key = (group_id, user_id)
-        level = message_link_level.get(level_key, 0)
-        try:
-            if level == 0:
-                until_date = int(time.time()) + 3600
-                await bot.restrict_chat_member(
-                    chat_id=group_id,
-                    user_id=user_id,
-                    permissions=ChatPermissions(
-                        can_send_messages=False,
-                        can_send_media_messages=False,
-                        can_send_polls=False,
-                        can_send_other_messages=False,
-                        can_add_web_page_previews=False,
-                        can_change_info=False,
-                        can_invite_users=False,
-                        can_pin_messages=False
-                    ),
-                    until_date=until_date
-                )
-                message_link_level[level_key] = 1
-            else:
-                await bot.restrict_chat_member(
-                    chat_id=group_id,
-                    user_id=user_id,
-                    permissions=ChatPermissions(
-                        can_send_messages=False,
-                        can_send_media_messages=False,
-                        can_send_polls=False,
-                        can_send_other_messages=False,
-                        can_add_web_page_previews=False,
-                        can_change_info=False,
-                        can_invite_users=False,
-                        can_pin_messages=False
-                    )
-                )
-                await _delete_user_recent_and_warnings(group_id, user_id, None, keep_one_text=
-                    f"🚫 用户 {display_name}\n📌 触发原因：{'+'.join(triggers)}\n🔒 处理结果：已被本群永久限制发言。\n{MISJUDGE_BOT_MENTION}",
-                    auto_delete_sec=10)
-            await save_link_ref_levels()
-        except Exception as e:
-            print(f"消息链接处罚失败: {e}")
-        return
 
     # 5.2 统一警告（非仅引流时）- 同用户连续触发只发一条警告（防刷屏）
     if len(triggers) > 0:
@@ -4120,6 +4150,57 @@ async def handle_exempt(callback: CallbackQuery):
         print("豁免异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
 
+@router.callback_query(F.data.startswith("report_history_exempt:"), F.from_user.id.in_(ADMIN_IDS))
+async def handle_report_history_exempt(callback: CallbackQuery):
+    try:
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("已过期", show_alert=True)
+            return
+        group_id = int(parts[1])
+        user_id = int(parts[2])
+        cfg = get_group_config(group_id)
+        whitelist = cfg.get("report_history_whitelist", []) or []
+        if not isinstance(whitelist, list):
+            whitelist = []
+        user_key = str(user_id)
+        if user_key not in whitelist:
+            whitelist.append(user_key)
+            apply_global_config_value("report_history_whitelist", whitelist)
+            await save_config()
+        current_count = count_user_reported_messages(user_id, group_id)
+        report_action_state[_report_action_key(group_id, user_id)] = {
+            "last_trigger_count": max(current_count, get_report_history_action_count(group_id, user_id)),
+            "last_trigger_at": int(time.time()),
+            "whitelisted_by": callback.from_user.id,
+        }
+        await save_report_action_state()
+        try:
+            await bot.restrict_chat_member(
+                chat_id=group_id,
+                user_id=user_id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_media_messages=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                    can_change_info=False,
+                    can_invite_users=True,
+                    can_pin_messages=False,
+                ),
+            )
+        except Exception:
+            pass
+        await callback.message.edit_text(
+            f"✅ 已将用户 {user_id} 加入举报处罚豁免白名单。\n后续只有出现新的举报增量，才会再次进入处罚判断。",
+            reply_markup=None,
+        )
+        await callback.answer("已豁免")
+    except Exception as e:
+        print("历史举报豁免异常:", e)
+        await callback.answer("❌ 失败", show_alert=True)
+
 
 @router.callback_query(F.data.startswith("markad:"), F.from_user.id.in_(ADMIN_IDS))
 async def handle_mark_ad(callback: CallbackQuery):
@@ -4395,6 +4476,7 @@ async def main():
     await save_config()
     await load_data()
     await load_user_violations()
+    await load_report_action_state()
     await load_recent_messages_cache()
     await load_forward_match_memory()
     load_repeat_levels()
