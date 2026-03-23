@@ -60,6 +60,7 @@ MEDIA_STATS_FILE = os.path.join(DATA_DIR, "media_stats.json")
 REPEAT_LEVEL_FILE = os.path.join(DATA_DIR, "repeat_levels.json")
 LINK_REF_LEVELS_FILE = os.path.join(DATA_DIR, "link_ref_levels.json")
 FORWARD_MATCH_FILE = os.path.join(DATA_DIR, "forward_match_memory.json")
+RECENT_MESSAGES_FILE = os.path.join(DATA_DIR, "recent_messages.json")
 
 reports = {}  # key: (group_id, message_id)
 lock = asyncio.Lock()
@@ -309,6 +310,64 @@ async def save_forward_match_memory():
             json.dump(forward_match_memory, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"forward match memory save failed: {e}")
+
+def _prune_recent_messages_cache():
+    cutoff = time.time() - USER_MSG_24H_SEC
+    for key in list(user_recent_message_ids.keys()):
+        msgs = user_recent_message_ids.get(key)
+        if not msgs:
+            user_recent_message_ids.pop(key, None)
+            continue
+        kept = [item for item in msgs if len(item) == 3 and item[1] >= cutoff]
+        if kept:
+            user_recent_message_ids[key] = deque(kept[-USER_MSG_TRACK_MAXLEN:], maxlen=USER_MSG_TRACK_MAXLEN)
+        else:
+            user_recent_message_ids.pop(key, None)
+
+async def load_recent_messages_cache():
+    global user_recent_message_ids
+    try:
+        if not os.path.exists(RECENT_MESSAGES_FILE):
+            user_recent_message_ids = {}
+            return
+        with open(RECENT_MESSAGES_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        loaded = {}
+        for key, items in (raw or {}).items():
+            try:
+                gid_str, uid_str = key.split("_", 1)
+                gid = int(gid_str)
+                uid = int(uid_str)
+            except Exception:
+                continue
+            if not isinstance(items, list):
+                continue
+            cleaned = []
+            for item in items:
+                if not isinstance(item, list) or len(item) != 3:
+                    continue
+                try:
+                    cleaned.append((int(item[0]), float(item[1]), str(item[2] or "")))
+                except Exception:
+                    continue
+            if cleaned:
+                loaded[(gid, uid)] = deque(cleaned[-USER_MSG_TRACK_MAXLEN:], maxlen=USER_MSG_TRACK_MAXLEN)
+        user_recent_message_ids = loaded
+        _prune_recent_messages_cache()
+    except Exception as e:
+        print(f"recent messages cache load failed: {e}")
+        user_recent_message_ids = {}
+
+async def save_recent_messages_cache():
+    try:
+        _prune_recent_messages_cache()
+        data = {}
+        for (gid, uid), msgs in user_recent_message_ids.items():
+            data[f"{gid}_{uid}"] = [[msg_id, ts, text] for msg_id, ts, text in list(msgs)]
+        with open(RECENT_MESSAGES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"recent messages cache save failed: {e}")
 
 async def load_media_stats():
     global media_stats, media_stats_loaded
@@ -2973,6 +3032,7 @@ def _track_user_message(group_id: int, user_id: int, msg_id: int, text: str = ""
     if key not in user_recent_message_ids:
         user_recent_message_ids[key] = deque(maxlen=USER_MSG_TRACK_MAXLEN)
     user_recent_message_ids[key].append((msg_id, time.time(), text or ""))
+    asyncio.create_task(save_recent_messages_cache())
 
 
 def _track_bot_message(group_id: int, msg_id: int, auto_delete_sec: int = BOT_MSG_AUTO_DELETE_SEC):
@@ -4335,6 +4395,7 @@ async def main():
     await save_config()
     await load_data()
     await load_user_violations()
+    await load_recent_messages_cache()
     await load_forward_match_memory()
     load_repeat_levels()
     load_link_ref_levels()
