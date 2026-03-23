@@ -3032,6 +3032,90 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
     return True
 
 
+def _get_only_group_id() -> int | None:
+    """仅配置了一个受控群时，返回该群 ID，便于单群模式兜底。"""
+    if len(GROUP_IDS) != 1:
+        return None
+    return next(iter(GROUP_IDS))
+
+
+def _find_recent_user_ids_by_text(group_id: int, text: str, *, limit: int = 3) -> list[int]:
+    """
+    在最近缓存里按文案反查用户。
+    单群转发学习时，Telegram 经常不给原始 user/chat 信息，这里做本地兜底。
+    """
+    now = time.time()
+    cutoff = now - USER_MSG_24H_SEC
+    raw = (text or "").strip()
+    norm = _normalize_text(text)
+    if not raw and not norm:
+        return []
+
+    scored: list[tuple[float, int]] = []
+    for (gid, uid), msgs in user_recent_message_ids.items():
+        if gid != group_id:
+            continue
+        best_score = 0.0
+        best_ts = 0.0
+        for _, ts, msg_text in msgs:
+            if ts < cutoff or not msg_text:
+                continue
+            raw_msg = (msg_text or "").strip()
+            norm_msg = _normalize_text(msg_text)
+            score = 0.0
+            if raw and raw_msg == raw:
+                score = 1.0
+            elif norm and norm_msg == norm:
+                score = 0.95
+            elif raw and raw_msg and (raw in raw_msg or raw_msg in raw):
+                score = 0.80
+            elif norm and norm_msg and (norm in norm_msg or norm_msg in norm):
+                score = 0.75
+            if score > best_score or (score == best_score and ts > best_ts):
+                best_score = score
+                best_ts = ts
+        if best_score > 0:
+            scored.append((best_score + min(best_ts / 10**12, 0.001), uid))
+
+    scored.sort(reverse=True)
+    out: list[int] = []
+    for _, uid in scored:
+        if uid not in out:
+            out.append(uid)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _delete_recent_messages_by_text(group_id: int, text: str) -> int:
+    """
+    当拿不到 user_id 时，退化为按同文案删除最近消息，并清掉对应机器人警告。
+    返回删除的原消息条数。
+    """
+    now = time.time()
+    cutoff = now - USER_MSG_24H_SEC
+    raw = (text or "").strip()
+    norm = _normalize_text(text)
+    if not raw and not norm:
+        return 0
+
+    deleted = 0
+    seen: set[int] = set()
+    for (gid, _uid), msgs in list(user_recent_message_ids.items()):
+        if gid != group_id:
+            continue
+        for msg_id, ts, msg_text in list(msgs):
+            if ts < cutoff or not msg_text or msg_id in seen:
+                continue
+            raw_msg = (msg_text or "").strip()
+            norm_msg = _normalize_text(msg_text)
+            if raw and raw_msg == raw or norm and norm_msg == norm:
+                await _delete_original_and_linked_reply(group_id, msg_id)
+                seen.add(msg_id)
+                deleted += 1
+    return deleted
+
+
 def _should_send_warning(group_id: int, user_id: int) -> bool:
     """检查是否应该为该用户发送新警告（防止刷屏）"""
     key = (group_id, user_id)
@@ -3521,51 +3605,63 @@ async def on_forward_learn_ad(message: Message):
                 learned = True
             except Exception as e:
                 print(f"转发学习广告样本失败: {e}")
-        # 即使拿不到原群信息，也允许“仅学习入库”，并给管理员回执
-        if not f_chat:
+        # 单群模式兜底：即使 Telegram 转发里不带原群信息，也直接假定唯一受控群
+        group_id = f_chat.id if f_chat else _get_only_group_id()
+        if not group_id:
             if learned:
-                await message.reply("✅ 已学习该转发消息内容（未包含原群信息，无法回群批量删除）。")
+                await message.reply("✅ 已学习该转发消息内容，但当前不是单群模式，且转发里没有原群信息，无法精准回群删除。")
             return
-
-        group_id = f_chat.id
-        # 仅处理配置中的受控群
         if group_id not in GROUP_IDS:
-            if learned:
-                await message.reply("✅ 已学习该转发消息内容（原群不在 GROUP_IDS，未执行回群删除）。")
-            return
+            only_gid = _get_only_group_id()
+            if only_gid is None:
+                if learned:
+                    await message.reply("✅ 已学习该转发消息内容，但转发来源群不在受控群列表，未执行回群删除。")
+                return
+            group_id = only_gid
 
         # 学习成功则自动开启该群的 AD 语义检测
         if learned:
             await _enable_semantic_detection_for_group(group_id)
-        # 1) 优先使用 forward_from / forward_origin 的 uid
+
+        # 1) 优先使用 Telegram 直接给出的 uid
         user_id = None
         if f_user:
             user_id = f_user.id
         else:
-            # 2) 无 uid 时，根据最近缓存按文本匹配尝试推断用户
-            now = time.time()
-            cutoff = now - USER_MSG_24H_SEC
-            best_uid = None
-            best_ts = 0.0
-            for (gid, uid), msgs in user_recent_message_ids.items():
-                if gid != group_id:
-                    continue
-                for msg_id, t, txt in msgs:
-                    if t < cutoff or not txt:
-                        continue
-                    if txt == text and t > best_ts:
-                        best_ts = t
-                        best_uid = uid
-            user_id = best_uid
-        if not user_id:
-            if learned:
-                await message.reply("✅ 已学习该转发消息内容（未能解析原发送用户ID，无法回群批量删除）。")
-            return
+            # 2) 无 uid 时，在该群最近消息里按相同文案反查用户
+            matched_user_ids = _find_recent_user_ids_by_text(group_id, text, limit=3)
+            if len(matched_user_ids) == 1:
+                user_id = matched_user_ids[0]
+            elif len(matched_user_ids) > 1:
+                # 有多个命中时，优先删最近最像的用户，但同时保留后续按文案删消息的兜底
+                user_id = matched_user_ids[0]
+            else:
+                matched_user_ids = []
 
+        deleted_by_user = False
+        if user_id:
+            try:
+                await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
+                deleted_by_user = True
+            except Exception as e:
+                print(f"转发学习时删除用户消息失败: {e}")
+
+        # 3) 再做一层按同文案删最近消息的兜底，解决 Telegram 不回传 uid/chat 信息的问题
+        deleted_by_text = 0
         try:
-            await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
+            deleted_by_text = await _delete_recent_messages_by_text(group_id, text)
         except Exception as e:
-            print(f"转发学习时删除用户消息失败: {e}")
+            print(f"按文案回群删除失败: {e}")
+
+        if learned:
+            if deleted_by_user or deleted_by_text:
+                scope = f"群 {group_id}"
+                if user_id:
+                    await message.reply(f"✅ 已学习广告内容，并已在 {scope} 清理该用户近期发言；同文案兜底删除 {deleted_by_text} 条。")
+                else:
+                    await message.reply(f"✅ 已学习广告内容；Telegram 未返回原用户信息，已在 {scope} 按同文案兜底删除 {deleted_by_text} 条。")
+            else:
+                await message.reply(f"✅ 已学习广告内容，但在群 {group_id} 的最近消息缓存里没找到可删除的同文案记录。")
     except Exception as e:
         print("转发学习命令异常:", e)
 
