@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import io
 import os
+import logging
 from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image, ImageOps
-from rapidocr_onnxruntime import RapidOCR
 
 from join_approval_risk_terms import JoinApprovalRiskTerms
 from join_approval_text_normalizer import count_chinese_chars, normalize_text
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -35,7 +38,15 @@ class JoinApprovalAvatarOCR:
         }
         self.ocr_max_side = max(64, int((os.getenv("OCR_MAX_SIDE") or "512").strip()))
         self.opencc_config = (os.getenv("OPENCC_CONFIG") or "t2s").strip()
-        self.engine = RapidOCR() if self.ocr_enabled else None
+        self.engine = None
+        if self.ocr_enabled:
+            try:
+                from rapidocr_onnxruntime import RapidOCR  # lazy import
+
+                self.engine = RapidOCR()
+            except Exception as e:
+                self.ocr_enabled = False
+                logger.warning("rapidocr_unavailable disable_ocr error=%s", e)
 
     def analyze_avatar(self, image_bytes: bytes) -> AvatarResult:
         if not self.ocr_enabled or self.engine is None:
