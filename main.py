@@ -3796,8 +3796,10 @@ async def cmd_mark_ad(message: Message):
         text = target.text or target.caption or ""
         if text:
             try:
-                semantic_ad_detector.add_ad_sample(text)
+                sample = semantic_ad_detector.add_ad_sample(text)
                 await _enable_semantic_detection_for_group(group_id)
+                if sample is None:
+                    print(f"/ad 样本已存在或被去重: {text[:80]}")
             except Exception as e:
                 print(f"/ad 学习广告样本失败: {e}")
         try:
@@ -3833,8 +3835,10 @@ async def on_forward_learn_ad(message: Message):
         memory_changed = False
         if text:
             try:
-                semantic_ad_detector.add_ad_sample(text)
-                learned = True
+                sample = semantic_ad_detector.add_ad_sample(text)
+                learned = sample is not None
+                if not learned:
+                    print(f"转发学习样本已存在或被去重: {text[:80]}")
             except Exception as e:
                 print(f"转发学习广告样本失败: {e}")
         # 单群模式兜底：即使 Telegram 转发里不带原群信息，也直接假定唯一受控群
@@ -3852,7 +3856,7 @@ async def on_forward_learn_ad(message: Message):
             group_id = only_gid
 
         # 学习成功则自动开启该群的 AD 语义检测
-        if learned:
+        if text:
             await _enable_semantic_detection_for_group(group_id)
 
         # 1) 优先使用 Telegram 直接给出的 uid
@@ -3892,15 +3896,18 @@ async def on_forward_learn_ad(message: Message):
         if memory_changed:
             asyncio.create_task(save_forward_match_memory())
 
-        if learned:
+        if text:
             if deleted_by_user or deleted_by_text:
                 scope = f"群 {group_id}"
                 if user_id:
-                    await message.reply(f"✅ 已学习广告内容，并已在 {scope} 清理该用户近期发言；同文案兜底删除 {deleted_by_text} 条。")
+                    learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
+                    await message.reply(f"✅ {learned_text}，并已在 {scope} 清理该用户近期发言；同文案兜底删除 {deleted_by_text} 条。")
                 else:
-                    await message.reply(f"✅ 已学习广告内容；Telegram 未返回原用户信息，已在 {scope} 按同文案兜底删除 {deleted_by_text} 条。")
+                    learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
+                    await message.reply(f"✅ {learned_text}；Telegram 未返回原用户信息，已在 {scope} 按同文案兜底删除 {deleted_by_text} 条。")
             else:
-                await message.reply(f"✅ 已学习广告内容，但在群 {group_id} 的最近消息缓存里没找到可删除的同文案记录。")
+                learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
+                await message.reply(f"✅ {learned_text}，但在群 {group_id} 的最近消息缓存里没找到可删除的同文案记录。")
     except Exception as e:
         print("转发学习命令异常:", e)
 

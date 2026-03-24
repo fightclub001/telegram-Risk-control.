@@ -154,7 +154,7 @@ class SemanticAdDetector:
     # ---------- 广告样本管理 ----------
 
     def add_ad_sample(self, raw_text: str) -> Optional[AdSample]:
-        """加入广告样本（带 SimHash 去重，与现有样本汉明距离≤1视为重复）."""
+        """加入广告样本。只对“真正重复”的文本做去重，避免短句被误判为已存在。"""
         norm = normalize_text(raw_text)
         if not norm or len(norm) < 4:
             return None
@@ -171,11 +171,19 @@ class SemanticAdDetector:
         cur = conn.execute("SELECT id FROM ads WHERE text = ?", (norm,))
         if cur.fetchone() is not None:
             return None
-        cur = conn.execute("SELECT id, simhash FROM ads")
+        cur = conn.execute("SELECT id, text, simhash FROM ads")
         rows = cur.fetchall()
-        for sid, existing_sh in rows:
+        for sid, existing_text, existing_sh in rows:
+            existing_text = str(existing_text or "")
             d = _hamming(int(existing_sh), sh)
-            if d <= 1:
+            # 对完全相同或几乎相同的样本才按 simhash 去重。
+            # 否则短文本很容易发生误杀，表现为“转发学习了但实际没入库”。
+            if (
+                d <= 1
+                and existing_text
+                and abs(len(existing_text) - len(norm)) <= 1
+                and fuzz.ratio(norm, existing_text) >= 98
+            ):
                 return None
 
         fp_str = "|".join(grams)
