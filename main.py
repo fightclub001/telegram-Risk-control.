@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import re
@@ -10,11 +11,14 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove, BufferedInputFile, ChatJoinRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from join_approval_avatar_ocr import JoinApprovalAvatarOCR, AvatarResult as JoinApprovalAvatarResult
+from join_approval_risk_terms import JoinApprovalRiskTerms
+from join_approval_text_normalizer import normalize_text as join_normalize_text
 from semantic_ads import SemanticAdDetector
 
 # ==================== 环境配置 ====================
@@ -89,6 +93,12 @@ media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
+join_approval_terms = JoinApprovalRiskTerms(os.path.dirname(os.path.abspath(__file__)))
+join_approval_avatar_ocr = JoinApprovalAvatarOCR(join_approval_terms)
+JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "86400").strip()))
+JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
+JOIN_APPROVAL_REQUEST_TIMEOUT = 10
+join_approval_avatar_cache = {}  # file_unique_id -> {ocr_text, normalized_text, is_text_avatar, chinese_char_count, total_char_count, matched_term, decision, timestamp}
 # 召唤代发：未解锁用户发「召唤」后下一次媒体由机器人代发（避免炸群）
 summon_pending = {}  # (group_id, user_id) -> timestamp
 SUMMON_TIMEOUT_SEC = 300
@@ -157,6 +167,175 @@ def _push_listen_log(
         )
     except Exception:
         pass
+
+
+def _join_approval_timeout_kwargs() -> dict:
+    timeout = JOIN_APPROVAL_REQUEST_TIMEOUT
+    return {
+        "request_timeout": timeout,
+    }
+
+
+def _prune_join_approval_avatar_cache() -> None:
+    now = time.time()
+    expired = [
+        key
+        for key, value in join_approval_avatar_cache.items()
+        if now - float(value.get("timestamp", 0)) > JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS
+    ]
+    for key in expired:
+        join_approval_avatar_cache.pop(key, None)
+
+
+def _get_join_approval_avatar_cache(file_unique_id: str) -> JoinApprovalAvatarResult | None:
+    entry = join_approval_avatar_cache.get(file_unique_id)
+    if not entry:
+        return None
+    if time.time() - float(entry.get("timestamp", 0)) > JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS:
+        join_approval_avatar_cache.pop(file_unique_id, None)
+        return None
+    return JoinApprovalAvatarResult(
+        extracted_text=str(entry.get("ocr_text", "")),
+        normalized_text=str(entry.get("normalized_text", "")),
+        is_text_avatar=bool(entry.get("is_text_avatar", False)),
+        chinese_char_count=int(entry.get("chinese_char_count", 0)),
+        total_char_count=int(entry.get("total_char_count", 0)),
+        matched_term=entry.get("matched_term"),
+    )
+
+
+def _set_join_approval_avatar_cache(file_unique_id: str, result: JoinApprovalAvatarResult) -> None:
+    join_approval_avatar_cache[file_unique_id] = {
+        "ocr_text": result.extracted_text,
+        "normalized_text": result.normalized_text,
+        "is_text_avatar": result.is_text_avatar,
+        "chinese_char_count": result.chinese_char_count,
+        "total_char_count": result.total_char_count,
+        "matched_term": result.matched_term,
+        "decision": "decline" if result.matched_term else "approve",
+        "timestamp": time.time(),
+    }
+    _prune_join_approval_avatar_cache()
+
+
+def _log_join_review(
+    *,
+    user_id: int,
+    chat_id: int,
+    nickname_match: str | None,
+    bio_match: str | None,
+    avatar_match: str | None,
+    final_decision: str,
+    reason: str,
+) -> None:
+    print(
+        "join_review "
+        f"user_id={user_id} chat_id={chat_id} "
+        f"nickname_match={nickname_match or '-'} "
+        f"bio_match={bio_match or '-'} "
+        f"avatar_match={avatar_match or '-'} "
+        f"decision={final_decision} reason={reason}"
+    )
+
+
+@router.chat_join_request(F.chat.id.in_(GROUP_IDS))
+async def handle_chat_join_request(join_request: ChatJoinRequest):
+    """Lightweight join approval: nickname -> bio -> avatar OCR."""
+    user = join_request.from_user
+    user_id = user.id
+    chat_id = join_request.chat.id
+    nickname_match = None
+    bio_match = None
+    avatar_match = None
+    final_decision = "approve"
+    reason = "no_rule_hit"
+
+    nickname_text = "".join(
+        part for part in (user.first_name, user.last_name, user.username) if part
+    )
+    nickname_match = join_approval_terms.match(nickname_text)
+    if nickname_match:
+        final_decision = "decline"
+        reason = "nickname_risk_term"
+    else:
+        bio_match = join_approval_terms.match(getattr(join_request, "bio", "") or "")
+        if bio_match:
+            final_decision = "decline"
+            reason = "bio_risk_term"
+
+    if final_decision == "approve" and join_approval_avatar_ocr.ocr_enabled:
+        try:
+            photos = await bot.get_user_profile_photos(
+                user_id=user_id,
+                limit=1,
+                **_join_approval_timeout_kwargs(),
+            )
+            if photos.total_count > 0 and photos.photos and photos.photos[0]:
+                largest = photos.photos[0][-1]
+                cached_result = _get_join_approval_avatar_cache(largest.file_unique_id)
+                avatar_result = cached_result
+                if avatar_result is None:
+                    try:
+                        tg_file = await bot.get_file(
+                            largest.file_id,
+                            **_join_approval_timeout_kwargs(),
+                        )
+                        if not tg_file.file_path:
+                            raise ValueError("empty file_path")
+                        downloaded = await bot.download_file(
+                            tg_file.file_path,
+                            timeout=JOIN_APPROVAL_REQUEST_TIMEOUT,
+                        )
+                        if downloaded is None:
+                            raise ValueError("avatar download returned None")
+                        if isinstance(downloaded, io.BytesIO):
+                            image_bytes = downloaded.getvalue()
+                        else:
+                            image_bytes = downloaded.read()
+                        avatar_result = join_approval_avatar_ocr.analyze_avatar(image_bytes)
+                        _set_join_approval_avatar_cache(largest.file_unique_id, avatar_result)
+                    except Exception as e:
+                        print(f"join avatar fetch/ocr failed user_id={user_id}: {e}")
+                        avatar_result = None
+                if avatar_result and avatar_result.is_text_avatar and avatar_result.matched_term:
+                    avatar_match = avatar_result.matched_term
+                    final_decision = "decline"
+                    reason = "avatar_text_risk_term"
+        except Exception as e:
+            print(f"join profile photo check failed user_id={user_id}: {e}")
+
+    try:
+        if final_decision == "decline":
+            await bot.decline_chat_join_request(
+                chat_id=chat_id,
+                user_id=user_id,
+                **_join_approval_timeout_kwargs(),
+            )
+            if JOIN_APPROVAL_DECLINE_AND_BAN:
+                try:
+                    await bot.ban_chat_member(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        **_join_approval_timeout_kwargs(),
+                    )
+                except Exception as e:
+                    print(f"join decline ban failed user_id={user_id}: {e}")
+        else:
+            await bot.approve_chat_join_request(
+                chat_id=chat_id,
+                user_id=user_id,
+                **_join_approval_timeout_kwargs(),
+            )
+    finally:
+        _log_join_review(
+            user_id=user_id,
+            chat_id=chat_id,
+            nickname_match=nickname_match,
+            bio_match=bio_match,
+            avatar_match=avatar_match,
+            final_decision=final_decision,
+            reason=reason,
+        )
 
 # ==================== 配置函数 ====================
 def _default_group_config():
