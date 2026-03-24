@@ -3237,18 +3237,6 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
         )
         return False
 
-    wl_words = cfg.get("repeat_exempt_keywords") or []
-    if any(w and w in text for w in wl_words):
-        _push_listen_log(
-            group_id=group_id,
-            user_id=user_id,
-            msg_id=message.message_id,
-            text=text,
-            verdict="PASS",
-            details="进入AD检测但命中豁免词 repeat_exempt_keywords，跳过AD匹配",
-        )
-        return False
-
     is_semantic_ad, sim, _ = semantic_ad_detector.check_text(text)
     _push_listen_log(
         group_id=group_id,

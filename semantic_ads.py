@@ -244,6 +244,18 @@ class SemanticAdDetector:
         if not rows:
             return False, 0.0, None
 
+        # 硬规则优先：
+        # 1. 完全相同的归一化文案必须命中
+        # 2. 新消息完整包含任一广告样本，也必须命中
+        for sid, text_old, _sh_old, _fp_str in rows:
+            sample_text = str(text_old or "")
+            if not sample_text:
+                continue
+            if norm == sample_text:
+                return True, 1.0, int(sid)
+            if sample_text in norm:
+                return True, 1.0, int(sid)
+
         grams_new = _ngrams(norm, 3)
         sh_new = _simhash_from_tokens(grams_new if grams_new else [norm])
 
@@ -292,6 +304,6 @@ class SemanticAdDetector:
                 best_score = score
                 best_id = sid
 
-        is_ad = best_score >= 0.90 and best_id is not None
+        is_ad = best_score >= 0.85 and best_id is not None
         return is_ad, best_score, best_id
 
