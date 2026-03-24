@@ -63,6 +63,7 @@ LINK_REF_LEVELS_FILE = os.path.join(DATA_DIR, "link_ref_levels.json")
 FORWARD_MATCH_FILE = os.path.join(DATA_DIR, "forward_match_memory.json")
 RECENT_MESSAGES_FILE = os.path.join(DATA_DIR, "recent_messages.json")
 REPORT_ACTIONS_FILE = os.path.join(DATA_DIR, "report_actions.json")
+AD_DELETE_SUMMARY_FILE = os.path.join(DATA_DIR, "ad_delete_summaries.json")
 
 reports = {}  # key: (group_id, message_id)
 lock = asyncio.Lock()
@@ -76,6 +77,8 @@ message_link_level = {}  # (group_id, user_id) -> 0|1
 config = {}
 forward_match_memory = {}  # normalized_text -> {"group_id": int, "user_id": int, "updated_at": int}
 report_action_state = {}  # key: "gid_uid" -> {"last_trigger_count": int, "last_trigger_at": int}
+pending_ad_delete_summaries = []  # recent AD delete events waiting for 10-item admin summary
+ad_delete_summary_lock = asyncio.Lock()
 # 媒体权限统计：合规消息数、同条超过10次不计数、已解锁名单、助力数（持久化到 MEDIA_STATS_FILE，重新部署须保留 DATA_DIR 卷）
 media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}, "boosts": {}}
 media_stats_loaded = False
@@ -339,6 +342,26 @@ async def save_report_action_state():
             json.dump(report_action_state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"report action state save failed: {e}")
+
+async def load_ad_delete_summaries():
+    global pending_ad_delete_summaries
+    try:
+        if os.path.exists(AD_DELETE_SUMMARY_FILE):
+            with open(AD_DELETE_SUMMARY_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            pending_ad_delete_summaries = raw if isinstance(raw, list) else []
+        else:
+            pending_ad_delete_summaries = []
+    except Exception as e:
+        print(f"ad delete summary load failed: {e}")
+        pending_ad_delete_summaries = []
+
+async def save_ad_delete_summaries():
+    try:
+        with open(AD_DELETE_SUMMARY_FILE, "w", encoding="utf-8") as f:
+            json.dump(pending_ad_delete_summaries, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"ad delete summary save failed: {e}")
 
 def _prune_recent_messages_cache():
     cutoff = time.time() - USER_MSG_24H_SEC
@@ -3213,6 +3236,60 @@ async def _enable_semantic_detection_for_group(group_id: int) -> bool:
     await save_config()
     return True
 
+async def _flush_ad_delete_summary_batch() -> None:
+    async with ad_delete_summary_lock:
+        if len(pending_ad_delete_summaries) < 10:
+            return
+        batch = pending_ad_delete_summaries[:10]
+        del pending_ad_delete_summaries[:10]
+        await save_ad_delete_summaries()
+
+    lines = []
+    learned_count = 0
+    for idx, item in enumerate(batch, start=1):
+        if item.get("learned"):
+            learned_count += 1
+        ts = time.strftime("%m-%d %H:%M:%S", time.localtime(int(item.get("ts", time.time()))))
+        lines.append(
+            f"{idx}. [{ts}] gid={item.get('group_id')} uid={item.get('user_id')} "
+            f"score={float(item.get('score', 0.0)):.3f} learned={'Y' if item.get('learned') else 'N'}\n"
+            f"   {item.get('text', '')}"
+        )
+
+    summary_text = (
+        "AD 删除汇总（10条）\n\n"
+        f"总数: 10\n"
+        f"新增学习入库: {learned_count}\n\n"
+        + "\n".join(lines)
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, summary_text)
+        except Exception as e:
+            print(f"send AD delete summary failed for admin {admin_id}: {e}")
+
+async def _record_semantic_ad_deletion(group_id: int, user_id: int, message_id: int, text: str, score: float) -> None:
+    learned = False
+    try:
+        sample = semantic_ad_detector.add_ad_sample(text)
+        learned = sample is not None
+    except Exception as e:
+        print(f"learn ad sample on delete failed: {e}")
+
+    event = {
+        "ts": int(time.time()),
+        "group_id": group_id,
+        "user_id": user_id,
+        "message_id": message_id,
+        "text": _clip_text(text, 120),
+        "score": round(float(score), 3),
+        "learned": learned,
+    }
+    async with ad_delete_summary_lock:
+        pending_ad_delete_summaries.append(event)
+        await save_ad_delete_summaries()
+    await _flush_ad_delete_summary_batch()
+
 
 async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, group_id: int, user_id: int) -> bool:
     """
@@ -3249,6 +3326,7 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
     if not is_semantic_ad:
         return False
 
+    await _record_semantic_ad_deletion(group_id, user_id, message.message_id, text, sim)
     await _delete_original_and_linked_reply(group_id, message.message_id)
     _push_listen_log(
         group_id=group_id,
@@ -4468,6 +4546,7 @@ async def main():
     await load_data()
     await load_user_violations()
     await load_report_action_state()
+    await load_ad_delete_summaries()
     await load_recent_messages_cache()
     await load_forward_match_memory()
     load_repeat_levels()
