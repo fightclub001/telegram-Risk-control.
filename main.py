@@ -91,6 +91,8 @@ media_reports = {}
 media_reports_lock = asyncio.Lock()
 media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
+pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message": Message, "user_id": int}
+MEDIA_GROUP_SETTLE_SEC = 1.2
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
 join_approval_terms = JoinApprovalRiskTerms(os.path.dirname(os.path.abspath(__file__)))
@@ -1073,16 +1075,29 @@ def get_media_perm_menu_keyboard(group_id: int):
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_media_whitelist_keyboard(group_id: int):
+def get_media_whitelist_keyboard(group_id: int, page: int = 0):
     cfg = get_group_config(group_id)
     wl = cfg.get("media_unlock_whitelist", [])
     if not isinstance(wl, list):
         wl = []
+    page_size = 15
+    total = len(wl)
+    max_page = max(0, (total - 1) // page_size) if total else 0
+    page = max(0, min(page, max_page))
+    start = page * page_size
+    end = start + page_size
     buttons = []
-    for i, v in enumerate(wl[:25]):
+    for i, v in enumerate(wl[start:end], start=start):
         s = str(v)[:30]
-        buttons.append([InlineKeyboardButton(text=f"❌ {s}", callback_data=f"remove_mw:{group_id}:{i}")])
-    buttons.append([InlineKeyboardButton(text="➕ 添加", callback_data=f"add_media_whitelist:{group_id}")])
+        buttons.append([InlineKeyboardButton(text=f"❌ {s}", callback_data=f"remove_mw:{group_id}:{i}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"submenu_media_whitelist:{group_id}:{page-1}"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"submenu_media_whitelist:{group_id}:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="➕ 添加", callback_data=f"add_media_whitelist:{group_id}:{page}")])
     buttons.append([InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_media_perm:{group_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -2332,14 +2347,28 @@ async def process_media_broadcast_interval(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("submenu_media_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
 async def media_whitelist_submenu(callback: CallbackQuery):
     try:
-        group_id = int(callback.data.split(":", 1)[1])
+        parts = callback.data.split(":")
+        group_id = int(parts[1])
+        page = int(parts[2]) if len(parts) >= 3 else 0
         title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         wl = cfg.get("media_unlock_whitelist", [])
         if not isinstance(wl, list):
             wl = []
-        text = f"<b>{title}</b> › 媒体解锁白名单\n\n用户ID或用户名，满足即无需消息/助力可发媒体。\n当前：" + (", ".join(str(x) for x in wl) if wl else "（空）")
-        await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id))
+        page_size = 15
+        total = len(wl)
+        max_page = max(0, (total - 1) // page_size) if total else 0
+        page = max(0, min(page, max_page))
+        start = page * page_size
+        end = start + page_size
+        visible = wl[start:end]
+        text = (
+            f"<b>{title}</b> › 媒体解锁白名单\n\n"
+            "用户ID或用户名，满足即无需消息/助力可发媒体。\n"
+            f"总数: {total}  页码: {page + 1}/{max_page + 1}\n\n"
+            + ("\n".join(str(x) for x in visible) if visible else "（空）")
+        )
+        await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id, page))
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -2347,7 +2376,8 @@ async def media_whitelist_submenu(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("add_media_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
 async def add_media_whitelist(callback: CallbackQuery, state: FSMContext):
     try:
-        group_id = int(callback.data.split(":", 1)[1])
+        parts = callback.data.split(":")
+        group_id = int(parts[1])
         await callback.message.edit_text("输入要添加的用户ID或用户名（一行一个，支持多行）：", reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditMediaWhitelistAdd)
@@ -2370,7 +2400,8 @@ async def process_media_whitelist_add(message: Message, state: FSMContext):
                 wl.append(s)
         cfg["media_unlock_whitelist"] = wl
         await save_config()
-        await message.reply(f"✅ 已添加，当前共 {len(wl)} 项", reply_markup=get_media_whitelist_keyboard(group_id))
+        last_page = max(0, (len(wl) - 1) // 15) if wl else 0
+        await message.reply(f"✅ 已添加，当前共 {len(wl)} 项", reply_markup=get_media_whitelist_keyboard(group_id, last_page))
         await state.set_state(AdminStates.GroupMenu)
     except Exception as e:
         await message.reply(f"❌ {str(e)}")
@@ -2378,9 +2409,10 @@ async def process_media_whitelist_add(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("remove_mw:"), F.from_user.id.in_(ADMIN_IDS))
 async def remove_media_whitelist(callback: CallbackQuery):
     try:
-        parts = callback.data.split(":", 2)
+        parts = callback.data.split(":")
         group_id = int(parts[1])
         idx = int(parts[2])
+        page = int(parts[3]) if len(parts) >= 4 else 0
         cfg = get_group_config(group_id)
         wl = cfg.get("media_unlock_whitelist", [])
         if not isinstance(wl, list):
@@ -2390,8 +2422,18 @@ async def remove_media_whitelist(callback: CallbackQuery):
             cfg["media_unlock_whitelist"] = wl
             await save_config()
         title = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{title}</b> › 媒体解锁白名单\n\n当前：" + (", ".join(str(x) for x in wl) if wl else "（空）")
-        await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id))
+        total = len(wl)
+        max_page = max(0, (total - 1) // 15) if total else 0
+        page = max(0, min(page, max_page))
+        start = page * 15
+        end = start + 15
+        visible = wl[start:end]
+        text = (
+            f"<b>{title}</b> › 媒体解锁白名单\n\n"
+            f"总数: {total}  页码: {page + 1}/{max_page + 1}\n\n"
+            + ("\n".join(str(x) for x in visible) if visible else "（空）")
+        )
+        await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id, page))
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -3158,6 +3200,42 @@ def _media_reply_buttons(chat_id: int, media_msg_id: int, report_count: int, lik
         ]
     ])
 
+
+async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
+    await asyncio.sleep(MEDIA_GROUP_SETTLE_SEC)
+    key = (chat_id, media_group_id)
+    data = pending_media_groups.pop(key, None)
+    if not data:
+        return
+
+    first_message = data.get("first_message")
+    message_ids = list(dict.fromkeys(data.get("message_ids", [])))
+    if not first_message or not message_ids:
+        return
+
+    caption = (data.get("caption") or "").strip()
+    summary = f"📎 媒体消息（共 {len(message_ids)} 条）"
+    if caption:
+        summary += f"\n📝 文字：{_clip_text(caption, 100)}"
+
+    reply = await first_message.reply(
+        summary,
+        reply_markup=_media_reply_buttons(chat_id, message_ids[0], 0, 0),
+    )
+    _track_group_reply(first_message, reply)
+    async with media_reports_lock:
+        media_reports[(chat_id, message_ids[0])] = {
+            "chat_id": chat_id,
+            "media_msg_id": message_ids[0],
+            "media_msg_ids": message_ids,
+            "media_group_id": media_group_id,
+            "reply_msg_id": reply.message_id,
+            "reporters": set(),
+            "likes": set(),
+            "deleted": False,
+            "caption": caption,
+        }
+
 def _message_link(chat_id: int, msg_id: int) -> str:
     """群内消息链接，便于管理员定位"""
     cid = str(chat_id).replace("-100", "")
@@ -3325,16 +3403,41 @@ async def on_media_message(message: Message):
                     last_media_no_perm_msg.pop(sk, None)
             asyncio.create_task(_delete_after())
         return
-    reply = await message.reply("📎 媒体消息", reply_markup=_media_reply_buttons(group_id, message.message_id, 0, 0))
+    media_group_id = getattr(message, "media_group_id", None)
+    if media_group_id:
+        key = (group_id, str(media_group_id))
+        group_data = pending_media_groups.get(key)
+        if group_data is None:
+            group_data = {
+                "message_ids": [],
+                "caption": "",
+                "first_message": message,
+                "user_id": user_id,
+            }
+            pending_media_groups[key] = group_data
+            asyncio.create_task(_finalize_media_group(group_id, str(media_group_id)))
+        group_data["message_ids"].append(message.message_id)
+        if message.caption:
+            group_data["caption"] = message.caption
+        if message.message_id < group_data["first_message"].message_id:
+            group_data["first_message"] = message
+        return
+
+    summary = "📎 媒体消息"
+    if message.caption:
+        summary += f"\n📝 文字：{_clip_text(message.caption, 100)}"
+    reply = await message.reply(summary, reply_markup=_media_reply_buttons(group_id, message.message_id, 0, 0))
     _track_group_reply(message, reply)
     async with media_reports_lock:
         media_reports[(group_id, message.message_id)] = {
             "chat_id": group_id,
             "media_msg_id": message.message_id,
+            "media_msg_ids": [message.message_id],
             "reply_msg_id": reply.message_id,
             "reporters": set(),
             "likes": set(),
             "deleted": False,
+            "caption": message.caption or "",
         }
 
 def _track_user_message(group_id: int, user_id: int, msg_id: int, text: str = ""):
@@ -4586,6 +4689,7 @@ async def handle_media_report(callback: CallbackQuery):
             report_count = len(data["reporters"])
             like_count = len(data["likes"])
             reply_id = data["reply_msg_id"]
+            media_msg_ids = list(data.get("media_msg_ids", [media_msg_id]))
 
         try:
             await bot.edit_message_reply_markup(
@@ -4599,12 +4703,13 @@ async def handle_media_report(callback: CallbackQuery):
 
         delete_threshold = cfg.get("media_report_delete_threshold", 3)
         if report_count >= delete_threshold:
-            await _delete_original_and_linked_reply(chat_id, media_msg_id)
+            for original_mid in media_msg_ids:
+                await _delete_original_and_linked_reply(chat_id, original_mid)
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=reply_id,
-                    text="⚠️ 多人举报，已删除该媒体。",
+                    text=f"⚠️ 多人举报，已删除该媒体消息（共 {len(media_msg_ids)} 条）。",
                     reply_markup=None
                 )
             except Exception:
