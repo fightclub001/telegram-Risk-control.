@@ -3961,6 +3961,10 @@ async def detect_and_warn(message: Message):
             details="未命中AD语义库；多层监听无触发项",
         )
 
+    # 合规文本：仅在本条消息未触发处罚，且轻度命中不超过 1 层时计入媒体解锁进度
+    if len(triggers) <= 1:
+        await _try_count_media_and_notify(message, group_id, user_id, cfg)
+
 
 @router.message(Command(commands=["ad", "AD", "Ad"]), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
 async def cmd_mark_ad(message: Message):
@@ -4103,10 +4107,6 @@ async def on_member_left(message: Message):
         await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
     except Exception as e:
         print(f"处理退群用户消息清理失败: {e}")
-
-    # 合规消息：仅当 triggers<=1 且本条未受任何处罚时计入
-    if len(triggers) <= 1:
-        await _try_count_media_and_notify(message, group_id, user_id, cfg)
 
 # 其他内容类型（贴纸/文件/动画等）：仅做外部引用检测，与文本/媒体一致处理
 _OTHER_CONTENT = {
