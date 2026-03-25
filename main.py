@@ -787,12 +787,12 @@ async def _try_count_media_and_notify(message: Message, group_id: int, user_id: 
             return
         just_unlocked = await _increment_media_count(group_id, user_id, norm)
         if just_unlocked:
-            name = _get_display_name_from_message(message, user_id)
+            mention = _format_user_mention(message.from_user, user_id)
             need_msg = cfg.get("media_unlock_msg_count", 50)
             try:
                 await bot.send_message(
                     group_id,
-                    f"🎉 {name} 已在本群发送合规消息满 {need_msg} 条，解锁直接发送图片/视频/语音的权限。"
+                    f"🎉 用户 {mention} 发送合规信息超过 {need_msg} 条，已解锁发媒体权限。"
                 )
             except Exception:
                 pass
@@ -2967,6 +2967,23 @@ def _get_display_name_from_message(message: Message, user_id: int) -> str:
     return name
 
 
+def _format_user_mention(user_obj, user_id: int) -> str:
+    username = getattr(user_obj, "username", None)
+    if username:
+        return f"@{username}"
+    full_name = getattr(user_obj, "full_name", None) or f"用户{user_id}"
+    safe_name = (
+        str(full_name).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+
+
+def _render_reporter_lines(reporter_labels: dict | None) -> str:
+    if not isinstance(reporter_labels, dict) or not reporter_labels:
+        return "👥 举报人：暂无"
+    return "👥 举报人：\n" + "\n".join(f"- {str(label)}" for label in reporter_labels.values())
+
+
 async def handle_repeat_message(message: Message) -> bool:
     """
     检测用户是否在配置时间窗口内重复发送相同内容
@@ -3951,6 +3968,7 @@ async def detect_and_warn(message: Message):
                         "suspect_id": user_id,
                         "chat_id": group_id,
                         "reporters": set(),
+                        "reporter_labels": {},
                         "reason": reason,
                         "trigger_count": len(triggers),
                         "suspect_name": display_name,
@@ -3973,6 +3991,7 @@ async def detect_and_warn(message: Message):
                     "suspect_id": user_id,
                     "chat_id": group_id,
                     "reporters": set(),
+                    "reporter_labels": {},
                     "reason": reason,
                     "trigger_count": len(triggers),
                     "suspect_name": display_name,
@@ -4281,6 +4300,8 @@ async def handle_report(callback: CallbackQuery):
                 await callback.answer("已举报过")
                 return
             data["reporters"].add(reporter_id)
+            reporter_labels = data.setdefault("reporter_labels", {})
+            reporter_labels[str(reporter_id)] = _format_user_mention(callback.from_user, reporter_id)
             count = len(data["reporters"])
             user_id = data["suspect_id"]
             warning_id = data["warning_id"]
@@ -4302,8 +4323,10 @@ async def handle_report(callback: CallbackQuery):
         display_name = data.get("suspect_name") or f"ID {user_id}"
         updated_text = (
             "🚨 已收到群成员的举报\n\n"
-            f"👤 用户：{display_name}（ID: {user_id}）📌 触发原因：{reason}\n"
-            f"📣 当前举报人数：{count} 人\n\n"
+            f"👤 用户：{display_name}（ID: {user_id}）\n"
+            f"📌 触发原因：{reason}\n"
+            f"📣 当前举报人数：{count} 人\n"
+            f"{_render_reporter_lines(data.get('reporter_labels'))}\n\n"
             "⚠️ 疑似广告，请勿私信该用户，可继续点举报。"
         )
         kb = build_warning_buttons(group_id, msg_id, count)
