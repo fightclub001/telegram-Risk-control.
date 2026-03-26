@@ -777,7 +777,7 @@ async def _increment_media_count(group_id: int, user_id: int, normalized_text: s
 
 
 async def _try_count_media_and_notify(message: Message, group_id: int, user_id: int, cfg: dict) -> None:
-    """合规消息计入并可能发送解锁贺信。仅对「未解锁」用户统计（已解锁=满50条/白名单/助力，不包含一发图就被删的用户，避免逻辑循环）。"""
+    """合规消息计入媒体解锁进度。达到阈值后静默解锁，不再主动群内提示。"""
     media_key = _media_key(group_id, user_id)
     if media_stats["unlocked"].get(media_key):
         return
@@ -787,15 +787,6 @@ async def _try_count_media_and_notify(message: Message, group_id: int, user_id: 
             return
         just_unlocked = await _increment_media_count(group_id, user_id, norm)
         if just_unlocked:
-            mention = _format_user_mention(message.from_user, user_id)
-            need_msg = cfg.get("media_unlock_msg_count", 50)
-            try:
-                await bot.send_message(
-                    group_id,
-                    f"🎉 用户 {mention} 发送合规信息超过 {need_msg} 条，已解锁发媒体权限。"
-                )
-            except Exception:
-                pass
             # 若该用户此前因多次违规被关闭媒体权限，则在达到解锁条件后自动恢复其发媒体权限
             try:
                 await bot.restrict_chat_member(
