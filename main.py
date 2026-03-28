@@ -3201,11 +3201,11 @@ def build_warning_buttons(group_id: int, msg_id: int, report_count: int):
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def _media_reply_buttons(chat_id: int, media_msg_id: int, report_count: int, like_count: int) -> InlineKeyboardMarkup:
+def _media_reply_buttons(chat_id: int, media_msg_id: int, report_count: int, garbage_count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=f"举报儿童色情⚠️ {report_count}人", callback_data=f"mr:{chat_id}:{media_msg_id}"),
-            InlineKeyboardButton(text=f"点赞👍 {like_count}人", callback_data=f"ml:{chat_id}:{media_msg_id}"),
+            InlineKeyboardButton(text=f"举报垃圾信息🚫 {garbage_count}人", callback_data=f"mg:{chat_id}:{media_msg_id}"),
         ]
     ])
 
@@ -3240,7 +3240,7 @@ async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
             "media_group_id": media_group_id,
             "reply_msg_id": reply.message_id,
             "reporters": set(),
-            "likes": set(),
+            "garbage_reporters": set(),
             "deleted": False,
             "caption": caption,
         }
@@ -3444,7 +3444,7 @@ async def on_media_message(message: Message):
             "media_msg_ids": [message.message_id],
             "reply_msg_id": reply.message_id,
             "reporters": set(),
-            "likes": set(),
+            "garbage_reporters": set(),
             "deleted": False,
             "caption": message.caption or "",
         }
@@ -4763,7 +4763,7 @@ async def handle_media_report(callback: CallbackQuery):
                 return
             data["reporters"].add(uid)
             report_count = len(data["reporters"])
-            like_count = len(data["likes"])
+            garbage_count = len(data.get("garbage_reporters", set()))
             reply_id = data["reply_msg_id"]
             media_msg_ids = list(data.get("media_msg_ids", [media_msg_id]))
 
@@ -4771,14 +4771,13 @@ async def handle_media_report(callback: CallbackQuery):
             await bot.edit_message_reply_markup(
                 chat_id=chat_id,
                 message_id=reply_id,
-                reply_markup=_media_reply_buttons(chat_id, media_msg_id, report_count, like_count)
+                reply_markup=_media_reply_buttons(chat_id, media_msg_id, report_count, garbage_count)
             )
         except Exception:
             pass
         await callback.answer()
 
-        delete_threshold = cfg.get("media_report_delete_threshold", 3)
-        if report_count >= delete_threshold:
+        if report_count >= 2:
             for original_mid in media_msg_ids:
                 await _delete_original_and_linked_reply(chat_id, original_mid)
             try:
@@ -4793,26 +4792,13 @@ async def handle_media_report(callback: CallbackQuery):
             async with media_reports_lock:
                 if key in media_reports:
                     media_reports[key]["deleted"] = True
-        elif report_count == 2:
-            link = _message_link(chat_id, media_msg_id)
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        admin_id,
-                        f"⚠️ 群内媒体被举报（儿童色情相关）\n群: {chat_id}\n消息: {link}\n当前举报人数: 2 人",
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="定位到消息", url=link)]
-                        ])
-                    )
-                except Exception:
-                    pass
     except Exception as e:
         print("媒体举报异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
 
-@router.callback_query(F.data.startswith("ml:"))
-async def handle_media_like(callback: CallbackQuery):
-    """点赞"""
+@router.callback_query(F.data.startswith("mg:"))
+async def handle_media_garbage_report(callback: CallbackQuery):
+    """举报垃圾信息：两人举报即删。"""
     try:
         parts = callback.data.split(":", 2)
         if len(parts) != 3:
@@ -4827,24 +4813,44 @@ async def handle_media_like(callback: CallbackQuery):
                 await callback.answer("已过期")
                 return
             data = media_reports[key]
-            if uid in data["likes"]:
-                await callback.answer("已点赞过")
+            if data["deleted"]:
+                await callback.answer("该媒体已被删除")
                 return
-            data["likes"].add(uid)
-            like_count = len(data["likes"])
+            garbage_reporters = data.setdefault("garbage_reporters", set())
+            if uid in garbage_reporters:
+                await callback.answer("已举报过")
+                return
+            garbage_reporters.add(uid)
+            garbage_count = len(garbage_reporters)
             reply_id = data["reply_msg_id"]
             report_count = len(data["reporters"])
+            media_msg_ids = list(data.get("media_msg_ids", [media_msg_id]))
         try:
             await bot.edit_message_reply_markup(
                 chat_id=chat_id,
                 message_id=reply_id,
-                reply_markup=_media_reply_buttons(chat_id, media_msg_id, report_count, like_count)
+                reply_markup=_media_reply_buttons(chat_id, media_msg_id, report_count, garbage_count)
             )
         except Exception:
             pass
         await callback.answer()
+        if garbage_count >= 2:
+            for original_mid in media_msg_ids:
+                await _delete_original_and_linked_reply(chat_id, original_mid)
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=reply_id,
+                    text=f"⚠️ 多人举报，已删除该媒体消息（共 {len(media_msg_ids)} 条）。",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+            async with media_reports_lock:
+                if key in media_reports:
+                    media_reports[key]["deleted"] = True
     except Exception as e:
-        print("媒体点赞异常:", e)
+        print("媒体垃圾举报异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
 
 async def cleanup_deleted_messages():
