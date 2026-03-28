@@ -3022,9 +3022,10 @@ async def handle_repeat_message(message: Message) -> bool:
             f"⚠️ 检测到你在 {window_sec // 3600} 小时内重复发送相同内容（2/{max_count}），请调整文字内容。"
         )
         try:
-            w = await message.reply(warn_text)
-            repeat_warning_msg_id[(group_id, user_id)] = w.message_id
-            _track_group_reply(message, w)
+            w = await _send_delayed_reply_if_original_exists(message, warn_text)
+            if w:
+                repeat_warning_msg_id[(group_id, user_id)] = w.message_id
+                _track_group_reply(message, w)
         except Exception:
             pass
         return False
@@ -3481,6 +3482,24 @@ def _track_group_reply(message: Message, reply: Message):
         bot_reply_links[(chat.id, reply.message_id)] = (message.message_id, time.time())
     except Exception:
         pass
+
+
+async def _send_delayed_reply_if_original_exists(
+    message: Message,
+    text: str,
+    delay_sec: float = 1.0,
+    **kwargs,
+) -> Message | None:
+    """延迟回复；若原消息已被删除，则不再发送机器人回复。"""
+    if delay_sec > 0:
+        await asyncio.sleep(delay_sec)
+    try:
+        return await message.reply(text, **kwargs)
+    except Exception as e:
+        err = str(e).lower()
+        if "replied message not found" in err or "message to be replied not found" in err:
+            return None
+        raise
 
 
 async def _delete_linked_bot_replies(group_id: int, original_msg_id: int | None):
@@ -3950,7 +3969,13 @@ async def detect_and_warn(message: Message):
             )
             try:
                 kb = build_warning_buttons(group_id, message.message_id, 0)
-                warning = await message.reply(warning_text, reply_markup=kb)
+                warning = await _send_delayed_reply_if_original_exists(
+                    message,
+                    warning_text,
+                    reply_markup=kb,
+                )
+                if not warning:
+                    return
                 _track_group_reply(message, warning)
                 rk = _report_key(group_id, message.message_id)
                 async with lock:
