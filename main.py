@@ -91,7 +91,7 @@ media_reports = {}
 media_reports_lock = asyncio.Lock()
 media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
-pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message": Message, "user_id": int}
+pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message": Message, "user_id": int, "last_update_ts": float}
 MEDIA_GROUP_SETTLE_SEC = 1.2
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
@@ -3211,9 +3211,16 @@ def _media_reply_buttons(chat_id: int, media_msg_id: int, report_count: int, gar
 
 
 async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
-    await asyncio.sleep(MEDIA_GROUP_SETTLE_SEC)
     key = (chat_id, media_group_id)
-    data = pending_media_groups.pop(key, None)
+    while True:
+        await asyncio.sleep(MEDIA_GROUP_SETTLE_SEC)
+        data = pending_media_groups.get(key)
+        if not data:
+            return
+        last_update_ts = float(data.get("last_update_ts", 0.0) or 0.0)
+        if time.time() - last_update_ts >= MEDIA_GROUP_SETTLE_SEC:
+            data = pending_media_groups.pop(key, None)
+            break
     if not data:
         return
 
@@ -3422,10 +3429,12 @@ async def on_media_message(message: Message):
                 "caption": "",
                 "first_message": message,
                 "user_id": user_id,
+                "last_update_ts": now,
             }
             pending_media_groups[key] = group_data
             asyncio.create_task(_finalize_media_group(group_id, str(media_group_id)))
         group_data["message_ids"].append(message.message_id)
+        group_data["last_update_ts"] = now
         if message.caption:
             group_data["caption"] = message.caption
         if message.message_id < group_data["first_message"].message_id:
