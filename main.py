@@ -3484,6 +3484,42 @@ def _track_group_reply(message: Message, reply: Message):
         pass
 
 
+def _is_original_message_still_tracked(group_id: int, original_msg_id: int | None) -> bool:
+    """检查原消息是否仍在本地最近消息缓存中。"""
+    if not original_msg_id:
+        return False
+    for (gid, _uid), msgs in user_recent_message_ids.items():
+        if gid != group_id:
+            continue
+        for msg_id, _ts, _txt in msgs:
+            if msg_id == original_msg_id:
+                return True
+    return False
+
+
+def _forget_tracked_user_message(group_id: int, original_msg_id: int | None) -> None:
+    """从最近消息缓存中移除已删除的原消息。"""
+    if not original_msg_id:
+        return
+    changed = False
+    for key in list(user_recent_message_ids.keys()):
+        gid, _uid = key
+        if gid != group_id:
+            continue
+        msgs = user_recent_message_ids.get(key)
+        if not msgs:
+            continue
+        kept = [(msg_id, ts, txt) for msg_id, ts, txt in msgs if msg_id != original_msg_id]
+        if len(kept) != len(msgs):
+            changed = True
+            if kept:
+                user_recent_message_ids[key] = deque(kept, maxlen=USER_MSG_TRACK_MAXLEN)
+            else:
+                user_recent_message_ids.pop(key, None)
+    if changed:
+        asyncio.create_task(save_recent_messages_cache())
+
+
 async def _send_delayed_reply_if_original_exists(
     message: Message,
     text: str,
@@ -3528,6 +3564,7 @@ async def _delete_original_and_linked_reply(group_id: int, original_msg_id: int 
         await bot.delete_message(group_id, original_msg_id)
     except Exception:
         pass
+    _forget_tracked_user_message(group_id, original_msg_id)
     await _delete_linked_bot_replies(group_id, original_msg_id)
 
 
@@ -4842,21 +4879,20 @@ async def cleanup_deleted_messages():
 
 
 async def cleanup_orphan_replies():
-    """每小时清理一次机器人在群里的引用回复，避免漏杀"""
+    """每 30 分钟清理一次已失去原消息缓存关联的机器人引用回复。"""
     while True:
-        await asyncio.sleep(3600)
-        # 拷贝一份当前列表，避免遍历时修改
+        await asyncio.sleep(1800)
         items = list(bot_reply_links.items())
         if not items:
             continue
         for (group_id, bot_msg_id), (orig_msg_id, created_ts) in items:
+            if _is_original_message_still_tracked(group_id, orig_msg_id):
+                continue
             try:
                 await bot.delete_message(group_id, bot_msg_id)
             except TelegramBadRequest:
-                # 已经被删就忽略
                 pass
             except Exception:
-                # 其他错误也不影响继续
                 pass
             finally:
                 bot_reply_links.pop((group_id, bot_msg_id), None)
