@@ -2975,32 +2975,16 @@ def _render_reporter_lines(reporter_labels: dict | None) -> str:
     return "👥 举报人：\n" + "\n".join(f"- {str(label)}" for label in reporter_labels.values())
 
 
-async def handle_repeat_message(message: Message) -> bool:
-    """
-    检测用户是否在配置时间窗口内重复发送相同内容
-    返回 True 表示已经进行了处罚/提醒并且本次消息后续逻辑应中止
-    """
-    if not message.text:
-        return False
-
+async def _handle_repeat_signature(message: Message, signature: str, repeat_label: str) -> bool:
+    """按统一规则处理重复文字或重复媒体。"""
     user_id = message.from_user.id
     group_id = message.chat.id
     cfg = get_group_config(group_id)
-    exempt_kw = cfg.get("repeat_exempt_keywords", []) or []
-    if isinstance(exempt_kw, list) and exempt_kw:
-        text_lower = (message.text or "").lower()
-        if any((k or "").strip().lower() in text_lower for k in exempt_kw if k):
-            return False
     window_sec = cfg.get("repeat_window_seconds", 2 * 3600)
     max_count = cfg.get("repeat_max_count", 3)
     ban_sec = cfg.get("repeat_ban_seconds", 86400)
-
-    norm_text = _normalize_text(message.text)
-    if not norm_text:
-        return False
-
-    key = (group_id, user_id, norm_text)
     now = time.time()
+    key = (group_id, user_id, signature)
 
     if key not in repeat_message_history:
         if len(repeat_message_history) >= REPEAT_HISTORY_MAX_KEYS:
@@ -3019,7 +3003,7 @@ async def handle_repeat_message(message: Message) -> bool:
 
     if count == 2:
         warn_text = (
-            f"⚠️ 检测到你在 {window_sec // 3600} 小时内重复发送相同内容（2/{max_count}），请调整文字内容。"
+            f"⚠️ 检测到你在 {window_sec // 3600} 小时内重复发送{repeat_label}（2/{max_count}），请勿刷屏。"
         )
         try:
             w = await _send_delayed_reply_if_original_exists(message, warn_text)
@@ -3069,7 +3053,7 @@ async def handle_repeat_message(message: Message) -> bool:
             await save_repeat_levels()
             notice = (
                 f"🚫 用户 {display_name}\n"
-                f"📌 触发原因：在配置时间窗口内多次重复发送相同内容（{max_count}/{max_count}）。\n"
+                f"📌 触发原因：在配置时间窗口内多次重复发送{repeat_label}（{max_count}/{max_count}）。\n"
                 f"🔒 处理结果：因刷屏已被本群禁言 1 天。\n{MISJUDGE_BOT_MENTION}"
             )
             try:
@@ -3101,7 +3085,7 @@ async def handle_repeat_message(message: Message) -> bool:
             await save_repeat_levels()
             notice = (
                 f"🚫 用户 {display_name}\n"
-                f"📌 触发原因：多次在 2 小时内重复发送相同内容，且在被解禁后仍然继续违规。\n"
+                f"📌 触发原因：多次在 2 小时内重复发送{repeat_label}，且在被解禁后仍然继续违规。\n"
                 f"🔒 处理结果：已被本群永久禁止发言。{MISJUDGE_BOT_MENTION}"
             )
             try:
@@ -3111,6 +3095,51 @@ async def handle_repeat_message(message: Message) -> bool:
             return True
 
     return False
+
+
+async def handle_repeat_message(message: Message) -> bool:
+    """
+    检测用户是否在配置时间窗口内重复发送相同内容
+    返回 True 表示已经进行了处罚/提醒并且本次消息后续逻辑应中止
+    """
+    if not message.text:
+        return False
+
+    cfg = get_group_config(message.chat.id)
+    exempt_kw = cfg.get("repeat_exempt_keywords", []) or []
+    if isinstance(exempt_kw, list) and exempt_kw:
+        text_lower = (message.text or "").lower()
+        if any((k or "").strip().lower() in text_lower for k in exempt_kw if k):
+            return False
+
+    norm_text = _normalize_text(message.text)
+    if not norm_text:
+        return False
+    return await _handle_repeat_signature(message, norm_text, "相同内容")
+
+
+def _get_media_repeat_signature(message: Message) -> str:
+    """提取媒体重复检测指纹，优先使用 file_unique_id。"""
+    if message.photo:
+        try:
+            largest = message.photo[-1]
+            if largest and getattr(largest, "file_unique_id", None):
+                return f"photo:{largest.file_unique_id}"
+        except Exception:
+            pass
+    for attr in ("video", "document", "animation", "audio", "voice", "video_note"):
+        obj = getattr(message, attr, None)
+        if obj and getattr(obj, "file_unique_id", None):
+            return f"{attr}:{obj.file_unique_id}"
+    return ""
+
+
+async def handle_repeat_media_message(message: Message) -> bool:
+    """检测同一图片/媒体的重复发送，处罚规则与重复文字一致。"""
+    signature = _get_media_repeat_signature(message)
+    if not signature:
+        return False
+    return await _handle_repeat_signature(message, signature, "同一图片/媒体")
 
 def _report_key(gid: int, mid: int) -> tuple:
     return (gid, mid)
@@ -3418,6 +3447,8 @@ async def on_media_message(message: Message):
                 if last_media_no_perm_msg.get(sk) == sent.message_id:
                     last_media_no_perm_msg.pop(sk, None)
             asyncio.create_task(_delete_after())
+        return
+    if await handle_repeat_media_message(message):
         return
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id:
