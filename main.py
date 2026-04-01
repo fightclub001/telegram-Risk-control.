@@ -91,7 +91,7 @@ media_reports = {}
 media_reports_lock = asyncio.Lock()
 media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
-pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message": Message, "user_id": int, "last_update_ts": float}
+pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message": Message, "user_id": int, "last_update_ts": float, "repeat_signatures": set[str]}
 MEDIA_GROUP_SETTLE_SEC = 1.2
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
@@ -3141,6 +3141,15 @@ async def handle_repeat_media_message(message: Message) -> bool:
         return False
     return await _handle_repeat_signature(message, signature, "同一图片/媒体")
 
+
+async def handle_repeat_media_group_message(message: Message, signatures: set[str]) -> bool:
+    """检测同一组相册/媒体是否被重复发送；组内重复图片只算一次。"""
+    cleaned = sorted(sig for sig in signatures if sig)
+    if not cleaned:
+        return False
+    group_signature = "album:" + "|".join(cleaned)
+    return await _handle_repeat_signature(message, group_signature, "同一组图片/媒体")
+
 def _report_key(gid: int, mid: int) -> tuple:
     return (gid, mid)
 
@@ -3256,6 +3265,8 @@ async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
     first_message = data.get("first_message")
     message_ids = list(dict.fromkeys(data.get("message_ids", [])))
     if not first_message or not message_ids:
+        return
+    if await handle_repeat_media_group_message(first_message, set(data.get("repeat_signatures", set()))):
         return
 
     caption = (data.get("caption") or "").strip()
@@ -3448,8 +3459,6 @@ async def on_media_message(message: Message):
                     last_media_no_perm_msg.pop(sk, None)
             asyncio.create_task(_delete_after())
         return
-    if await handle_repeat_media_message(message):
-        return
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id:
         key = (group_id, str(media_group_id))
@@ -3461,15 +3470,21 @@ async def on_media_message(message: Message):
                 "first_message": message,
                 "user_id": user_id,
                 "last_update_ts": now,
+                "repeat_signatures": set(),
             }
             pending_media_groups[key] = group_data
             asyncio.create_task(_finalize_media_group(group_id, str(media_group_id)))
         group_data["message_ids"].append(message.message_id)
         group_data["last_update_ts"] = now
+        repeat_signature = _get_media_repeat_signature(message)
+        if repeat_signature:
+            group_data["repeat_signatures"].add(repeat_signature)
         if message.caption:
             group_data["caption"] = message.caption
         if message.message_id < group_data["first_message"].message_id:
             group_data["first_message"] = message
+        return
+    if await handle_repeat_media_message(message):
         return
 
     summary = "📎 媒体消息"
