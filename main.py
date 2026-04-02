@@ -101,6 +101,8 @@ JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECO
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
 JOIN_APPROVAL_REQUEST_TIMEOUT = 10
 join_approval_avatar_cache = {}  # file_unique_id -> {ocr_text, normalized_text, is_text_avatar, chinese_char_count, total_char_count, matched_term, decision, timestamp}
+join_approval_review_batch = []
+JOIN_APPROVAL_BATCH_SIZE = 10
 # 召唤代发：未解锁用户发「召唤」后下一次媒体由机器人代发（避免炸群）
 summon_pending = {}  # (group_id, user_id) -> timestamp
 SUMMON_TIMEOUT_SEC = 300
@@ -240,6 +242,83 @@ def _log_join_review(
     )
 
 
+def _join_review_reason_text(reason: str) -> str:
+    mapping = {
+        "nickname_risk_term": "昵称命中敏感词",
+        "bio_risk_term": "简介命中敏感词",
+        "avatar_text_risk_term": "头像OCR命中敏感词",
+        "avatar_ocr_disabled": "头像OCR未启用",
+        "no_avatar": "没有头像",
+        "avatar_not_text": "头像不是文字头像",
+        "avatar_fetch_or_ocr_failed": "头像下载或OCR失败",
+        "avatar_ocr_no_match": "头像是文字头像，但文字不含敏感词",
+        "avatar_profile_check_failed": "头像资料检查失败",
+        "no_rule_hit": "未触发任何规则",
+    }
+    return mapping.get(reason, reason or "未知原因")
+
+
+def _format_join_review_user(user) -> str:
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{username}"
+    full_name = getattr(user, "full_name", None) or getattr(user, "first_name", None) or "无用户名用户"
+    safe_name = str(full_name).replace("\n", " ").strip()
+    return f"{safe_name} (ID {getattr(user, 'id', '-')})"
+
+
+async def _flush_join_review_batch_if_needed() -> None:
+    if len(join_approval_review_batch) < JOIN_APPROVAL_BATCH_SIZE:
+        return
+    batch = join_approval_review_batch[:JOIN_APPROVAL_BATCH_SIZE]
+    del join_approval_review_batch[:JOIN_APPROVAL_BATCH_SIZE]
+    lines = []
+    for idx, item in enumerate(batch, start=1):
+        lines.append(
+            f"{idx}. {item['user_label']} -> {item['decision_label']}\n"
+            f"   原因: {item['reason_label']}"
+        )
+    text = "入群审批汇总（10人）\n\n" + "\n".join(lines)
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            pass
+
+
+async def _record_join_review_batch(
+    *,
+    user,
+    final_decision: str,
+    reason: str,
+) -> None:
+    decision_label = "拒绝" if final_decision == "decline" else "通过"
+    join_approval_review_batch.append(
+        {
+            "user_label": _format_join_review_user(user),
+            "decision_label": decision_label,
+            "reason_label": _join_review_reason_text(reason),
+        }
+    )
+    await _flush_join_review_batch_if_needed()
+
+
+async def _notify_join_approval_startup_status() -> None:
+    status = "ENABLED" if join_approval_avatar_ocr.ocr_enabled else "DISABLED"
+    details = (
+        f"头像OCR: {status}\n"
+        f"OCR缓存TTL: {JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS} 秒\n"
+        f"DeclineAndBan: {'ON' if JOIN_APPROVAL_DECLINE_AND_BAN else 'OFF'}\n"
+        f"风险词数量: {len(join_approval_terms.terms)}"
+    )
+    text = "入群审批自检\n\n" + details
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            pass
+
+
 @router.chat_join_request(F.chat.id.in_(GROUP_IDS))
 async def handle_chat_join_request(join_request: ChatJoinRequest):
     """Lightweight join approval: nickname -> bio -> avatar OCR."""
@@ -319,7 +398,7 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
                         final_decision = "decline"
                         reason = "avatar_text_risk_term"
                     elif avatar_result:
-                        reason = "avatar_ocr_no_match"
+                        reason = "avatar_not_text" if not avatar_result.is_text_avatar else "avatar_ocr_no_match"
             except Exception as e:
                 reason = "avatar_profile_check_failed"
                 print(f"join profile photo check failed user_id={user_id}: {e}")
@@ -353,6 +432,11 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
             nickname_match=nickname_match,
             bio_match=bio_match,
             avatar_match=avatar_match,
+            final_decision=final_decision,
+            reason=reason,
+        )
+        await _record_join_review_batch(
+            user=user,
             final_decision=final_decision,
             reason=reason,
         )
@@ -4997,6 +5081,7 @@ async def main():
     load_repeat_levels()
     load_link_ref_levels()
     await load_media_stats()
+    await _notify_join_approval_startup_status()
     asyncio.create_task(cleanup_deleted_messages())
     asyncio.create_task(cleanup_orphan_replies())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
