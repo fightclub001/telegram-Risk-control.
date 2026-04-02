@@ -265,46 +265,64 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
             final_decision = "decline"
             reason = "bio_risk_term"
 
-    if final_decision == "approve" and join_approval_avatar_ocr.ocr_enabled:
-        try:
-            photos = await bot.get_user_profile_photos(
-                user_id=user_id,
-                limit=1,
-                **_join_approval_timeout_kwargs(),
-            )
-            if photos.total_count > 0 and photos.photos and photos.photos[0]:
-                largest = photos.photos[0][-1]
-                cached_result = _get_join_approval_avatar_cache(largest.file_unique_id)
-                avatar_result = cached_result
-                if avatar_result is None:
-                    try:
-                        tg_file = await bot.get_file(
-                            largest.file_id,
-                            **_join_approval_timeout_kwargs(),
+    if final_decision == "approve":
+        if not join_approval_avatar_ocr.ocr_enabled:
+            reason = "avatar_ocr_disabled"
+        else:
+            try:
+                photos = await bot.get_user_profile_photos(
+                    user_id=user_id,
+                    limit=1,
+                    **_join_approval_timeout_kwargs(),
+                )
+                if photos.total_count <= 0 or not photos.photos or not photos.photos[0]:
+                    reason = "no_avatar"
+                else:
+                    largest = photos.photos[0][-1]
+                    cached_result = _get_join_approval_avatar_cache(largest.file_unique_id)
+                    avatar_result = cached_result
+                    if avatar_result is None:
+                        try:
+                            tg_file = await bot.get_file(
+                                largest.file_id,
+                                **_join_approval_timeout_kwargs(),
+                            )
+                            if not tg_file.file_path:
+                                raise ValueError("empty file_path")
+                            downloaded = await bot.download_file(
+                                tg_file.file_path,
+                                timeout=JOIN_APPROVAL_REQUEST_TIMEOUT,
+                            )
+                            if downloaded is None:
+                                raise ValueError("avatar download returned None")
+                            if isinstance(downloaded, io.BytesIO):
+                                image_bytes = downloaded.getvalue()
+                            else:
+                                image_bytes = downloaded.read()
+                            avatar_result = join_approval_avatar_ocr.analyze_avatar(image_bytes)
+                            _set_join_approval_avatar_cache(largest.file_unique_id, avatar_result)
+                        except Exception as e:
+                            reason = "avatar_fetch_or_ocr_failed"
+                            print(f"join avatar fetch/ocr failed user_id={user_id}: {e}")
+                            avatar_result = None
+                    if avatar_result:
+                        print(
+                            "join_avatar_ocr "
+                            f"user_id={user_id} chat_id={chat_id} "
+                            f"text={avatar_result.extracted_text!r} "
+                            f"normalized={avatar_result.normalized_text!r} "
+                            f"is_text_avatar={avatar_result.is_text_avatar} "
+                            f"matched={avatar_result.matched_term or '-'}"
                         )
-                        if not tg_file.file_path:
-                            raise ValueError("empty file_path")
-                        downloaded = await bot.download_file(
-                            tg_file.file_path,
-                            timeout=JOIN_APPROVAL_REQUEST_TIMEOUT,
-                        )
-                        if downloaded is None:
-                            raise ValueError("avatar download returned None")
-                        if isinstance(downloaded, io.BytesIO):
-                            image_bytes = downloaded.getvalue()
-                        else:
-                            image_bytes = downloaded.read()
-                        avatar_result = join_approval_avatar_ocr.analyze_avatar(image_bytes)
-                        _set_join_approval_avatar_cache(largest.file_unique_id, avatar_result)
-                    except Exception as e:
-                        print(f"join avatar fetch/ocr failed user_id={user_id}: {e}")
-                        avatar_result = None
-                if avatar_result and avatar_result.is_text_avatar and avatar_result.matched_term:
-                    avatar_match = avatar_result.matched_term
-                    final_decision = "decline"
-                    reason = "avatar_text_risk_term"
-        except Exception as e:
-            print(f"join profile photo check failed user_id={user_id}: {e}")
+                    if avatar_result and avatar_result.is_text_avatar and avatar_result.matched_term:
+                        avatar_match = avatar_result.matched_term
+                        final_decision = "decline"
+                        reason = "avatar_text_risk_term"
+                    elif avatar_result:
+                        reason = "avatar_ocr_no_match"
+            except Exception as e:
+                reason = "avatar_profile_check_failed"
+                print(f"join profile photo check failed user_id={user_id}: {e}")
 
     try:
         if final_decision == "decline":
