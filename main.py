@@ -5054,9 +5054,9 @@ async def cleanup_deleted_messages():
 
 
 async def cleanup_orphan_replies():
-    """每 30 分钟清理一次孤儿引用回复；对无法确认的旧回复也做兜底回收。"""
+    """每 5 分钟清理一次孤儿引用回复；对无法确认的旧回复也做兜底回收。"""
     while True:
-        await asyncio.sleep(1800)
+        await asyncio.sleep(300)
         now = time.time()
         items = list(bot_reply_links.items())
         if not items:
