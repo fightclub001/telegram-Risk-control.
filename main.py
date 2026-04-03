@@ -126,6 +126,7 @@ BOT_MSG_AUTO_DELETE_SEC = 24 * 3600  # 机器人消息24小时后自动删除
 bot_sent_messages = {}
 # 机器人在群里的“引用回复”跟踪：(group_id, bot_reply_msg_id) -> (original_msg_id, created_ts)
 bot_reply_links = {}
+BOT_REPLY_ORPHAN_MAX_AGE_SEC = 30 * 60
 # 同用户连续触发警告防刷屏：(group_id, user_id) -> (last_warning_time, last_warning_msg_id)
 user_last_warning = {}
 USER_WARNING_COOLDOWN_SEC = 60  # 同用户60秒内只发一条警告
@@ -3713,6 +3714,17 @@ async def _delete_linked_bot_replies(group_id: int, original_msg_id: int | None)
             bot_reply_links.pop((group_id, bot_msg_id), None)
 
 
+async def _drop_report_by_warning_id(group_id: int, warning_id: int) -> None:
+    removed = False
+    async with lock:
+        for rk, data in list(reports.items()):
+            if rk[0] == group_id and int(data.get("warning_id", 0) or 0) == int(warning_id):
+                reports.pop(rk, None)
+                removed = True
+    if removed:
+        await save_data()
+
+
 async def _delete_original_and_linked_reply(group_id: int, original_msg_id: int | None):
     """删除原消息，并同步删除机器人对该消息的引用回复。"""
     if not original_msg_id:
@@ -5042,14 +5054,15 @@ async def cleanup_deleted_messages():
 
 
 async def cleanup_orphan_replies():
-    """每 30 分钟清理一次已失去原消息缓存关联的机器人引用回复。"""
+    """每 30 分钟清理一次孤儿引用回复；对无法确认的旧回复也做兜底回收。"""
     while True:
         await asyncio.sleep(1800)
+        now = time.time()
         items = list(bot_reply_links.items())
         if not items:
             continue
         for (group_id, bot_msg_id), (orig_msg_id, created_ts) in items:
-            if _is_original_message_still_tracked(group_id, orig_msg_id):
+            if _is_original_message_still_tracked(group_id, orig_msg_id) and (now - float(created_ts)) < BOT_REPLY_ORPHAN_MAX_AGE_SEC:
                 continue
             try:
                 await bot.delete_message(group_id, bot_msg_id)
@@ -5059,6 +5072,7 @@ async def cleanup_orphan_replies():
                 pass
             finally:
                 bot_reply_links.pop((group_id, bot_msg_id), None)
+                await _drop_report_by_warning_id(group_id, bot_msg_id)
 
 async def main():
     print("🚀 机器人启动")
