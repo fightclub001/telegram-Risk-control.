@@ -78,20 +78,20 @@ media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
 pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message": Message, "user_id": int, "last_update_ts": float, "repeat_signatures": set[str]}
 MEDIA_GROUP_SETTLE_SEC = 2.5
-MEDIA_GROUP_STALE_SEC = 10 * 60
-MEDIA_REPORT_ENTRY_TTL_SEC = 6 * 3600
+MEDIA_GROUP_STALE_SEC = 5 * 60
+MEDIA_REPORT_ENTRY_TTL_SEC = 2 * 3600
 MEDIA_REPORT_DELETED_TTL_SEC = 15 * 60
-MEDIA_REPORT_LAST_TTL_SEC = 24 * 3600
+MEDIA_REPORT_LAST_TTL_SEC = 6 * 3600
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
 join_approval_avatar_ocr = JoinApprovalAvatarOCR()
-JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "21600").strip()))
-JOIN_APPROVAL_OCR_CACHE_MAX = max(32, int((os.getenv("OCR_CACHE_MAX") or "96").strip()))
+JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "10800").strip()))
+JOIN_APPROVAL_OCR_CACHE_MAX = max(24, int((os.getenv("OCR_CACHE_MAX") or "64").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
 JOIN_APPROVAL_REQUEST_TIMEOUT = 10
 join_approval_avatar_cache = {}  # file_unique_id -> {ocr_text, normalized_text, is_text_avatar, chinese_char_count, total_char_count, matched_term, timestamp}
-join_review_logs = deque(maxlen=500)
-moderation_logs = deque(maxlen=500)
+join_review_logs = deque(maxlen=200)
+moderation_logs = deque(maxlen=200)
 join_review_logs_dirty = False
 moderation_logs_dirty = False
 # 无权限发媒体警告：同用户删上一条；(group_id, user_id) -> 上一条机器人警告 message_id
@@ -117,7 +117,7 @@ RECENT_MESSAGES_PRUNE_SEC = 10 * 60
 bot_sent_messages = {}
 # 机器人在群里的“引用回复”跟踪：(group_id, bot_reply_msg_id) -> (original_msg_id, created_ts)
 bot_reply_links = {}
-BOT_REPLY_ORPHAN_MAX_AGE_SEC = 30 * 60
+BOT_REPLY_ORPHAN_MAX_AGE_SEC = 15 * 60
 # 同用户连续触发警告防刷屏：(group_id, user_id) -> (last_warning_time, last_warning_msg_id)
 user_last_warning = {}
 USER_WARNING_COOLDOWN_SEC = 60  # 同用户60秒内只发一条警告
@@ -259,18 +259,18 @@ async def load_join_review_logs() -> None:
     global join_review_logs, join_review_logs_dirty
     try:
         if not os.path.exists(JOIN_REVIEW_LOG_FILE):
-            join_review_logs = deque(maxlen=500)
+            join_review_logs = deque(maxlen=200)
             join_review_logs_dirty = False
             return
         with open(JOIN_REVIEW_LOG_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if not isinstance(raw, list):
             raw = []
-        join_review_logs = deque(raw[-500:], maxlen=500)
+        join_review_logs = deque(raw[-200:], maxlen=200)
         join_review_logs_dirty = False
     except Exception as e:
         print(f"join review logs load failed: {e}")
-        join_review_logs = deque(maxlen=500)
+        join_review_logs = deque(maxlen=200)
         join_review_logs_dirty = False
 
 
@@ -290,18 +290,18 @@ async def load_moderation_logs() -> None:
     global moderation_logs, moderation_logs_dirty
     try:
         if not os.path.exists(MOD_ACTION_LOG_FILE):
-            moderation_logs = deque(maxlen=500)
+            moderation_logs = deque(maxlen=200)
             moderation_logs_dirty = False
             return
         with open(MOD_ACTION_LOG_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if not isinstance(raw, list):
             raw = []
-        moderation_logs = deque(raw[-500:], maxlen=500)
+        moderation_logs = deque(raw[-200:], maxlen=200)
         moderation_logs_dirty = False
     except Exception as e:
         print(f"moderation logs load failed: {e}")
-        moderation_logs = deque(maxlen=500)
+        moderation_logs = deque(maxlen=200)
         moderation_logs_dirty = False
 
 
@@ -552,6 +552,7 @@ async def load_forward_match_memory():
             with open(FORWARD_MATCH_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             forward_match_memory = raw if isinstance(raw, dict) else {}
+            await save_forward_match_memory()
         else:
             forward_match_memory = {}
     except Exception as e:
@@ -568,6 +569,15 @@ async def save_forward_match_memory():
         ]
         for key in stale_keys:
             forward_match_memory.pop(key, None)
+        max_items = 3000
+        if len(forward_match_memory) > max_items:
+            trim_count = len(forward_match_memory) - max_items
+            oldest_keys = sorted(
+                forward_match_memory,
+                key=lambda key: int((forward_match_memory.get(key) or {}).get("updated_at", 0)),
+            )[:trim_count]
+            for key in oldest_keys:
+                forward_match_memory.pop(key, None)
         with open(FORWARD_MATCH_FILE, "w", encoding="utf-8") as f:
             json.dump(forward_match_memory, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -1030,20 +1040,6 @@ def get_primary_group_id() -> int:
         raise ValueError("GROUP_IDS is empty")
     return sorted(GROUP_IDS)[0]
 
-def get_global_config():
-    return get_group_config(get_primary_group_id())
-
-def apply_global_config_value(key: str, value):
-    for gid in GROUP_IDS:
-        cfg = get_group_config(gid)
-        cfg[key] = deepcopy(value)
-
-def apply_global_config_updates(updates: dict):
-    for gid in GROUP_IDS:
-        cfg = get_group_config(gid)
-        for key, value in updates.items():
-            cfg[key] = deepcopy(value)
-
 
 def fmt_duration(seconds: int) -> str:
     """将秒数格式化为人类可读时长"""
@@ -1072,37 +1068,15 @@ async def get_chat_title_safe(bot, chat_id: int) -> str:
 # ==================== FSM 状态 ====================
 class AdminStates(StatesGroup):
     MainMenu = State()
-    ChooseGroup = State()
     GroupMenu = State()
-    EditBioKeywords = State()
-    EditDisplayKeywords = State()
-    EditMessageKeywords = State()
-    EditAutoreplyKeywords = State()
-    EditAutoreplyText = State()
-    EditAutoreplyButtons = State()
-    EditAutoreplyDeleteTime = State()
-    EditShortMsgThreshold = State()
-    EditConsecutiveCount = State()
-    EditTimeWindow = State()
-    EditFillGarbageMinRaw = State()
-    EditFillGarbageMaxClean = State()
-    EditFillSpaceRatio = State()
-    EditMuteHours = State()
-    EditReportedThreshold = State()
-    EditReportHistoryWhitelist = State()
     EditRepeatWindow = State()
     EditRepeatMaxCount = State()
     EditRepeatBanSec = State()
     EditRepeatExemptKeywords = State()
     EditMediaUnlockMsg = State()
-    EditMediaUnlockBoosts = State()
     EditMediaReportCooldown = State()
     EditMediaReportMaxDay = State()
-    EditMediaWhitelistAdd = State()
-    EditMediaWhitelistRemove = State()
-    EditExemptUsers = State()
     EditMediaDeleteThreshold = State()
-    EditMediaBroadcastInterval = State()
     EditSemanticAdAdd = State()
     EditSemanticAdRemove = State()
 
@@ -1115,19 +1089,6 @@ def get_main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def get_group_list_keyboard(bot):
-    """异步生成群组列表键盘，显示群名 + ID"""
-    buttons = []
-    for gid in sorted(GROUP_IDS):
-        title = await get_chat_title_safe(bot, gid)
-        label = f"👥 {title}" if title != str(gid) else f"👥 {gid}"
-        # 标题过长时截断，保留 ID 信息
-        if len(label) > 35:
-            label = label[:32] + "..."
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"select_group:{gid}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ 返回", callback_data="back_main")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 def get_group_menu_keyboard(group_id: int):
     buttons = [
         [InlineKeyboardButton(text="🧠 AD机器学习", callback_data=f"submenu_semantic_ad:{group_id}")],
@@ -1137,61 +1098,6 @@ def get_group_menu_keyboard(group_id: int):
         [InlineKeyboardButton(text="🚪 入群审批记录", callback_data=f"view_join_logs:{group_id}:0")],
         [InlineKeyboardButton(text="📝 处理记录", callback_data=f"view_mod_logs:{group_id}:0")],
         [InlineKeyboardButton(text="🎛️ 基础设置", callback_data=f"submenu_basic:{group_id}")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_bio_menu_keyboard(group_id: int):
-    cfg = get_group_config(group_id)
-    link_status = "✅" if cfg.get("check_bio_link") else "❌"
-    kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-    buttons = [
-        [InlineKeyboardButton(text=f"链接 {link_status}", callback_data=f"toggle_bio_link:{group_id}")],
-        [InlineKeyboardButton(text=f"敏感词 {kw_status}", callback_data=f"toggle_bio_keywords:{group_id}")],
-        [InlineKeyboardButton(text="📋 编辑词汇", callback_data=f"edit_bio_kw:{group_id}")],
-        [InlineKeyboardButton(text="👀 查看", callback_data=f"view_bio_kw:{group_id}")],
-        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_display_menu_keyboard(group_id: int):
-    cfg = get_group_config(group_id)
-    status = "✅" if cfg.get("check_display_keywords") else "❌"
-    buttons = [
-        [InlineKeyboardButton(text=f"启用 {status}", callback_data=f"toggle_display:{group_id}")],
-        [InlineKeyboardButton(text="📋 编辑词汇", callback_data=f"edit_display_kw:{group_id}")],
-        [InlineKeyboardButton(text="👀 查看", callback_data=f"view_display_kw:{group_id}")],
-        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_message_menu_keyboard(group_id: int):
-    cfg = get_group_config(group_id)
-    status = "✅" if cfg.get("check_message_keywords") else "❌"
-    msg_link_status = "✅" if cfg.get("check_message_link", True) else "❌"
-    norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
-    buttons = [
-        [InlineKeyboardButton(text=f"敏感词 {status}", callback_data=f"toggle_message:{group_id}")],
-        [InlineKeyboardButton(text=f"链接/@引流 {msg_link_status}", callback_data=f"toggle_message_link:{group_id}")],
-        [InlineKeyboardButton(text=f"防拼字规避 {norm_status}", callback_data=f"toggle_message_normalize:{group_id}")],
-        [InlineKeyboardButton(text="📋 编辑词汇", callback_data=f"edit_message_kw:{group_id}")],
-        [InlineKeyboardButton(text="👀 查看", callback_data=f"view_message_kw:{group_id}")],
-        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_short_menu_keyboard(group_id: int):
-    cfg = get_group_config(group_id)
-    short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
-    fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-    window_sec = cfg.get("time_window_seconds", 60)
-    buttons = [
-        [InlineKeyboardButton(text=f"短消息 {short_enabled}", callback_data=f"toggle_short:{group_id}")],
-        [InlineKeyboardButton(text=f"字数: {cfg.get('short_msg_threshold')}", callback_data=f"edit_threshold:{group_id}")],
-        [InlineKeyboardButton(text=f"连续: {cfg.get('min_consecutive_count')}", callback_data=f"edit_consecutive:{group_id}")],
-        [InlineKeyboardButton(text=f"窗口: {fmt_duration(window_sec)}", callback_data=f"edit_window:{group_id}")],
-        [InlineKeyboardButton(text=f"垃圾 {fill_enabled}", callback_data=f"toggle_fill:{group_id}")],
-        [InlineKeyboardButton(text=f"最小: {cfg.get('fill_garbage_min_raw_len')}", callback_data=f"edit_fill_min:{group_id}")],
-        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1207,12 +1113,6 @@ def get_semantic_ad_menu_keyboard(group_id: int):
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_violation_menu_keyboard(group_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="该功能已下线", callback_data="noop")],
-        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
-    ])
 
 def get_basic_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
@@ -1348,13 +1248,6 @@ async def select_group(callback: CallbackQuery, state: FSMContext):
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
 @router.callback_query(F.data == "back_main", F.from_user.id.in_(ADMIN_IDS))
-async def back_main(callback: CallbackQuery, state: FSMContext):
-    text = "👮 管理员面板"
-    kb = get_main_menu_keyboard()
-    await callback.message.edit_text(text, reply_markup=kb)
-    await state.set_state(AdminStates.MainMenu)
-    await callback.answer()
-
 @router.callback_query(F.data == "back_choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def back_choose_group(callback: CallbackQuery, state: FSMContext):
     """单群模式下，返回即回到本群控制台。"""
@@ -1381,53 +1274,6 @@ async def group_menu(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("submenu_multi_rules:"), F.from_user.id.in_(ADMIN_IDS))
-async def multi_rules_submenu(callback: CallbackQuery):
-    """多功能叠加规则：展示当前各模块的触发顺序与优先级。"""
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        text = (
-            f"<b>{title}</b> › 多功能叠加规则\n\n"
-            "当前触发顺序（从上到下，前者优先）：\n"
-            "1️⃣ AD 语义广告检测：命中后直接删除该条消息，不再执行后续检测。\n"
-            "2️⃣ 举报阈值禁言：被非管理员举报消息数 ≥ 阈值 "
-            f"（当前: {cfg.get('reported_message_threshold', 3)}）时按次数封禁并删除消息。\n"
-            "3️⃣ 多层风控检测：简介/昵称/链接等命中形成多层触发，3 层及以上直接封禁并清理 24 小时内消息。\n"
-            "4️⃣ 轻度触发累计：1～2 层触发计入轻度警告，达到 3 次时仅通知管理员，可在 AD 面板中豁免轻度。\n"
-            "5️⃣ 重复发言检测：在配置窗口内多次重复同一内容，按违规等级禁言并清理近期消息。\n\n"
-            "当前策略为：\n"
-            "- AD 命中后，不再进入举报、多层、重复检测（避免多次处罚）。\n"
-            "- 当多层风控和重复发言同时满足时，以多层风控结果为准（更重的处罚覆盖较轻处罚）。\n\n"
-            "后续如果需要，可以在这里增加可调策略，例如切换优先级或是否让 AD 命中也计入其它统计。"
-        )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")]
-            ]
-        )
-        await callback.message.edit_text(text, reply_markup=kb)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-# ==================== 简介检测 ====================
-@router.callback_query(F.data.startswith("submenu_bio:"), F.from_user.id.in_(ADMIN_IDS))
-async def bio_submenu(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        text = "该功能已下线。\n当前不再检测简介链接或简介敏感词。"
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")]]
-        )
-        await callback.message.edit_text(text, reply_markup=kb)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
 
 @router.callback_query(F.data.startswith("submenu_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
 async def semantic_ad_submenu(callback: CallbackQuery):
@@ -1699,525 +1545,6 @@ async def process_semantic_ad_remove(message: Message, state: FSMContext):
     except Exception as e:
         await message.reply(f"❌ 删除失败: {e}")
 
-@router.callback_query(F.data.startswith("toggle_bio_link:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_bio_link(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["check_bio_link"] = not cfg.get("check_bio_link", True)
-        await save_config()
-        status = "✅" if cfg["check_bio_link"] else "❌"
-        await callback.answer(f"链接: {status}", show_alert=True)
-        kb = get_bio_menu_keyboard(group_id)
-        link_status = "✅" if cfg.get("check_bio_link") else "❌"
-        kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 多层风控检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}"
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("toggle_bio_keywords:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_bio_keywords(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["check_bio_keywords"] = not cfg.get("check_bio_keywords", True)
-        await save_config()
-        status = "✅" if cfg["check_bio_keywords"] else "❌"
-        await callback.answer(f"敏感词: {status}", show_alert=True)
-        kb = get_bio_menu_keyboard(group_id)
-        link_status = "✅" if cfg.get("check_bio_link") else "❌"
-        kw_status = "✅" if cfg.get("check_bio_keywords") else "❌"
-        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 多层风控检测\n\n简介链接: {link_status}\n简介敏感词: {kw_status}"
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("edit_bio_kw:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_bio_keywords(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        keywords = cfg.get("bio_keywords", [])
-        kw_text = "\n".join(keywords)
-        text = f"<b>{title}</b> › 编辑简介敏感词\n\n当前列表：\n" + (kw_text if kw_text else "（空）") + "\n\n发送新词（一行一个）会追加到列表，/clear 清空全部"
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditBioKeywords)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditBioKeywords), F.from_user.id.in_(ADMIN_IDS))
-async def process_bio_keywords(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        
-        if message.text.strip() == "/clear":
-            cfg["bio_keywords"] = []
-            await save_config()
-            kb = get_bio_menu_keyboard(group_id)
-            await message.reply("✅ 已清空简介敏感词列表", reply_markup=kb)
-        else:
-            existing = cfg.get("bio_keywords", []) or []
-            if not isinstance(existing, list):
-                existing = []
-            new_words = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
-            added = [w for w in new_words if w not in existing]
-            existing.extend(added)
-            cfg["bio_keywords"] = existing
-            await save_config()
-            kb = get_bio_menu_keyboard(group_id)
-            await message.reply(f"✅ 已追加 {len(added)} 个词，当前共 {len(existing)} 个", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-@router.callback_query(F.data.startswith("view_bio_kw:"), F.from_user.id.in_(ADMIN_IDS))
-async def view_bio_keywords(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        keywords = cfg.get("bio_keywords", [])
-        kw_text = "\n".join(keywords) if keywords else "（无）"
-        text = f"简介敏感词（{len(keywords)}个）\n\n{kw_text}"
-        await callback.answer(text, show_alert=True)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-# ==================== 显示名称检测 ====================
-@router.callback_query(F.data.startswith("submenu_display:"), F.from_user.id.in_(ADMIN_IDS))
-async def display_submenu(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        status = "✅" if cfg.get("check_display_keywords") else "❌"
-        text = f"<b>{title}</b> › 名称检测: {status}"
-        kb = get_display_menu_keyboard(group_id)
-        await callback.message.edit_text(text, reply_markup=kb)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("toggle_display:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_display(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["check_display_keywords"] = not cfg.get("check_display_keywords", True)
-        await save_config()
-        status = "✅" if cfg["check_display_keywords"] else "❌"
-        await callback.answer(f"名称检测: {status}", show_alert=True)
-        kb = get_display_menu_keyboard(group_id)
-        status_display = "✅" if cfg.get("check_display_keywords") else "❌"
-        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 名称检测: {status_display}"
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("edit_display_kw:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_display_keywords(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        keywords = cfg.get("display_keywords", [])
-        kw_text = "\n".join(keywords)
-        text = f"<b>{title}</b> › 编辑名称敏感词\n\n当前列表：\n" + (kw_text if kw_text else "（空）") + "\n\n发送新词（一行一个）会追加到列表，/clear 清空全部"
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditDisplayKeywords)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditDisplayKeywords), F.from_user.id.in_(ADMIN_IDS))
-async def process_display_keywords(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        
-        if message.text.strip() == "/clear":
-            cfg["display_keywords"] = []
-            await save_config()
-            kb = get_display_menu_keyboard(group_id)
-            await message.reply("✅ 已清空名称敏感词列表", reply_markup=kb)
-        else:
-            existing = cfg.get("display_keywords", []) or []
-            if not isinstance(existing, list):
-                existing = []
-            new_words = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
-            added = [w for w in new_words if w not in existing]
-            existing.extend(added)
-            cfg["display_keywords"] = existing
-            await save_config()
-            kb = get_display_menu_keyboard(group_id)
-            await message.reply(f"✅ 已追加 {len(added)} 个词，当前共 {len(existing)} 个", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-@router.callback_query(F.data.startswith("view_display_kw:"), F.from_user.id.in_(ADMIN_IDS))
-async def view_display_keywords(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        keywords = cfg.get("display_keywords", [])
-        kw_text = "\n".join(keywords) if keywords else "（无）"
-        text = f"名称敏感词（{len(keywords)}个）\n\n{kw_text}"
-        await callback.answer(text, show_alert=True)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-# ==================== 消息检测 ====================
-@router.callback_query(F.data.startswith("submenu_message:"), F.from_user.id.in_(ADMIN_IDS))
-async def message_submenu(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        status = "✅" if cfg.get("check_message_keywords") else "❌"
-        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
-        norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
-        text = f"<b>{title}</b> › 消息检测\n\n敏感词: {status}\n链接/@引流: {msg_link}\n防拼字规避: {norm_status}"
-        kb = get_message_menu_keyboard(group_id)
-        await callback.message.edit_text(text, reply_markup=kb)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("toggle_message:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_message(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["check_message_keywords"] = not cfg.get("check_message_keywords", True)
-        await save_config()
-        status = "✅" if cfg["check_message_keywords"] else "❌"
-        await callback.answer(f"消息检测: {status}", show_alert=True)
-        kb = get_message_menu_keyboard(group_id)
-        status_display = "✅" if cfg.get("check_message_keywords") else "❌"
-        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
-        norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
-        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 消息检测\n\n敏感词: {status_display}\n链接/@引流: {msg_link}\n防拼字规避: {norm_status}"
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("toggle_message_link:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_message_link(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["check_message_link"] = not cfg.get("check_message_link", True)
-        await save_config()
-        status = "✅" if cfg["check_message_link"] else "❌"
-        await callback.answer(f"链接/@引流: {status}", show_alert=True)
-        kb = get_message_menu_keyboard(group_id)
-        title = await get_chat_title_safe(callback.bot, group_id)
-        status_display = "✅" if cfg.get("check_message_keywords") else "❌"
-        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
-        norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
-        text = f"<b>{title}</b> › 消息检测\n\n敏感词: {status_display}\n链接/@引流: {msg_link}\n防拼字规避: {norm_status}"
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("toggle_message_normalize:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_message_normalize(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["message_keyword_normalize"] = not cfg.get("message_keyword_normalize", True)
-        await save_config()
-        status = "✅" if cfg["message_keyword_normalize"] else "❌"
-        await callback.answer(f"防拼字规避: {status}", show_alert=True)
-        kb = get_message_menu_keyboard(group_id)
-        title = await get_chat_title_safe(callback.bot, group_id)
-        status_display = "✅" if cfg.get("check_message_keywords") else "❌"
-        msg_link = "✅" if cfg.get("check_message_link", True) else "❌"
-        norm_status = "✅" if cfg.get("message_keyword_normalize", True) else "❌"
-        text = f"<b>{title}</b> › 消息检测\n\n敏感词: {status_display}\n链接/@引流: {msg_link}\n防拼字规避: {norm_status}"
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("edit_message_kw:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_message_keywords(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        keywords = cfg.get("message_keywords", [])
-        kw_text = "\n".join(keywords)
-        text = f"<b>{title}</b> › 编辑消息敏感词\n\n当前列表：\n" + (kw_text if kw_text else "（空）") + "\n\n发送新词（一行一个）会追加到列表，/clear 清空全部"
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditMessageKeywords)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditMessageKeywords), F.from_user.id.in_(ADMIN_IDS))
-async def process_message_keywords(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        
-        if message.text.strip() == "/clear":
-            cfg["message_keywords"] = []
-            await save_config()
-            kb = get_message_menu_keyboard(group_id)
-            await message.reply("✅ 已清空消息敏感词列表", reply_markup=kb)
-        else:
-            existing = cfg.get("message_keywords", []) or []
-            if not isinstance(existing, list):
-                existing = []
-            new_words = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
-            added = [w for w in new_words if w not in existing]
-            existing.extend(added)
-            cfg["message_keywords"] = existing
-            await save_config()
-            kb = get_message_menu_keyboard(group_id)
-            await message.reply(f"✅ 已追加 {len(added)} 个词，当前共 {len(existing)} 个", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-@router.callback_query(F.data.startswith("view_message_kw:"), F.from_user.id.in_(ADMIN_IDS))
-async def view_message_keywords(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        keywords = cfg.get("message_keywords", [])
-        kw_text = "\n".join(keywords) if keywords else "（无）"
-        text = f"消息敏感词（{len(keywords)}个）\n\n{kw_text}"
-        await callback.answer(text, show_alert=True)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-# ==================== 短消息和垃圾检测 ====================
-@router.callback_query(F.data.startswith("submenu_short:"), F.from_user.id.in_(ADMIN_IDS))
-async def short_submenu(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
-        fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-        th = cfg.get("short_msg_threshold", 3)
-        n = cfg.get("min_consecutive_count", 2)
-        w = cfg.get("time_window_seconds", 60)
-        rule = f"连续{n}条字数≤{th}在{w}秒内即触发（防「点」「我」「头」「像」式连发）"
-        text = f"<b>{title}</b> › 短消息/垃圾\n\n短消息: {short_enabled}\n规则: {rule}\n\n垃圾: {fill_enabled}"
-        kb = get_short_menu_keyboard(group_id)
-        await callback.message.edit_text(text, reply_markup=kb)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("toggle_short:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_short_msg(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["short_msg_detection"] = not cfg.get("short_msg_detection", True)
-        await save_config()
-        status = "✅" if cfg["short_msg_detection"] else "❌"
-        await callback.answer(f"短消息: {status}", show_alert=True)
-        kb = get_short_menu_keyboard(group_id)
-        short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
-        fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 短消息/垃圾\n\n短消息: {short_enabled}\n垃圾: {fill_enabled}"
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("edit_threshold:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_threshold(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        current = cfg.get("short_msg_threshold", 3)
-        text = f"字数阈值（当前: {current}）："
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditShortMsgThreshold)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditShortMsgThreshold), F.from_user.id.in_(ADMIN_IDS))
-async def process_threshold(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        value = int(message.text.strip())
-        cfg["short_msg_threshold"] = value
-        await save_config()
-        kb = get_short_menu_keyboard(group_id)
-        await message.reply(f"✅ 已设为 {value}", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except ValueError:
-        await message.reply("❌ 请输入数字")
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-@router.callback_query(F.data.startswith("edit_consecutive:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_consecutive(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        current = cfg.get("min_consecutive_count", 2)
-        text = f"连续条数（当前: {current}）："
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditConsecutiveCount)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditConsecutiveCount), F.from_user.id.in_(ADMIN_IDS))
-async def process_consecutive(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        value = int(message.text.strip())
-        cfg["min_consecutive_count"] = value
-        await save_config()
-        kb = get_short_menu_keyboard(group_id)
-        await message.reply(f"✅ 已设为 {value}", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except ValueError:
-        await message.reply("❌ 请输入数字")
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-@router.callback_query(F.data.startswith("edit_window:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_window(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        current = cfg.get("time_window_seconds", 60)
-        text = f"时间窗口秒数（当前: {current}）："
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditTimeWindow)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditTimeWindow), F.from_user.id.in_(ADMIN_IDS))
-async def process_window(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        value = int(message.text.strip())
-        cfg["time_window_seconds"] = value
-        await save_config()
-        kb = get_short_menu_keyboard(group_id)
-        await message.reply(f"✅ 已设为 {value}s", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except ValueError:
-        await message.reply("❌ 请输入数字")
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-@router.callback_query(F.data.startswith("toggle_fill:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_fill(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["fill_garbage_detection"] = not cfg.get("fill_garbage_detection", True)
-        await save_config()
-        status = "✅" if cfg["fill_garbage_detection"] else "❌"
-        await callback.answer(f"垃圾检测: {status}", show_alert=True)
-        kb = get_short_menu_keyboard(group_id)
-        short_enabled = "✅" if cfg.get("short_msg_detection") else "❌"
-        fill_enabled = "✅" if cfg.get("fill_garbage_detection") else "❌"
-        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 短消息/垃圾\n\n短消息: {short_enabled}\n垃圾: {fill_enabled}"
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("edit_fill_min:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_fill_min(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        current = cfg.get("fill_garbage_min_raw_len", 12)
-        text = f"最小原始长度（当前: {current}）："
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditFillGarbageMinRaw)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditFillGarbageMinRaw), F.from_user.id.in_(ADMIN_IDS))
-async def process_fill_min(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        value = int(message.text.strip())
-        cfg["fill_garbage_min_raw_len"] = value
-        await save_config()
-        kb = get_short_menu_keyboard(group_id)
-        await message.reply(f"✅ 已设为 {value}", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except ValueError:
-        await message.reply("❌ 请输入数字")
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-# ==================== 违规处理 ====================
-@router.callback_query(F.data.startswith("submenu_violation:"), F.from_user.id.in_(ADMIN_IDS))
-async def violation_submenu(callback: CallbackQuery):
-    await callback.answer("历史举报处罚已下线。", show_alert=True)
-
-@router.callback_query(F.data.startswith("edit_mute:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_mute_hours(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("历史举报处罚已下线。", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditMuteHours), F.from_user.id.in_(ADMIN_IDS))
-async def process_mute_hours(message: Message, state: FSMContext):
-    await state.set_state(AdminStates.GroupMenu)
-    await message.reply("历史举报处罚已下线。")
-
-@router.callback_query(F.data.startswith("edit_report_threshold:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_report_threshold(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("历史举报处罚已下线。", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditReportedThreshold), F.from_user.id.in_(ADMIN_IDS))
-async def process_report_threshold(message: Message, state: FSMContext):
-    await state.set_state(AdminStates.GroupMenu)
-    await message.reply("历史举报处罚已下线。")
-
-@router.callback_query(F.data.startswith("edit_report_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_report_whitelist(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("历史举报处罚已下线。", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditReportHistoryWhitelist), F.from_user.id.in_(ADMIN_IDS))
-async def process_report_history_whitelist(message: Message, state: FSMContext):
-    await state.set_state(AdminStates.GroupMenu)
-    await message.reply("历史举报处罚已下线。")
-
 # ==================== 重复发言 ====================
 @router.callback_query(F.data.startswith("submenu_repeat:"), F.from_user.id.in_(ADMIN_IDS))
 async def repeat_submenu(callback: CallbackQuery):
@@ -2397,45 +1724,6 @@ async def process_media_msg(message: Message, state: FSMContext):
     except (ValueError, Exception) as e:
         await message.reply(f"❌ 请输入数字: {e}")
 
-@router.callback_query(F.data.startswith("edit_media_boosts:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_media_boosts(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("助力解锁已下线，媒体权限仅按合规文本条数解锁。", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditMediaUnlockBoosts), F.from_user.id.in_(ADMIN_IDS))
-async def process_media_boosts(message: Message, state: FSMContext):
-    await state.set_state(AdminStates.GroupMenu)
-    await message.reply("助力解锁已下线，媒体权限仅按合规文本条数解锁。")
-
-@router.callback_query(F.data.startswith("toggle_media_broadcast:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_media_broadcast(callback: CallbackQuery):
-    await callback.answer("媒体规则广播已下线。", show_alert=True)
-
-@router.callback_query(F.data.startswith("edit_media_broadcast_interval:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_media_broadcast_interval(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("媒体规则广播已下线。", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditMediaBroadcastInterval), F.from_user.id.in_(ADMIN_IDS))
-async def process_media_broadcast_interval(message: Message, state: FSMContext):
-    await state.set_state(AdminStates.GroupMenu)
-    await message.reply("媒体规则广播已下线。")
-
-@router.callback_query(F.data.startswith("submenu_media_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
-async def media_whitelist_submenu(callback: CallbackQuery):
-    await callback.answer("媒体解锁白名单已下线。", show_alert=True)
-
-@router.callback_query(F.data.startswith("add_media_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
-async def add_media_whitelist(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("媒体解锁白名单已下线。", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditMediaWhitelistAdd), F.from_user.id.in_(ADMIN_IDS))
-async def process_media_whitelist_add(message: Message, state: FSMContext):
-    await state.set_state(AdminStates.GroupMenu)
-    await message.reply("媒体解锁白名单已下线。")
-
-@router.callback_query(F.data.startswith("remove_mw:"), F.from_user.id.in_(ADMIN_IDS))
-async def remove_media_whitelist(callback: CallbackQuery):
-    await callback.answer("媒体解锁白名单已下线。", show_alert=True)
-
 # ==================== 媒体举报 ====================
 @router.callback_query(F.data.startswith("submenu_media_report:"), F.from_user.id.in_(ADMIN_IDS))
 async def media_report_submenu(callback: CallbackQuery):
@@ -2531,185 +1819,6 @@ async def process_media_delete_threshold(message: Message, state: FSMContext):
     except (ValueError, Exception) as e:
         await message.reply(f"❌ 请输入数字: {e}")
 
-# ==================== 自动回复 ====================
-@router.callback_query(F.data.startswith("submenu_autoreply:"), F.from_user.id.in_(ADMIN_IDS))
-async def autoreply_submenu(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        text = "自动回复功能已下线。"
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")]]
-        )
-        await callback.message.edit_text(text, reply_markup=kb)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("toggle_ar:"), F.from_user.id.in_(ADMIN_IDS))
-async def toggle_autoreply(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        ar["enabled"] = not ar.get("enabled", False)
-        await save_config()
-        status = "✅" if ar["enabled"] else "❌"
-        await callback.answer(f"自动回复: {status}", show_alert=True)
-        kb = get_autoreply_menu_keyboard(group_id)
-        enabled = "✅" if ar.get("enabled") else "❌"
-        kw_count = len(ar.get("keywords", []))
-        breadcrumb = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{breadcrumb}</b> › 自动回复\n\n状态: {enabled}\n关键词: {kw_count} 个"
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.callback_query(F.data.startswith("edit_ar_kw:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_ar_keywords(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        keywords = ar.get("keywords", [])
-        kw_text = "\n".join(keywords)
-        text = f"自动回复关键词\n\n{kw_text if kw_text else '（无）'}\n\n发送新词汇（一行一个）或 /clear 清空"
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditAutoreplyKeywords)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditAutoreplyKeywords), F.from_user.id.in_(ADMIN_IDS))
-async def process_ar_keywords(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        
-        if message.text.strip() == "/clear":
-            ar["keywords"] = []
-        else:
-            ar["keywords"] = [x.strip().lower() for x in message.text.strip().split("\n") if x.strip()]
-        
-        await save_config()
-        kb = get_autoreply_menu_keyboard(group_id)
-        await message.reply(f"✅ 已更新（{len(ar['keywords'])}个）", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-@router.callback_query(F.data.startswith("edit_ar_text:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_ar_text(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        current = ar.get("reply_text", "")
-        text = f"自动回复文本\n\n{current if current else '（无）'}\n\n发送新文本"
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditAutoreplyText)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditAutoreplyText), F.from_user.id.in_(ADMIN_IDS))
-async def process_ar_text(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        ar["reply_text"] = message.text.strip()
-        
-        await save_config()
-        kb = get_autoreply_menu_keyboard(group_id)
-        await message.reply("✅ 已更新", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-@router.callback_query(F.data.startswith("edit_ar_btn:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_ar_buttons(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        buttons = ar.get("buttons", [])
-        btn_text = "\n".join(buttons)
-        text = f"自动回复按钮\n\n{btn_text if btn_text else '（无）'}\n\n发送新按钮（一行一个）或 /clear 清空"
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditAutoreplyButtons)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditAutoreplyButtons), F.from_user.id.in_(ADMIN_IDS))
-async def process_ar_buttons(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        
-        if message.text.strip() == "/clear":
-            ar["buttons"] = []
-        else:
-            ar["buttons"] = [x.strip() for x in message.text.strip().split("\n") if x.strip()]
-        
-        await save_config()
-        kb = get_autoreply_menu_keyboard(group_id)
-        await message.reply(f"✅ 已更新（{len(ar['buttons'])}个）", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
-@router.callback_query(F.data.startswith("edit_ar_del:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_ar_delete(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        user_sec = ar.get("delete_user_sec", 0)
-        bot_sec = ar.get("delete_bot_sec", 0)
-        text = f"删除延时（秒）\n用户消息: {user_sec}\n机器人消息: {bot_sec}\n\n输入两个数字（用空格隔开）"
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditAutoreplyDeleteTime)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditAutoreplyDeleteTime), F.from_user.id.in_(ADMIN_IDS))
-async def process_ar_delete(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        ar = cfg.get("autoreply", {})
-        
-        parts = message.text.strip().split()
-        if len(parts) != 2:
-            await message.reply("❌ 输入两个数字")
-            return
-        
-        user_sec = int(parts[0])
-        bot_sec = int(parts[1])
-        ar["delete_user_sec"] = user_sec
-        ar["delete_bot_sec"] = bot_sec
-        
-        await save_config()
-        kb = get_autoreply_menu_keyboard(group_id)
-        await message.reply(f"✅ 已设为 {user_sec}s 和 {bot_sec}s", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except ValueError:
-        await message.reply("❌ 请输入两个数字")
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
-
 # ==================== 基础设置 ====================
 @router.callback_query(F.data.startswith("submenu_basic:"), F.from_user.id.in_(ADMIN_IDS))
 async def basic_submenu(callback: CallbackQuery):
@@ -2794,77 +1903,16 @@ async def export_listen_log(callback: CallbackQuery):
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
-@router.callback_query(F.data.startswith("submenu_exempt:"), F.from_user.id.in_(ADMIN_IDS))
-async def exempt_submenu(callback: CallbackQuery):
-    await callback.answer("旧豁免名单已下线。", show_alert=True)
-
-@router.callback_query(F.data.startswith("edit_exempt:"), F.from_user.id.in_(ADMIN_IDS))
-async def edit_exempt(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("旧豁免名单已下线。", show_alert=True)
-
-@router.message(StateFilter(AdminStates.EditExemptUsers), F.from_user.id.in_(ADMIN_IDS))
-async def process_exempt(message: Message, state: FSMContext):
-    await state.set_state(AdminStates.GroupMenu)
-    await message.reply("旧豁免名单已下线。")
-
-# ==================== 状态查看 ====================
-async def _build_status_text(bot) -> str:
-    """生成状态页完整文案"""
-    admin_count = len(ADMIN_IDS)
-    async with lock:
-        report_count = len(reports)
-    lines = [
-        "📊 <b>系统状态</b>\n",
-        "<b>群组概览</b>:",
-    ]
-    for gid in sorted(GROUP_IDS):
-        title = await get_chat_title_safe(bot, gid)
-        cfg = get_group_config(gid)
-        status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
-        lines.append(f"├ {title} (<code>{gid}</code>)  {status}")
-    lines.append("")
-    lines.append("<b>数据统计</b>:")
-    lines.append(f"├ 进行中举报: {report_count} 条")
-    lines.append(f"├ 入群审批记录: {len(join_review_logs)} 条")
-    lines.append(f"├ 处理记录: {len(moderation_logs)} 条")
-    lines.append("")
-    lines.append("<b>系统</b>: ✅ 运行正常  |  管理员: %d" % admin_count)
-    return "\n".join(lines)
-
-
-@router.callback_query(F.data == "view_status", F.from_user.id.in_(ADMIN_IDS))
-async def view_status(callback: CallbackQuery):
-    try:
-        text = await _build_status_text(callback.bot)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 刷新", callback_data="view_status")],
-            [InlineKeyboardButton(text="⬅️ 返回主菜单", callback_data="back_main")],
-        ])
-        await callback.message.edit_text(text, reply_markup=kb)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
-
 # ==================== 检测和回复核心逻辑 ====================
-FILL_CHARS = set(r" .,，。！？*\\\~`-_=+[]{}()\"'\\|\n\t\r　")
-# 防拼字规避：去掉空格、常见标点后匹配敏感词（如 A  bc，D 命中 abcd）
-KEYWORD_NORMALIZE_CHARS = set(" .,，。！？、；：\"'（）【】\n\t\r　*_~`-+=|")
-
-def _normalize_for_keyword(text: str) -> str:
-    """去掉空格和常见标点、转小写，用于防拼字规避匹配"""
-    if not text:
-        return ""
-    return "".join(c for c in text.lower() if c not in KEYWORD_NORMALIZE_CHARS)
-
 user_short_msg_history = {}
 
 # key: (group_id, user_id, signature_hash) -> deque[timestamp]；避免长文本直接常驻内存
 repeat_message_history = {}
 repeat_message_history_last = {}  # key -> last_activity_time，用于淘汰
-REPEAT_HISTORY_MAX_KEYS = 12000
+REPEAT_HISTORY_MAX_KEYS = 6000
 # key: (group_id, user_id) -> int（0/1/2）；持久化到 REPEAT_LEVEL_FILE）
 repeat_violation_level = {}
-MEDIA_REPORT_LAST_MAX = 2000
+MEDIA_REPORT_LAST_MAX = 800
 
 
 def _normalize_text(text: str) -> str:
@@ -4321,11 +3369,6 @@ async def handle_mark_ad(callback: CallbackQuery):
     except Exception as e:
         print("标记广告异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("mild_exempt:"))
-async def handle_mild_exempt(callback: CallbackQuery):
-    await callback.answer("该功能已下线", show_alert=True)
 
 @router.callback_query(F.data.startswith("mr:"))
 async def handle_media_report(callback: CallbackQuery):
