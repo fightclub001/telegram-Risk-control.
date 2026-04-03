@@ -73,10 +73,11 @@ media_stats_dirty = False
 # 媒体消息举报/点赞（内存即可，按消息维度）
 media_reports = {}
 media_reports_lock = asyncio.Lock()
+media_group_report_index = {}  # (chat_id, media_group_id) -> primary media_msg_id
 media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
 pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message": Message, "user_id": int, "last_update_ts": float, "repeat_signatures": set[str]}
-MEDIA_GROUP_SETTLE_SEC = 1.2
+MEDIA_GROUP_SETTLE_SEC = 2.5
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
 join_approval_avatar_ocr = JoinApprovalAvatarOCR()
@@ -3187,6 +3188,59 @@ def _media_reply_buttons(chat_id: int, media_msg_id: int, report_count: int, gar
     ])
 
 
+def _build_media_summary_text(media_count: int, caption: str) -> str:
+    summary = f"📎 媒体消息（共 {media_count} 条）"
+    if caption:
+        summary += f"\n📝 文字：{_clip_text(caption, 100)}"
+    return summary
+
+
+async def _attach_to_existing_media_group_report(
+    chat_id: int,
+    media_group_id: str,
+    message: Message,
+    repeat_signature: str,
+) -> bool:
+    """
+    如果同一 media_group_id 已经生成过举报卡片，则把迟到的媒体并入原卡片，
+    避免因为单张消息处理快慢不同而出现两次回复。
+    """
+    async with media_reports_lock:
+        primary_mid = media_group_report_index.get((chat_id, media_group_id))
+        if primary_mid is None:
+            return False
+        key = (chat_id, primary_mid)
+        data = media_reports.get(key)
+        if not data or data.get("deleted"):
+            media_group_report_index.pop((chat_id, media_group_id), None)
+            return False
+        media_msg_ids = data.setdefault("media_msg_ids", [])
+        if message.message_id not in media_msg_ids:
+            media_msg_ids.append(message.message_id)
+            media_msg_ids.sort()
+        if repeat_signature:
+            repeat_signatures = data.setdefault("repeat_signatures", set())
+            if isinstance(repeat_signatures, set):
+                repeat_signatures.add(repeat_signature)
+        if message.caption:
+            data["caption"] = message.caption
+        reply_id = int(data["reply_msg_id"])
+        report_count = len(data.get("reporters", set()))
+        garbage_count = len(data.get("garbage_reporters", set()))
+        caption = str(data.get("caption") or "")
+        summary_text = _build_media_summary_text(len(media_msg_ids), caption)
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=reply_id,
+            text=summary_text,
+            reply_markup=_media_reply_buttons(chat_id, primary_mid, report_count, garbage_count),
+        )
+    except Exception:
+        pass
+    return True
+
+
 async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
     key = (chat_id, media_group_id)
     while True:
@@ -3205,14 +3259,34 @@ async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
     message_ids = list(dict.fromkeys(data.get("message_ids", [])))
     if not first_message or not message_ids:
         return
+    if await _attach_to_existing_media_group_report(
+        chat_id,
+        media_group_id,
+        first_message,
+        "",
+    ):
+        async with media_reports_lock:
+            primary_mid = media_group_report_index.get((chat_id, media_group_id))
+            if primary_mid is not None:
+                report_data = media_reports.get((chat_id, primary_mid))
+                if report_data:
+                    ids = report_data.setdefault("media_msg_ids", [])
+                    for mid in message_ids:
+                        if mid not in ids:
+                            ids.append(mid)
+                    ids.sort()
+                    caption = (data.get("caption") or "").strip()
+                    if caption:
+                        report_data["caption"] = caption
+                    repeat_signatures = report_data.setdefault("repeat_signatures", set())
+                    if isinstance(repeat_signatures, set):
+                        repeat_signatures.update(set(data.get("repeat_signatures", set())))
+        return
     if await handle_repeat_media_group_message(first_message, set(data.get("repeat_signatures", set()))):
         return
 
     caption = (data.get("caption") or "").strip()
-    summary = f"📎 媒体消息（共 {len(message_ids)} 条）"
-    if caption:
-        summary += f"\n📝 文字：{_clip_text(caption, 100)}"
-
+    summary = _build_media_summary_text(len(message_ids), caption)
     reply = await first_message.reply(
         summary,
         reply_markup=_media_reply_buttons(chat_id, message_ids[0], 0, 0),
@@ -3229,7 +3303,9 @@ async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
             "garbage_reporters": set(),
             "deleted": False,
             "caption": caption,
+            "repeat_signatures": set(data.get("repeat_signatures", set())),
         }
+        media_group_report_index[(chat_id, media_group_id)] = message_ids[0]
 
 def _message_link(chat_id: int, msg_id: int) -> str:
     """群内消息链接，便于管理员定位"""
@@ -3352,7 +3428,11 @@ async def on_media_message(message: Message):
         return
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id:
-        key = (group_id, str(media_group_id))
+        media_group_id = str(media_group_id)
+        repeat_signature = _get_media_repeat_signature(message)
+        if await _attach_to_existing_media_group_report(group_id, media_group_id, message, repeat_signature):
+            return
+        key = (group_id, media_group_id)
         group_data = pending_media_groups.get(key)
         if group_data is None:
             group_data = {
@@ -3364,10 +3444,9 @@ async def on_media_message(message: Message):
                 "repeat_signatures": set(),
             }
             pending_media_groups[key] = group_data
-            asyncio.create_task(_finalize_media_group(group_id, str(media_group_id)))
+            asyncio.create_task(_finalize_media_group(group_id, media_group_id))
         group_data["message_ids"].append(message.message_id)
         group_data["last_update_ts"] = now
-        repeat_signature = _get_media_repeat_signature(message)
         if repeat_signature:
             group_data["repeat_signatures"].add(repeat_signature)
         if message.caption:
@@ -4302,6 +4381,9 @@ async def handle_media_report(callback: CallbackQuery):
             async with media_reports_lock:
                 if key in media_reports:
                     media_reports[key]["deleted"] = True
+                    mgid = media_reports[key].get("media_group_id")
+                    if mgid:
+                        media_group_report_index.pop((chat_id, str(mgid)), None)
     except Exception as e:
         print("媒体举报异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
@@ -4359,6 +4441,9 @@ async def handle_media_garbage_report(callback: CallbackQuery):
             async with media_reports_lock:
                 if key in media_reports:
                     media_reports[key]["deleted"] = True
+                    mgid = media_reports[key].get("media_group_id")
+                    if mgid:
+                        media_group_report_index.pop((chat_id, str(mgid)), None)
     except Exception as e:
         print("媒体垃圾举报异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
