@@ -7,6 +7,8 @@ import time
 import hashlib
 from copy import deepcopy
 from collections import deque
+from types import SimpleNamespace
+from typing import Any
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
@@ -16,8 +18,6 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from join_approval_avatar_ocr import JoinApprovalAvatarOCR, AvatarResult as JoinApprovalAvatarResult
-from semantic_ads import SemanticAdDetector
 
 # ==================== 环境配置 ====================
 GROUP_IDS = set()
@@ -83,8 +83,8 @@ MEDIA_REPORT_ENTRY_TTL_SEC = 2 * 3600
 MEDIA_REPORT_DELETED_TTL_SEC = 15 * 60
 MEDIA_REPORT_LAST_TTL_SEC = 6 * 3600
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
-semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
-join_approval_avatar_ocr = JoinApprovalAvatarOCR()
+semantic_ad_detector: Any | None = None
+join_approval_avatar_ocr: Any | None = None
 JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "10800").strip()))
 JOIN_APPROVAL_OCR_CACHE_MAX = max(24, int((os.getenv("OCR_CACHE_MAX") or "64").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -176,6 +176,24 @@ def _join_approval_timeout_kwargs() -> dict:
     }
 
 
+def get_semantic_ad_detector() -> Any:
+    global semantic_ad_detector
+    if semantic_ad_detector is None:
+        from semantic_ads import SemanticAdDetector
+
+        semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
+    return semantic_ad_detector
+
+
+def get_join_approval_avatar_ocr() -> Any:
+    global join_approval_avatar_ocr
+    if join_approval_avatar_ocr is None:
+        from join_approval_avatar_ocr import JoinApprovalAvatarOCR
+
+        join_approval_avatar_ocr = JoinApprovalAvatarOCR()
+    return join_approval_avatar_ocr
+
+
 def _prune_join_approval_avatar_cache() -> None:
     now = time.time()
     expired = [
@@ -195,14 +213,14 @@ def _prune_join_approval_avatar_cache() -> None:
         join_approval_avatar_cache.pop(key, None)
 
 
-def _get_join_approval_avatar_cache(file_unique_id: str) -> JoinApprovalAvatarResult | None:
+def _get_join_approval_avatar_cache(file_unique_id: str) -> Any | None:
     entry = join_approval_avatar_cache.get(file_unique_id)
     if not entry:
         return None
     if time.time() - float(entry.get("timestamp", 0)) > JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS:
         join_approval_avatar_cache.pop(file_unique_id, None)
         return None
-    return JoinApprovalAvatarResult(
+    return SimpleNamespace(
         extracted_text=str(entry.get("ocr_text", "")),
         normalized_text=str(entry.get("normalized_text", "")),
         is_text_avatar=bool(entry.get("is_text_avatar", False)),
@@ -212,7 +230,7 @@ def _get_join_approval_avatar_cache(file_unique_id: str) -> JoinApprovalAvatarRe
     )
 
 
-def _set_join_approval_avatar_cache(file_unique_id: str, result: JoinApprovalAvatarResult) -> None:
+def _set_join_approval_avatar_cache(file_unique_id: str, result: Any) -> None:
     join_approval_avatar_cache[file_unique_id] = {
         "ocr_text": result.extracted_text,
         "normalized_text": result.normalized_text,
@@ -367,8 +385,9 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
     chat_id = join_request.chat.id
     final_decision = "approve"
     reason = "no_rule_hit"
+    approval_ocr = get_join_approval_avatar_ocr()
 
-    if not join_approval_avatar_ocr.ocr_enabled:
+    if not approval_ocr.ocr_enabled:
         reason = "avatar_ocr_disabled"
     else:
         try:
@@ -398,7 +417,7 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
                             raise ValueError("avatar download returned None")
                         image_bytes = downloaded.getvalue() if isinstance(downloaded, io.BytesIO) else downloaded.read()
                         avatar_result = await asyncio.to_thread(
-                            join_approval_avatar_ocr.analyze_avatar,
+                            approval_ocr.analyze_avatar,
                             image_bytes,
                         )
                         _set_join_approval_avatar_cache(largest.file_unique_id, avatar_result)
@@ -551,7 +570,16 @@ async def load_forward_match_memory():
         if os.path.exists(FORWARD_MATCH_FILE):
             with open(FORWARD_MATCH_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            forward_match_memory = raw if isinstance(raw, dict) else {}
+            if isinstance(raw, dict):
+                compacted = {}
+                for key, value in raw.items():
+                    unpacked = _unpack_forward_match_value(value)
+                    if unpacked is None:
+                        continue
+                    compacted[key] = _pack_forward_match_value(*unpacked)
+                forward_match_memory = compacted
+            else:
+                forward_match_memory = {}
             await save_forward_match_memory()
         else:
             forward_match_memory = {}
@@ -563,10 +591,11 @@ async def save_forward_match_memory():
     try:
         now = int(time.time())
         cutoff = now - USER_MSG_24H_SEC
-        stale_keys = [
-            key for key, value in forward_match_memory.items()
-            if not isinstance(value, dict) or int(value.get("updated_at", 0)) < cutoff
-        ]
+        stale_keys = []
+        for key, value in list(forward_match_memory.items()):
+            unpacked = _unpack_forward_match_value(value)
+            if unpacked is None or unpacked[2] < cutoff:
+                stale_keys.append(key)
         for key in stale_keys:
             forward_match_memory.pop(key, None)
         max_items = 3000
@@ -574,7 +603,7 @@ async def save_forward_match_memory():
             trim_count = len(forward_match_memory) - max_items
             oldest_keys = sorted(
                 forward_match_memory,
-                key=lambda key: int((forward_match_memory.get(key) or {}).get("updated_at", 0)),
+                key=lambda key: (_unpack_forward_match_value(forward_match_memory.get(key)) or (0, 0, 0))[2],
             )[:trim_count]
             for key in oldest_keys:
                 forward_match_memory.pop(key, None)
@@ -958,6 +987,28 @@ async def save_repeat_levels():
 
 def _media_key(group_id: int, user_id: int) -> str:
     return f"{group_id}_{user_id}"
+
+
+def _pack_forward_match_value(group_id: int, user_id: int, updated_at: int) -> list[int]:
+    return [int(group_id), int(user_id), int(updated_at)]
+
+
+def _unpack_forward_match_value(value: Any) -> tuple[int, int, int] | None:
+    if isinstance(value, dict):
+        try:
+            return (
+                int(value.get("group_id", 0)),
+                int(value.get("user_id", 0)),
+                int(value.get("updated_at", 0)),
+            )
+        except Exception:
+            return None
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        try:
+            return (int(value[0]), int(value[1]), int(value[2]))
+        except Exception:
+            return None
+    return None
 
 
 def _media_text_fingerprint(normalized_text: str) -> str:
@@ -1412,7 +1463,7 @@ async def process_semantic_ad_add(message: Message, state: FSMContext):
         added_ids = []
         skipped = 0
         for ln in lines:
-            sample = semantic_ad_detector.add_ad_sample(ln)
+            sample = get_semantic_ad_detector().add_ad_sample(ln)
             if sample is None:
                 skipped += 1
             else:
@@ -1448,7 +1499,7 @@ async def view_semantic_ad(callback: CallbackQuery):
         if page < 0:
             page = 0
 
-        samples = semantic_ad_detector.list_samples()
+        samples = get_semantic_ad_detector().list_samples()
         if not samples:
             await callback.answer("当前广告语义库为空。", show_alert=False)
             return
@@ -1530,7 +1581,7 @@ async def process_semantic_ad_remove(message: Message, state: FSMContext):
             except ValueError:
                 invalid += 1
                 continue
-            ok = semantic_ad_detector.remove_sample(sid)
+            ok = get_semantic_ad_detector().remove_sample(sid)
             if ok:
                 removed.append(sid)
             else:
@@ -1923,28 +1974,22 @@ def _remember_forward_match(group_id: int, user_id: int, text: str) -> bool:
     norm = _normalize_text(text)
     if not norm:
         return False
-    forward_match_memory[norm] = {
-        "group_id": group_id,
-        "user_id": user_id,
-        "updated_at": int(time.time()),
-    }
+    forward_match_memory[norm] = _pack_forward_match_value(group_id, user_id, int(time.time()))
     return True
 
 def _get_remembered_user_id_by_text(group_id: int, text: str) -> int | None:
     norm = _normalize_text(text)
     if not norm:
         return None
-    data = forward_match_memory.get(norm)
-    if not isinstance(data, dict):
+    unpacked = _unpack_forward_match_value(forward_match_memory.get(norm))
+    if unpacked is None:
         return None
-    if int(data.get("group_id", 0)) != int(group_id):
+    remembered_group_id, remembered_user_id, updated_at = unpacked
+    if remembered_group_id != int(group_id):
         return None
-    if int(time.time()) - int(data.get("updated_at", 0)) > USER_MSG_24H_SEC:
+    if int(time.time()) - updated_at > USER_MSG_24H_SEC:
         return None
-    try:
-        return int(data.get("user_id"))
-    except Exception:
-        return None
+    return remembered_user_id
 
 async def _remember_recent_user_texts(group_id: int, user_id: int) -> bool:
     msgs = await _recent_messages_fetch_by_user(group_id, user_id)
@@ -2394,7 +2439,7 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
     for msg_id, _ts, txt in recent_msgs:
         if txt:
             try:
-                semantic_ad_detector.add_ad_sample(txt)
+                get_semantic_ad_detector().add_ad_sample(txt)
                 memory_changed = _remember_forward_match(group_id, user_id, txt) or memory_changed
             except Exception as e:
                 print(f"删除用户消息时学习样本失败: {e}")
@@ -2662,7 +2707,7 @@ async def _enable_semantic_detection_for_group(group_id: int) -> bool:
 async def _record_semantic_ad_deletion(group_id: int, user_id: int, message_id: int, text: str, score: float) -> bool:
     learned = False
     try:
-        sample = semantic_ad_detector.add_ad_sample(text)
+        sample = get_semantic_ad_detector().add_ad_sample(text)
         learned = sample is not None
     except Exception as e:
         print(f"learn ad sample on delete failed: {e}")
@@ -2679,7 +2724,7 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
     if len((text or "").strip()) < 4:
         return False
 
-    is_semantic_ad, sim, _ = semantic_ad_detector.check_text(text)
+    is_semantic_ad, sim, _ = get_semantic_ad_detector().check_text(text)
     _push_listen_log(
         group_id=group_id,
         user_id=user_id,
@@ -2882,7 +2927,7 @@ async def cmd_mark_ad(message: Message):
         text = target.text or target.caption or ""
         if text:
             try:
-                sample = semantic_ad_detector.add_ad_sample(text)
+                sample = get_semantic_ad_detector().add_ad_sample(text)
                 await _enable_semantic_detection_for_group(group_id)
                 if sample is None:
                     print(f"/ad 样本已存在或被去重: {text[:80]}")
@@ -2921,7 +2966,7 @@ async def on_forward_learn_ad(message: Message):
         memory_changed = False
         if text:
             try:
-                sample = semantic_ad_detector.add_ad_sample(text)
+                sample = get_semantic_ad_detector().add_ad_sample(text)
                 learned = sample is not None
                 if not learned:
                     print(f"转发学习样本已存在或被去重: {text[:80]}")
@@ -3350,7 +3395,7 @@ async def handle_mark_ad(callback: CallbackQuery):
         # 学习广告样本（仅使用当前触发的原始文本）
         if orig_text:
             try:
-                semantic_ad_detector.add_ad_sample(orig_text)
+                get_semantic_ad_detector().add_ad_sample(orig_text)
                 await _enable_semantic_detection_for_group(group_id)
             except Exception as e:
                 print(f"学习广告样本失败: {e}")
