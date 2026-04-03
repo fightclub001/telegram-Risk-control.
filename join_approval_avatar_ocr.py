@@ -8,6 +8,8 @@ import sys
 import tempfile
 from dataclasses import dataclass
 
+from PIL import Image, ImageOps, ImageStat
+
 from join_approval_text_normalizer import count_chinese_chars, normalize_text
 
 
@@ -37,9 +39,84 @@ class JoinApprovalAvatarOCR:
             "off",
         }
         self.ocr_max_side = max(64, int((os.getenv("OCR_MAX_SIDE") or "320").strip()))
+        self.prefilter_enabled = (os.getenv("OCR_PREFILTER_ENABLED") or "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self.prefilter_max_side = max(48, int((os.getenv("OCR_PREFILTER_MAX_SIDE") or "96").strip()))
+
+    def _looks_like_text_avatar(self, image_bytes: bytes) -> bool:
+        """
+        Cheap prefilter for join approval.
+
+        Most normal user avatars are photos/illustrations with richer color distribution.
+        Text-heavy porn-spam avatars are usually poster-like: few dominant colors + strong edges.
+        """
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image.thumbnail((self.prefilter_max_side, self.prefilter_max_side), Image.Resampling.BILINEAR)
+        except Exception:
+            return True
+
+        width, height = image.size
+        if width < 24 or height < 24:
+            return True
+
+        total = width * height
+        gray = ImageOps.grayscale(image)
+        gray_stat = ImageStat.Stat(gray)
+        contrast_std = float(gray_stat.stddev[0] or 0.0)
+        if contrast_std < 18.0:
+            return False
+
+        quantized = image.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
+        colors = quantized.getcolors(maxcolors=total) or []
+        colors.sort(reverse=True, key=lambda item: item[0])
+        top_ratio = float(colors[0][0]) / total if colors else 0.0
+        top2_ratio = float(sum(count for count, _color in colors[:2])) / total if colors else 0.0
+        palette_size = len(colors)
+        reduced = image.quantize(colors=3, method=Image.Quantize.MEDIANCUT)
+        reduced_colors = reduced.getcolors(maxcolors=total) or []
+        reduced_colors.sort(reverse=True, key=lambda item: item[0])
+        reduced_top2_ratio = (
+            float(sum(count for count, _color in reduced_colors[:2])) / total if reduced_colors else 0.0
+        )
+
+        pixels = gray.load()
+        edge_hits = 0
+        edge_total = 0
+        for y in range(height):
+            for x in range(width):
+                current = int(pixels[x, y])
+                if x + 1 < width:
+                    edge_total += 1
+                    if abs(current - int(pixels[x + 1, y])) >= 42:
+                        edge_hits += 1
+                if y + 1 < height:
+                    edge_total += 1
+                    if abs(current - int(pixels[x, y + 1])) >= 42:
+                        edge_hits += 1
+        edge_density = float(edge_hits) / max(1, edge_total)
+
+        if top_ratio >= 0.46 and edge_density >= 0.060 and contrast_std >= 24.0:
+            return True
+        if top2_ratio >= 0.76 and edge_density >= 0.048 and contrast_std >= 22.0:
+            return True
+        if palette_size <= 4 and edge_density >= 0.055 and contrast_std >= 20.0:
+            return True
+        if reduced_top2_ratio >= 0.70 and edge_density >= 0.050 and contrast_std >= 20.0:
+            return True
+        if reduced_top2_ratio >= 0.66 and edge_density >= 0.072 and contrast_std >= 22.0:
+            return True
+        return False
 
     def analyze_avatar(self, image_bytes: bytes) -> AvatarResult:
         if not self.ocr_enabled:
+            return AvatarResult("", "", False, 0, 0, None)
+        if self.prefilter_enabled and not self._looks_like_text_avatar(image_bytes):
             return AvatarResult("", "", False, 0, 0, None)
 
         temp_path = ""

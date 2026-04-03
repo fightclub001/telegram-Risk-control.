@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import os
+import sqlite3
 import time
 import hashlib
 from copy import deepcopy
@@ -56,18 +57,19 @@ MEDIA_STATS_FILE = os.path.join(DATA_DIR, "media_stats.json")
 REPEAT_LEVEL_FILE = os.path.join(DATA_DIR, "repeat_levels.json")
 FORWARD_MATCH_FILE = os.path.join(DATA_DIR, "forward_match_memory.json")
 RECENT_MESSAGES_FILE = os.path.join(DATA_DIR, "recent_messages.json")
+RECENT_MESSAGES_DB_FILE = os.path.join(DATA_DIR, "recent_messages.db")
 JOIN_REVIEW_LOG_FILE = os.path.join(DATA_DIR, "join_review_logs.json")
 MOD_ACTION_LOG_FILE = os.path.join(DATA_DIR, "moderation_logs.json")
 
 reports = {}  # key: (group_id, message_id)
 lock = asyncio.Lock()
-user_recent_message_ids = {}  # (group_id, user_id) -> deque of (msg_id, time, text), for 24h delete & learning
 repeat_warning_msg_id = {}  # (group_id, user_id) -> msg_id of "2次" repeat warning, delete if orig deleted
 config = {}
 forward_match_memory = {}  # normalized_text -> {"group_id": int, "user_id": int, "updated_at": int}
 # 媒体权限统计：合规消息数、同条超过10次不计数、已解锁名单（持久化到 MEDIA_STATS_FILE）
 media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}}
 media_stats_loaded = False
+media_stats_dirty = False
 # 媒体消息举报/点赞（内存即可，按消息维度）
 media_reports = {}
 media_reports_lock = asyncio.Lock()
@@ -101,6 +103,8 @@ USER_MSG_TRACK_MAXLEN = 500
 USER_MSG_24H_SEC = 24 * 3600
 BOT_MSG_AUTO_DELETE_SEC = 24 * 3600  # 机器人消息24小时后自动删除
 BOT_MESSAGE_SWEEP_SEC = 60
+RECENT_MESSAGES_FLUSH_SEC = 2
+RECENT_MESSAGES_PRUNE_SEC = 10 * 60
 
 # 机器人消息跟踪：(group_id, msg_id) -> expire_at
 bot_sent_messages = {}
@@ -115,6 +119,10 @@ banned_warning_messages = {}
 
 # ==================== 监听决策日志（仅保留最近10条） ====================
 listen_decision_logs = deque(maxlen=10)  # newest appended to right
+recent_messages_conn: sqlite3.Connection | None = None
+recent_messages_pending_writes = deque()
+recent_messages_lock = asyncio.Lock()
+recent_messages_last_prune_ts = 0.0
 
 
 def _clip_text(s: str, n: int = 80) -> str:
@@ -542,67 +550,311 @@ async def save_forward_match_memory():
     except Exception as e:
         print(f"forward match memory save failed: {e}")
 
-def _prune_recent_messages_cache():
-    cutoff = time.time() - USER_MSG_24H_SEC
-    for key in list(user_recent_message_ids.keys()):
-        msgs = user_recent_message_ids.get(key)
-        if not msgs:
-            user_recent_message_ids.pop(key, None)
-            continue
-        kept = [item for item in msgs if len(item) == 3 and item[1] >= cutoff]
-        if kept:
-            user_recent_message_ids[key] = deque(kept[-USER_MSG_TRACK_MAXLEN:], maxlen=USER_MSG_TRACK_MAXLEN)
-        else:
-            user_recent_message_ids.pop(key, None)
+def _get_recent_messages_conn() -> sqlite3.Connection:
+    global recent_messages_conn
+    if recent_messages_conn is None:
+        conn = sqlite3.connect(RECENT_MESSAGES_DB_FILE, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recent_messages (
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                ts REAL NOT NULL,
+                text TEXT NOT NULL,
+                norm_text TEXT NOT NULL,
+                PRIMARY KEY (group_id, message_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_messages_user_ts "
+            "ON recent_messages(group_id, user_id, ts DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_messages_norm_ts "
+            "ON recent_messages(group_id, norm_text, ts DESC)"
+        )
+        recent_messages_conn = conn
+    return recent_messages_conn
 
-async def load_recent_messages_cache():
-    global user_recent_message_ids
-    try:
-        if not os.path.exists(RECENT_MESSAGES_FILE):
-            user_recent_message_ids = {}
+
+async def _prune_recent_messages_db(force: bool = False) -> None:
+    global recent_messages_last_prune_ts
+    now = time.time()
+    if not force and (now - recent_messages_last_prune_ts) < RECENT_MESSAGES_PRUNE_SEC:
+        return
+    cutoff = now - USER_MSG_24H_SEC
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        conn.execute("DELETE FROM recent_messages WHERE ts < ?", (cutoff,))
+        conn.execute(
+            """
+            DELETE FROM recent_messages
+            WHERE rowid IN (
+                SELECT rowid FROM (
+                    SELECT
+                        rowid,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY group_id, user_id
+                            ORDER BY ts DESC, message_id DESC
+                        ) AS rn
+                    FROM recent_messages
+                )
+                WHERE rn > ?
+            )
+            """,
+            (USER_MSG_TRACK_MAXLEN,),
+        )
+        conn.commit()
+    recent_messages_last_prune_ts = now
+
+
+def _queue_recent_message_upsert(group_id: int, user_id: int, msg_id: int, ts: float, text: str) -> None:
+    recent_messages_pending_writes.append(
+        ("upsert", int(group_id), int(user_id), int(msg_id), float(ts), str(text or ""), _normalize_text(text))
+    )
+
+
+def _queue_recent_message_delete(group_id: int, original_msg_id: int) -> None:
+    recent_messages_pending_writes.append(("delete", int(group_id), int(original_msg_id)))
+
+
+async def _flush_recent_messages_writes(force: bool = False) -> None:
+    if not recent_messages_pending_writes and not force:
+        return
+    conn = _get_recent_messages_conn()
+    pending = []
+    while recent_messages_pending_writes:
+        pending.append(recent_messages_pending_writes.popleft())
+    async with recent_messages_lock:
+        if pending:
+            conn.execute("BEGIN")
+            try:
+                for item in pending:
+                    op = item[0]
+                    if op == "upsert":
+                        _, group_id, user_id, msg_id, ts, text, norm_text = item
+                        conn.execute(
+                            """
+                            INSERT INTO recent_messages (group_id, user_id, message_id, ts, text, norm_text)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(group_id, message_id) DO UPDATE SET
+                                user_id=excluded.user_id,
+                                ts=excluded.ts,
+                                text=excluded.text,
+                                norm_text=excluded.norm_text
+                            """,
+                            (group_id, user_id, msg_id, ts, text, norm_text),
+                        )
+                    elif op == "delete":
+                        _, group_id, msg_id = item
+                        conn.execute(
+                            "DELETE FROM recent_messages WHERE group_id = ? AND message_id = ?",
+                            (group_id, msg_id),
+                        )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+    await _prune_recent_messages_db(force=force)
+
+
+async def _recent_messages_flush_worker() -> None:
+    while True:
+        await asyncio.sleep(RECENT_MESSAGES_FLUSH_SEC)
+        try:
+            await _flush_recent_messages_writes()
+        except Exception as e:
+            print(f"recent messages flush failed: {e}")
+
+
+async def _migrate_recent_messages_from_legacy_json() -> None:
+    if not os.path.exists(RECENT_MESSAGES_FILE):
+        return
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        row = conn.execute("SELECT 1 FROM recent_messages LIMIT 1").fetchone()
+        if row is not None:
             return
+    try:
         with open(RECENT_MESSAGES_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        loaded = {}
-        for key, items in (raw or {}).items():
+    except Exception as e:
+        print(f"legacy recent messages migration skipped: {e}")
+        return
+    rows = []
+    for key, items in (raw or {}).items():
+        try:
+            gid_str, uid_str = key.split("_", 1)
+            gid = int(gid_str)
+            uid = int(uid_str)
+        except Exception:
+            continue
+        if not isinstance(items, list):
+            continue
+        for item in items[-USER_MSG_TRACK_MAXLEN:]:
+            if not isinstance(item, list) or len(item) != 3:
+                continue
             try:
-                gid_str, uid_str = key.split("_", 1)
-                gid = int(gid_str)
-                uid = int(uid_str)
+                msg_id = int(item[0])
+                ts = float(item[1])
+                text = str(item[2] or "")
             except Exception:
                 continue
-            if not isinstance(items, list):
-                continue
-            cleaned = []
-            for item in items:
-                if not isinstance(item, list) or len(item) != 3:
-                    continue
-                try:
-                    cleaned.append((int(item[0]), float(item[1]), str(item[2] or "")))
-                except Exception:
-                    continue
-            if cleaned:
-                loaded[(gid, uid)] = deque(cleaned[-USER_MSG_TRACK_MAXLEN:], maxlen=USER_MSG_TRACK_MAXLEN)
-        user_recent_message_ids = loaded
-        _prune_recent_messages_cache()
+            rows.append((gid, uid, msg_id, ts, text, _normalize_text(text)))
+    if not rows:
+        return
+    async with recent_messages_lock:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO recent_messages (group_id, user_id, message_id, ts, text, norm_text)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+    await _prune_recent_messages_db(force=True)
+
+
+async def load_recent_messages_cache():
+    try:
+        _get_recent_messages_conn()
+        await _migrate_recent_messages_from_legacy_json()
+        await _prune_recent_messages_db(force=True)
     except Exception as e:
         print(f"recent messages cache load failed: {e}")
-        user_recent_message_ids = {}
+
 
 async def save_recent_messages_cache():
     try:
-        _prune_recent_messages_cache()
-        data = {}
-        for (gid, uid), msgs in user_recent_message_ids.items():
-            data[f"{gid}_{uid}"] = [[msg_id, ts, text] for msg_id, ts, text in list(msgs)]
-        with open(RECENT_MESSAGES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        await _flush_recent_messages_writes(force=True)
     except Exception as e:
         print(f"recent messages cache save failed: {e}")
 
+
+async def _recent_messages_fetch_by_user(group_id: int, user_id: int) -> list[tuple[int, float, str]]:
+    cutoff = time.time() - USER_MSG_24H_SEC
+    await _flush_recent_messages_writes()
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        rows = conn.execute(
+            """
+            SELECT message_id, ts, text
+            FROM recent_messages
+            WHERE group_id = ? AND user_id = ? AND ts >= ?
+            ORDER BY ts DESC, message_id DESC
+            """,
+            (group_id, user_id, cutoff),
+        ).fetchall()
+    return [(int(row["message_id"]), float(row["ts"]), str(row["text"] or "")) for row in rows]
+
+
+async def _recent_message_exists(group_id: int, message_id: int) -> bool:
+    cutoff = time.time() - USER_MSG_24H_SEC
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM recent_messages
+            WHERE group_id = ? AND message_id = ? AND ts >= ?
+            LIMIT 1
+            """,
+            (group_id, message_id, cutoff),
+        ).fetchone()
+    return row is not None
+
+
+async def _recent_messages_find_user_ids_by_text(group_id: int, text: str, *, limit: int = 3) -> list[int]:
+    norm = _normalize_text(text)
+    raw = (text or "").strip()
+    if not norm and not raw:
+        return []
+    cutoff = time.time() - USER_MSG_24H_SEC
+    conn = _get_recent_messages_conn()
+    candidates: list[tuple[float, int]] = []
+    async with recent_messages_lock:
+        if norm:
+            rows = conn.execute(
+                """
+                SELECT user_id, MAX(ts) AS last_ts
+                FROM recent_messages
+                WHERE group_id = ? AND ts >= ? AND norm_text = ?
+                GROUP BY user_id
+                ORDER BY last_ts DESC
+                LIMIT ?
+                """,
+                (group_id, cutoff, norm, limit),
+            ).fetchall()
+            for row in rows:
+                candidates.append((float(row["last_ts"]), int(row["user_id"])))
+        if len(candidates) < limit and raw:
+            like_value = f"%{raw}%"
+            rows = conn.execute(
+                """
+                SELECT user_id, MAX(ts) AS last_ts
+                FROM recent_messages
+                WHERE group_id = ? AND ts >= ? AND text LIKE ?
+                GROUP BY user_id
+                ORDER BY last_ts DESC
+                LIMIT ?
+                """,
+                (group_id, cutoff, like_value, limit),
+            ).fetchall()
+            for row in rows:
+                uid = int(row["user_id"])
+                if uid not in [item[1] for item in candidates]:
+                    candidates.append((float(row["last_ts"]), uid))
+    candidates.sort(reverse=True)
+    return [uid for _ts, uid in candidates[:limit]]
+
+
+async def _recent_messages_delete_by_text(group_id: int, text: str) -> list[int]:
+    norm = _normalize_text(text)
+    raw = (text or "").strip()
+    if not norm and not raw:
+        return []
+    cutoff = time.time() - USER_MSG_24H_SEC
+    conn = _get_recent_messages_conn()
+    message_ids: list[int] = []
+    async with recent_messages_lock:
+        if norm:
+            rows = conn.execute(
+                """
+                SELECT message_id
+                FROM recent_messages
+                WHERE group_id = ? AND ts >= ? AND norm_text = ?
+                ORDER BY ts DESC, message_id DESC
+                """,
+                (group_id, cutoff, norm),
+            ).fetchall()
+            message_ids.extend(int(row["message_id"]) for row in rows)
+        if raw:
+            like_value = f"%{raw}%"
+            rows = conn.execute(
+                """
+                SELECT message_id
+                FROM recent_messages
+                WHERE group_id = ? AND ts >= ? AND text LIKE ?
+                ORDER BY ts DESC, message_id DESC
+                """,
+                (group_id, cutoff, like_value),
+            ).fetchall()
+            for row in rows:
+                msg_id = int(row["message_id"])
+                if msg_id not in message_ids:
+                    message_ids.append(msg_id)
+    return message_ids
+
 async def load_media_stats():
-    global media_stats, media_stats_loaded
+    global media_stats, media_stats_loaded, media_stats_dirty
     media_stats_loaded = False
+    media_stats_dirty = False
     try:
         if os.path.exists(MEDIA_STATS_FILE):
             with open(MEDIA_STATS_FILE, "r", encoding="utf-8") as f:
@@ -619,14 +871,31 @@ async def load_media_stats():
         print(f"媒体统计加载失败: {e}（本次运行不写入，避免覆盖磁盘原有数据）")
 
 async def save_media_stats():
-    global media_stats_loaded
+    global media_stats_loaded, media_stats_dirty
     if not media_stats_loaded:
+        return
+    if not media_stats_dirty:
         return
     try:
         with open(MEDIA_STATS_FILE, "w", encoding="utf-8") as f:
             json.dump(media_stats, f, ensure_ascii=False, indent=2)
+        media_stats_dirty = False
     except Exception as e:
         print(f"媒体统计保存失败: {e}")
+
+
+def _mark_media_stats_dirty() -> None:
+    global media_stats_dirty
+    media_stats_dirty = True
+
+
+async def _media_stats_flush_worker() -> None:
+    while True:
+        await asyncio.sleep(5)
+        try:
+            await save_media_stats()
+        except Exception as e:
+            print(f"media stats flush failed: {e}")
 
 def load_repeat_levels():
     global repeat_violation_level
@@ -686,9 +955,10 @@ async def _increment_media_count(group_id: int, user_id: int, normalized_text: s
     if count >= need_count:
         media_stats["unlocked"][key] = True
         media_stats["text_counts"].pop(key, None)
+        _mark_media_stats_dirty()
         await save_media_stats()
         return True
-    await save_media_stats()
+    _mark_media_stats_dirty()
     return False
 
 
@@ -2565,10 +2835,10 @@ def _normalize_for_keyword(text: str) -> str:
 
 user_short_msg_history = {}
 
-# key: (group_id, user_id, normalized_text) -> deque[timestamp]；key 数量上限 REPEAT_HISTORY_MAX_KEYS，超则淘汰最久未用
+# key: (group_id, user_id, signature_hash) -> deque[timestamp]；避免长文本直接常驻内存
 repeat_message_history = {}
 repeat_message_history_last = {}  # key -> last_activity_time，用于淘汰
-REPEAT_HISTORY_MAX_KEYS = 20000
+REPEAT_HISTORY_MAX_KEYS = 12000
 # key: (group_id, user_id) -> int（0/1/2）；持久化到 REPEAT_LEVEL_FILE）
 repeat_violation_level = {}
 MEDIA_REPORT_LAST_MAX = 5000
@@ -2605,13 +2875,11 @@ def _get_remembered_user_id_by_text(group_id: int, text: str) -> int | None:
     except Exception:
         return None
 
-def _remember_recent_user_texts(group_id: int, user_id: int) -> bool:
-    key = (group_id, user_id)
-    msgs = user_recent_message_ids.get(key) or []
-    cutoff = time.time() - USER_MSG_24H_SEC
+async def _remember_recent_user_texts(group_id: int, user_id: int) -> bool:
+    msgs = await _recent_messages_fetch_by_user(group_id, user_id)
     changed = False
-    for _msg_id, ts, txt in list(msgs):
-        if ts < cutoff or not txt:
+    for _msg_id, _ts, txt in msgs:
+        if not txt:
             continue
         changed = _remember_forward_match(group_id, user_id, txt) or changed
     return changed
@@ -2644,6 +2912,28 @@ def _render_reporter_lines(reporter_labels: dict | None) -> str:
     return "👥 举报人：\n" + "\n".join(f"- {str(label)}" for label in reporter_labels.values())
 
 
+def _repeat_signature_hash(signature: str) -> int:
+    digest = hashlib.blake2b((signature or "").encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=False)
+
+
+def _prune_repeat_history(now: float, window_sec: int) -> None:
+    cutoff = now - max(window_sec, USER_MSG_24H_SEC)
+    stale_keys = [
+        key for key, last_ts in repeat_message_history_last.items()
+        if float(last_ts) < cutoff
+    ]
+    for key in stale_keys:
+        repeat_message_history.pop(key, None)
+        repeat_message_history_last.pop(key, None)
+    if len(repeat_message_history) < REPEAT_HISTORY_MAX_KEYS:
+        return
+    trim_count = max(1000, len(repeat_message_history) - REPEAT_HISTORY_MAX_KEYS + 1000)
+    for key in sorted(repeat_message_history_last, key=repeat_message_history_last.get)[:trim_count]:
+        repeat_message_history.pop(key, None)
+        repeat_message_history_last.pop(key, None)
+
+
 async def _handle_repeat_signature(message: Message, signature: str, repeat_label: str) -> bool:
     """按统一规则处理重复文字或重复媒体。"""
     user_id = message.from_user.id
@@ -2653,14 +2943,11 @@ async def _handle_repeat_signature(message: Message, signature: str, repeat_labe
     max_count = cfg.get("repeat_max_count", 3)
     ban_sec = cfg.get("repeat_ban_seconds", 86400)
     now = time.time()
-    key = (group_id, user_id, signature)
+    key = (group_id, user_id, _repeat_signature_hash(signature))
 
     if key not in repeat_message_history:
-        if len(repeat_message_history) >= REPEAT_HISTORY_MAX_KEYS:
-            for k in sorted(repeat_message_history_last.keys(), key=lambda k: repeat_message_history_last.get(k, 0))[:5000]:
-                repeat_message_history.pop(k, None)
-                repeat_message_history_last.pop(k, None)
-        repeat_message_history[key] = deque(maxlen=10)
+        _prune_repeat_history(now, window_sec)
+        repeat_message_history[key] = deque(maxlen=max(max_count + 2, 6))
     history = repeat_message_history[key]
     repeat_message_history_last[key] = now
 
@@ -2952,21 +3239,16 @@ def _message_link(chat_id: int, msg_id: int) -> str:
 async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg_id: int | None, keep_one_text: str = "", auto_delete_sec: int = 0):
     """删除该用户最近 24 小时内消息、机器人对其的警告，仅保留一条最终公告（带误封联系）。
     auto_delete_sec > 0 时，公告消息在指定秒数后自动删除。"""
-    key = (group_id, user_id)
-    now = time.time()
-    cutoff = now - USER_MSG_24H_SEC
     memory_changed = False
-    if key in user_recent_message_ids:
-        for msg_id, t, txt in list(user_recent_message_ids[key]):
-            if t >= cutoff:
-                # 被机器人删除的消息也作为广告样本学习
-                if txt:
-                    try:
-                        semantic_ad_detector.add_ad_sample(txt)
-                        memory_changed = _remember_forward_match(group_id, user_id, txt) or memory_changed
-                    except Exception as e:
-                        print(f"删除用户消息时学习样本失败: {e}")
-                await _delete_original_and_linked_reply(group_id, msg_id)
+    recent_msgs = await _recent_messages_fetch_by_user(group_id, user_id)
+    for msg_id, _ts, txt in recent_msgs:
+        if txt:
+            try:
+                semantic_ad_detector.add_ad_sample(txt)
+                memory_changed = _remember_forward_match(group_id, user_id, txt) or memory_changed
+            except Exception as e:
+                print(f"删除用户消息时学习样本失败: {e}")
+        await _delete_original_and_linked_reply(group_id, msg_id)
     if memory_changed:
         asyncio.create_task(save_forward_match_memory())
     to_remove = []
@@ -3114,12 +3396,8 @@ async def on_media_message(message: Message):
         }
 
 def _track_user_message(group_id: int, user_id: int, msg_id: int, text: str = ""):
-    """记录用户消息 id 和文本，用于 24 小时内可删并可学习"""
-    key = (group_id, user_id)
-    if key not in user_recent_message_ids:
-        user_recent_message_ids[key] = deque(maxlen=USER_MSG_TRACK_MAXLEN)
-    user_recent_message_ids[key].append((msg_id, time.time(), text or ""))
-    asyncio.create_task(save_recent_messages_cache())
+    """记录用户消息到 SQLite 队列，用于 24 小时内回溯删除与转发学习。"""
+    _queue_recent_message_upsert(group_id, user_id, msg_id, time.time(), text or "")
 
 
 def _track_bot_message(group_id: int, msg_id: int, auto_delete_sec: int = BOT_MSG_AUTO_DELETE_SEC):
@@ -3138,40 +3416,19 @@ def _track_group_reply(message: Message, reply: Message):
         pass
 
 
-def _is_original_message_still_tracked(group_id: int, original_msg_id: int | None) -> bool:
-    """检查原消息是否仍在本地最近消息缓存中。"""
+async def _is_original_message_still_tracked(group_id: int, original_msg_id: int | None) -> bool:
+    """检查原消息是否仍在最近消息存储中。"""
     if not original_msg_id:
         return False
-    for (gid, _uid), msgs in user_recent_message_ids.items():
-        if gid != group_id:
-            continue
-        for msg_id, _ts, _txt in msgs:
-            if msg_id == original_msg_id:
-                return True
-    return False
+    await _flush_recent_messages_writes()
+    return await _recent_message_exists(group_id, original_msg_id)
 
 
 def _forget_tracked_user_message(group_id: int, original_msg_id: int | None) -> None:
-    """从最近消息缓存中移除已删除的原消息。"""
+    """从最近消息存储中移除已删除的原消息。"""
     if not original_msg_id:
         return
-    changed = False
-    for key in list(user_recent_message_ids.keys()):
-        gid, _uid = key
-        if gid != group_id:
-            continue
-        msgs = user_recent_message_ids.get(key)
-        if not msgs:
-            continue
-        kept = [(msg_id, ts, txt) for msg_id, ts, txt in msgs if msg_id != original_msg_id]
-        if len(kept) != len(msgs):
-            changed = True
-            if kept:
-                user_recent_message_ids[key] = deque(kept, maxlen=USER_MSG_TRACK_MAXLEN)
-            else:
-                user_recent_message_ids.pop(key, None)
-    if changed:
-        asyncio.create_task(save_recent_messages_cache())
+    _queue_recent_message_delete(group_id, original_msg_id)
 
 
 async def _send_delayed_reply_if_original_exists(
@@ -3306,52 +3563,13 @@ def _get_only_group_id() -> int | None:
     return next(iter(GROUP_IDS))
 
 
-def _find_recent_user_ids_by_text(group_id: int, text: str, *, limit: int = 3) -> list[int]:
+async def _find_recent_user_ids_by_text(group_id: int, text: str, *, limit: int = 3) -> list[int]:
     """
-    在最近缓存里按文案反查用户。
+    在最近消息存储里按文案反查用户。
     单群转发学习时，Telegram 经常不给原始 user/chat 信息，这里做本地兜底。
     """
-    now = time.time()
-    cutoff = now - USER_MSG_24H_SEC
-    raw = (text or "").strip()
-    norm = _normalize_text(text)
-    if not raw and not norm:
-        return []
-
-    scored: list[tuple[float, int]] = []
-    for (gid, uid), msgs in user_recent_message_ids.items():
-        if gid != group_id:
-            continue
-        best_score = 0.0
-        best_ts = 0.0
-        for _, ts, msg_text in msgs:
-            if ts < cutoff or not msg_text:
-                continue
-            raw_msg = (msg_text or "").strip()
-            norm_msg = _normalize_text(msg_text)
-            score = 0.0
-            if raw and raw_msg == raw:
-                score = 1.0
-            elif norm and norm_msg == norm:
-                score = 0.95
-            elif raw and raw_msg and (raw in raw_msg or raw_msg in raw):
-                score = 0.80
-            elif norm and norm_msg and (norm in norm_msg or norm_msg in norm):
-                score = 0.75
-            if score > best_score or (score == best_score and ts > best_ts):
-                best_score = score
-                best_ts = ts
-        if best_score > 0:
-            scored.append((best_score + min(best_ts / 10**12, 0.001), uid))
-
-    scored.sort(reverse=True)
-    out: list[int] = []
-    for _, uid in scored:
-        if uid not in out:
-            out.append(uid)
-        if len(out) >= limit:
-            break
-    return out
+    await _flush_recent_messages_writes()
+    return await _recent_messages_find_user_ids_by_text(group_id, text, limit=limit)
 
 
 async def _delete_recent_messages_by_text(group_id: int, text: str) -> int:
@@ -3359,27 +3577,16 @@ async def _delete_recent_messages_by_text(group_id: int, text: str) -> int:
     当拿不到 user_id 时，退化为按同文案删除最近消息，并清掉对应机器人警告。
     返回删除的原消息条数。
     """
-    now = time.time()
-    cutoff = now - USER_MSG_24H_SEC
-    raw = (text or "").strip()
-    norm = _normalize_text(text)
-    if not raw and not norm:
-        return 0
-
+    await _flush_recent_messages_writes()
+    message_ids = await _recent_messages_delete_by_text(group_id, text)
     deleted = 0
     seen: set[int] = set()
-    for (gid, _uid), msgs in list(user_recent_message_ids.items()):
-        if gid != group_id:
+    for msg_id in message_ids:
+        if msg_id in seen:
             continue
-        for msg_id, ts, msg_text in list(msgs):
-            if ts < cutoff or not msg_text or msg_id in seen:
-                continue
-            raw_msg = (msg_text or "").strip()
-            norm_msg = _normalize_text(msg_text)
-            if raw and raw_msg == raw or norm and norm_msg == norm:
-                await _delete_original_and_linked_reply(group_id, msg_id)
-                seen.add(msg_id)
-                deleted += 1
+        await _delete_original_and_linked_reply(group_id, msg_id)
+        seen.add(msg_id)
+        deleted += 1
     return deleted
 
 
@@ -3591,7 +3798,7 @@ async def on_forward_learn_ad(message: Message):
             user_id = _get_remembered_user_id_by_text(group_id, text)
         if not user_id:
             # 2) 无 uid 时，在该群最近消息里按相同文案反查用户
-            matched_user_ids = _find_recent_user_ids_by_text(group_id, text, limit=3)
+            matched_user_ids = await _find_recent_user_ids_by_text(group_id, text, limit=3)
             if len(matched_user_ids) == 1:
                 user_id = matched_user_ids[0]
             elif len(matched_user_ids) > 1:
@@ -3604,7 +3811,7 @@ async def on_forward_learn_ad(message: Message):
         if user_id:
             try:
                 memory_changed = _remember_forward_match(group_id, user_id, text) or memory_changed
-                memory_changed = _remember_recent_user_texts(group_id, user_id) or memory_changed
+                memory_changed = await _remember_recent_user_texts(group_id, user_id) or memory_changed
                 await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
                 deleted_by_user = True
             except Exception as e:
@@ -4220,7 +4427,7 @@ async def cleanup_orphan_replies():
         if not items:
             continue
         for (group_id, bot_msg_id), (orig_msg_id, created_ts) in items:
-            if _is_original_message_still_tracked(group_id, orig_msg_id) and (now - float(created_ts)) < BOT_REPLY_ORPHAN_MAX_AGE_SEC:
+            if await _is_original_message_still_tracked(group_id, orig_msg_id) and (now - float(created_ts)) < BOT_REPLY_ORPHAN_MAX_AGE_SEC:
                 continue
             try:
                 await bot.delete_message(group_id, bot_msg_id)
@@ -4245,6 +4452,8 @@ async def main():
     await load_moderation_logs()
     load_repeat_levels()
     await load_media_stats()
+    asyncio.create_task(_recent_messages_flush_worker())
+    asyncio.create_task(_media_stats_flush_worker())
     asyncio.create_task(cleanup_bot_messages())
     asyncio.create_task(cleanup_deleted_messages())
     asyncio.create_task(cleanup_orphan_replies())
