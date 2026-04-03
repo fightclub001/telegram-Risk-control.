@@ -2,7 +2,6 @@ import asyncio
 import io
 import json
 import os
-import re
 import time
 import hashlib
 from copy import deepcopy
@@ -17,8 +16,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from join_approval_avatar_ocr import JoinApprovalAvatarOCR, AvatarResult as JoinApprovalAvatarResult
-from join_approval_risk_terms import JoinApprovalRiskTerms
-from join_approval_text_normalizer import normalize_text as join_normalize_text
 from semantic_ads import SemanticAdDetector
 
 # ==================== 环境配置 ====================
@@ -46,45 +43,30 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
-try:
-    from bot_admin import router as admin_router
-    dp.include_router(admin_router)
-except ImportError:
-    admin_router = None
 
 # ==================== 数据文件 ====================
 # 使用环境变量 DATA_DIR；Railway 需将 Volume 挂载到该路径（如 /data），重新部署后配置与名单才不丢失
-# 以下数据均持久化，重启不丢失：CONFIG_FILE（豁免名单 exempt_users、媒体白名单 media_unlock_whitelist、
-# 重复发言豁免词 repeat_exempt_keywords、各群关键词与开关等）；DATA_FILE 举报记录；MEDIA_STATS_FILE 合规数/助力/解锁
+# 以下数据均持久化，重启不丢失：CONFIG_FILE（核心面板配置）、DATA_FILE（进行中举报记录）、
+# MEDIA_STATS_FILE（合规消息数/解锁状态）、RECENT_MESSAGES_FILE（最近24小时消息缓存）。
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "reports.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-USER_VIOLATIONS_FILE = os.path.join(DATA_DIR, "user_violations.json")
 MEDIA_STATS_FILE = os.path.join(DATA_DIR, "media_stats.json")
 REPEAT_LEVEL_FILE = os.path.join(DATA_DIR, "repeat_levels.json")
-LINK_REF_LEVELS_FILE = os.path.join(DATA_DIR, "link_ref_levels.json")
 FORWARD_MATCH_FILE = os.path.join(DATA_DIR, "forward_match_memory.json")
 RECENT_MESSAGES_FILE = os.path.join(DATA_DIR, "recent_messages.json")
-REPORT_ACTIONS_FILE = os.path.join(DATA_DIR, "report_actions.json")
-AD_DELETE_SUMMARY_FILE = os.path.join(DATA_DIR, "ad_delete_summaries.json")
+JOIN_REVIEW_LOG_FILE = os.path.join(DATA_DIR, "join_review_logs.json")
+MOD_ACTION_LOG_FILE = os.path.join(DATA_DIR, "moderation_logs.json")
 
 reports = {}  # key: (group_id, message_id)
 lock = asyncio.Lock()
-user_violations = {}  # key: "gid_uid" -> { msg_id: { "time", "reporters": [] } }
 user_recent_message_ids = {}  # (group_id, user_id) -> deque of (msg_id, time, text), for 24h delete & learning
-mild_trigger_entries = {}  # (group_id, user_id) -> list of (orig_msg_id, warning_msg_id), max 3
 repeat_warning_msg_id = {}  # (group_id, user_id) -> msg_id of "2次" repeat warning, delete if orig deleted
-# 外部引用 / 消息链接：0=未触发过，1=已触发一次（下次永封）
-external_ref_level = {}  # (group_id, user_id) -> 0|1
-message_link_level = {}  # (group_id, user_id) -> 0|1
 config = {}
 forward_match_memory = {}  # normalized_text -> {"group_id": int, "user_id": int, "updated_at": int}
-report_action_state = {}  # key: "gid_uid" -> {"last_trigger_count": int, "last_trigger_at": int}
-pending_ad_delete_summaries = []  # recent AD delete events waiting for 10-item admin summary
-ad_delete_summary_lock = asyncio.Lock()
-# 媒体权限统计：合规消息数、同条超过10次不计数、已解锁名单、助力数（持久化到 MEDIA_STATS_FILE，重新部署须保留 DATA_DIR 卷）
-media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}, "boosts": {}}
+# 媒体权限统计：合规消息数、同条超过10次不计数、已解锁名单（持久化到 MEDIA_STATS_FILE）
+media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}}
 media_stats_loaded = False
 # 媒体消息举报/点赞（内存即可，按消息维度）
 media_reports = {}
@@ -95,17 +77,14 @@ pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "c
 MEDIA_GROUP_SETTLE_SEC = 1.2
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
-join_approval_terms = JoinApprovalRiskTerms(os.path.dirname(os.path.abspath(__file__)))
-join_approval_avatar_ocr = JoinApprovalAvatarOCR(join_approval_terms)
+join_approval_avatar_ocr = JoinApprovalAvatarOCR()
 JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "86400").strip()))
+JOIN_APPROVAL_OCR_CACHE_MAX = max(32, int((os.getenv("OCR_CACHE_MAX") or "256").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
 JOIN_APPROVAL_REQUEST_TIMEOUT = 10
-join_approval_avatar_cache = {}  # file_unique_id -> {ocr_text, normalized_text, is_text_avatar, chinese_char_count, total_char_count, matched_term, decision, timestamp}
-join_approval_review_batch = []
-JOIN_APPROVAL_BATCH_SIZE = 10
-# 召唤代发：未解锁用户发「召唤」后下一次媒体由机器人代发（避免炸群）
-summon_pending = {}  # (group_id, user_id) -> timestamp
-SUMMON_TIMEOUT_SEC = 300
+join_approval_avatar_cache = {}  # file_unique_id -> {ocr_text, normalized_text, is_text_avatar, chinese_char_count, total_char_count, matched_term, timestamp}
+join_review_logs = deque(maxlen=1000)
+moderation_logs = deque(maxlen=1000)
 # 无权限发媒体警告：同用户删上一条；(group_id, user_id) -> 上一条机器人警告 message_id
 last_media_no_perm_msg = {}
 MEDIA_NO_PERM_DELETE_AFTER_SEC = 60  # 不同用户的警告 1 分钟后自动删除
@@ -121,8 +100,9 @@ MISJUDGE_BOT_MENTION = "如有误封，请直接联系本群管理员处理。"
 USER_MSG_TRACK_MAXLEN = 500
 USER_MSG_24H_SEC = 24 * 3600
 BOT_MSG_AUTO_DELETE_SEC = 24 * 3600  # 机器人消息24小时后自动删除
+BOT_MESSAGE_SWEEP_SEC = 60
 
-# 机器人消息跟踪：(group_id, msg_id) -> timestamp
+# 机器人消息跟踪：(group_id, msg_id) -> expire_at
 bot_sent_messages = {}
 # 机器人在群里的“引用回复”跟踪：(group_id, bot_reply_msg_id) -> (original_msg_id, created_ts)
 bot_reply_links = {}
@@ -190,6 +170,14 @@ def _prune_join_approval_avatar_cache() -> None:
     ]
     for key in expired:
         join_approval_avatar_cache.pop(key, None)
+    if len(join_approval_avatar_cache) <= JOIN_APPROVAL_OCR_CACHE_MAX:
+        return
+    overflow = sorted(
+        join_approval_avatar_cache.items(),
+        key=lambda item: float(item[1].get("timestamp", 0)),
+    )[: len(join_approval_avatar_cache) - JOIN_APPROVAL_OCR_CACHE_MAX]
+    for key, _value in overflow:
+        join_approval_avatar_cache.pop(key, None)
 
 
 def _get_join_approval_avatar_cache(file_unique_id: str) -> JoinApprovalAvatarResult | None:
@@ -217,42 +205,26 @@ def _set_join_approval_avatar_cache(file_unique_id: str, result: JoinApprovalAva
         "chinese_char_count": result.chinese_char_count,
         "total_char_count": result.total_char_count,
         "matched_term": result.matched_term,
-        "decision": "decline" if result.matched_term else "approve",
         "timestamp": time.time(),
     }
     _prune_join_approval_avatar_cache()
 
 
-def _log_join_review(
-    *,
-    user_id: int,
-    chat_id: int,
-    nickname_match: str | None,
-    bio_match: str | None,
-    avatar_match: str | None,
-    final_decision: str,
-    reason: str,
-) -> None:
+def _log_join_review(*, user_id: int, chat_id: int, final_decision: str, reason: str) -> None:
     print(
         "join_review "
         f"user_id={user_id} chat_id={chat_id} "
-        f"nickname_match={nickname_match or '-'} "
-        f"bio_match={bio_match or '-'} "
-        f"avatar_match={avatar_match or '-'} "
         f"decision={final_decision} reason={reason}"
     )
 
 
 def _join_review_reason_text(reason: str) -> str:
     mapping = {
-        "nickname_risk_term": "昵称命中敏感词",
-        "bio_risk_term": "简介命中敏感词",
-        "avatar_text_risk_term": "头像OCR命中敏感词",
+        "avatar_text_avatar": "头像属于文字头像，拒绝入群",
         "avatar_ocr_disabled": "头像OCR未启用",
         "no_avatar": "没有头像",
         "avatar_not_text": "头像不是文字头像",
         "avatar_fetch_or_ocr_failed": "头像下载或OCR失败",
-        "avatar_ocr_no_match": "头像是文字头像，但文字不含敏感词",
         "avatar_profile_check_failed": "头像资料检查失败",
         "no_rule_hit": "未触发任何规则",
     }
@@ -268,141 +240,157 @@ def _format_join_review_user(user) -> str:
     return f"{safe_name} (ID {getattr(user, 'id', '-')})"
 
 
-async def _flush_join_review_batch_if_needed() -> None:
-    if len(join_approval_review_batch) < JOIN_APPROVAL_BATCH_SIZE:
-        return
-    batch = join_approval_review_batch[:JOIN_APPROVAL_BATCH_SIZE]
-    del join_approval_review_batch[:JOIN_APPROVAL_BATCH_SIZE]
-    lines = []
-    for idx, item in enumerate(batch, start=1):
-        lines.append(
-            f"{idx}. {item['user_label']} -> {item['decision_label']}\n"
-            f"   原因: {item['reason_label']}"
-        )
-    text = "入群审批汇总（10人）\n\n" + "\n".join(lines)
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text)
-        except Exception:
-            pass
+async def load_join_review_logs() -> None:
+    global join_review_logs
+    try:
+        if not os.path.exists(JOIN_REVIEW_LOG_FILE):
+            join_review_logs = deque(maxlen=1000)
+            return
+        with open(JOIN_REVIEW_LOG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, list):
+            raw = []
+        join_review_logs = deque(raw[-1000:], maxlen=1000)
+    except Exception as e:
+        print(f"join review logs load failed: {e}")
+        join_review_logs = deque(maxlen=1000)
 
 
-async def _record_join_review_batch(
+async def save_join_review_logs() -> None:
+    try:
+        with open(JOIN_REVIEW_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(join_review_logs), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"join review logs save failed: {e}")
+
+
+async def load_moderation_logs() -> None:
+    global moderation_logs
+    try:
+        if not os.path.exists(MOD_ACTION_LOG_FILE):
+            moderation_logs = deque(maxlen=1000)
+            return
+        with open(MOD_ACTION_LOG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, list):
+            raw = []
+        moderation_logs = deque(raw[-1000:], maxlen=1000)
+    except Exception as e:
+        print(f"moderation logs load failed: {e}")
+        moderation_logs = deque(maxlen=1000)
+
+
+async def save_moderation_logs() -> None:
+    try:
+        with open(MOD_ACTION_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(moderation_logs), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"moderation logs save failed: {e}")
+
+
+async def _record_join_review_log(
     *,
     user,
+    chat_id: int,
     final_decision: str,
     reason: str,
 ) -> None:
-    decision_label = "拒绝" if final_decision == "decline" else "通过"
-    join_approval_review_batch.append(
+    join_review_logs.append(
         {
+            "ts": int(time.time()),
+            "chat_id": chat_id,
             "user_label": _format_join_review_user(user),
-            "decision_label": decision_label,
+            "decision_label": "拒绝" if final_decision == "decline" else "通过",
             "reason_label": _join_review_reason_text(reason),
         }
     )
-    await _flush_join_review_batch_if_needed()
+    await save_join_review_logs()
 
 
-async def _notify_join_approval_startup_status() -> None:
-    status = "ENABLED" if join_approval_avatar_ocr.ocr_enabled else "DISABLED"
-    details = (
-        f"头像OCR: {status}\n"
-        f"OCR缓存TTL: {JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS} 秒\n"
-        f"DeclineAndBan: {'ON' if JOIN_APPROVAL_DECLINE_AND_BAN else 'OFF'}\n"
-        f"风险词数量: {len(join_approval_terms.terms)}"
+async def _record_moderation_log(
+    *,
+    group_id: int,
+    user_id: int,
+    user_label: str,
+    action: str,
+    reason: str,
+) -> None:
+    moderation_logs.append(
+        {
+            "ts": int(time.time()),
+            "group_id": group_id,
+            "user_id": user_id,
+            "user_label": user_label,
+            "action": action,
+            "reason": reason,
+        }
     )
-    text = "入群审批自检\n\n" + details
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text)
-        except Exception:
-            pass
+    await save_moderation_logs()
 
 
 @router.chat_join_request(F.chat.id.in_(GROUP_IDS))
 async def handle_chat_join_request(join_request: ChatJoinRequest):
-    """Lightweight join approval: nickname -> bio -> avatar OCR."""
+    """Join approval: only reject text avatars; no nickname/bio screening."""
     user = join_request.from_user
     user_id = user.id
     chat_id = join_request.chat.id
-    nickname_match = None
-    bio_match = None
-    avatar_match = None
     final_decision = "approve"
     reason = "no_rule_hit"
 
-    nickname_text = "".join(
-        part for part in (user.first_name, user.last_name, user.username) if part
-    )
-    nickname_match = join_approval_terms.match(nickname_text)
-    if nickname_match:
-        final_decision = "decline"
-        reason = "nickname_risk_term"
+    if not join_approval_avatar_ocr.ocr_enabled:
+        reason = "avatar_ocr_disabled"
     else:
-        bio_match = join_approval_terms.match(getattr(join_request, "bio", "") or "")
-        if bio_match:
-            final_decision = "decline"
-            reason = "bio_risk_term"
-
-    if final_decision == "approve":
-        if not join_approval_avatar_ocr.ocr_enabled:
-            reason = "avatar_ocr_disabled"
-        else:
-            try:
-                photos = await bot.get_user_profile_photos(
-                    user_id=user_id,
-                    limit=1,
-                    **_join_approval_timeout_kwargs(),
-                )
-                if photos.total_count <= 0 or not photos.photos or not photos.photos[0]:
-                    reason = "no_avatar"
-                else:
-                    largest = photos.photos[0][-1]
-                    cached_result = _get_join_approval_avatar_cache(largest.file_unique_id)
-                    avatar_result = cached_result
-                    if avatar_result is None:
-                        try:
-                            tg_file = await bot.get_file(
-                                largest.file_id,
-                                **_join_approval_timeout_kwargs(),
-                            )
-                            if not tg_file.file_path:
-                                raise ValueError("empty file_path")
-                            downloaded = await bot.download_file(
-                                tg_file.file_path,
-                                timeout=JOIN_APPROVAL_REQUEST_TIMEOUT,
-                            )
-                            if downloaded is None:
-                                raise ValueError("avatar download returned None")
-                            if isinstance(downloaded, io.BytesIO):
-                                image_bytes = downloaded.getvalue()
-                            else:
-                                image_bytes = downloaded.read()
-                            avatar_result = join_approval_avatar_ocr.analyze_avatar(image_bytes)
-                            _set_join_approval_avatar_cache(largest.file_unique_id, avatar_result)
-                        except Exception as e:
-                            reason = "avatar_fetch_or_ocr_failed"
-                            print(f"join avatar fetch/ocr failed user_id={user_id}: {e}")
-                            avatar_result = None
-                    if avatar_result:
-                        print(
-                            "join_avatar_ocr "
-                            f"user_id={user_id} chat_id={chat_id} "
-                            f"text={avatar_result.extracted_text!r} "
-                            f"normalized={avatar_result.normalized_text!r} "
-                            f"is_text_avatar={avatar_result.is_text_avatar} "
-                            f"matched={avatar_result.matched_term or '-'}"
+        try:
+            photos = await bot.get_user_profile_photos(
+                user_id=user_id,
+                limit=1,
+                **_join_approval_timeout_kwargs(),
+            )
+            if photos.total_count <= 0 or not photos.photos or not photos.photos[0]:
+                reason = "no_avatar"
+            else:
+                largest = photos.photos[0][-1]
+                avatar_result = _get_join_approval_avatar_cache(largest.file_unique_id)
+                if avatar_result is None:
+                    try:
+                        tg_file = await bot.get_file(
+                            largest.file_id,
+                            **_join_approval_timeout_kwargs(),
                         )
-                    if avatar_result and avatar_result.is_text_avatar and avatar_result.matched_term:
-                        avatar_match = avatar_result.matched_term
+                        if not tg_file.file_path:
+                            raise ValueError("empty file_path")
+                        downloaded = await bot.download_file(
+                            tg_file.file_path,
+                            timeout=JOIN_APPROVAL_REQUEST_TIMEOUT,
+                        )
+                        if downloaded is None:
+                            raise ValueError("avatar download returned None")
+                        image_bytes = downloaded.getvalue() if isinstance(downloaded, io.BytesIO) else downloaded.read()
+                        avatar_result = await asyncio.to_thread(
+                            join_approval_avatar_ocr.analyze_avatar,
+                            image_bytes,
+                        )
+                        _set_join_approval_avatar_cache(largest.file_unique_id, avatar_result)
+                    except Exception as e:
+                        reason = "avatar_fetch_or_ocr_failed"
+                        print(f"join avatar fetch/ocr failed user_id={user_id}: {e}")
+                        avatar_result = None
+                if avatar_result:
+                    print(
+                        "join_avatar_ocr "
+                        f"user_id={user_id} chat_id={chat_id} "
+                        f"text={avatar_result.extracted_text!r} "
+                        f"normalized={avatar_result.normalized_text!r} "
+                        f"is_text_avatar={avatar_result.is_text_avatar}"
+                    )
+                    if avatar_result.is_text_avatar:
                         final_decision = "decline"
-                        reason = "avatar_text_risk_term"
-                    elif avatar_result:
-                        reason = "avatar_not_text" if not avatar_result.is_text_avatar else "avatar_ocr_no_match"
-            except Exception as e:
-                reason = "avatar_profile_check_failed"
-                print(f"join profile photo check failed user_id={user_id}: {e}")
+                        reason = "avatar_text_avatar"
+                    else:
+                        reason = "avatar_not_text"
+        except Exception as e:
+            reason = "avatar_profile_check_failed"
+            print(f"join profile photo check failed user_id={user_id}: {e}")
 
     try:
         if final_decision == "decline":
@@ -430,54 +418,29 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
         _log_join_review(
             user_id=user_id,
             chat_id=chat_id,
-            nickname_match=nickname_match,
-            bio_match=bio_match,
-            avatar_match=avatar_match,
             final_decision=final_decision,
             reason=reason,
         )
-        await _record_join_review_batch(
+        await _record_join_review_log(
             user=user,
+            chat_id=chat_id,
             final_decision=final_decision,
             reason=reason,
         )
 
 # ==================== 配置函数 ====================
 def _default_group_config():
-    """单群默认配置（关键词等会随管理员编辑持久化到 CONFIG_FILE）"""
+    """单群默认配置：仅保留当前生产仍需的核心功能。"""
     return {
         "enabled": True,
-        "display_keywords": ["加v", "加微信", "加qq", "加扣", "福利加", "约", "约炮", "资源私聊", "私我", "私聊我", "飞机", "纸飞机", "福利", "外围", "反差", "嫩模", "学生妹", "空姐", "人妻", "熟女", "onlyfans", "of", "leak", "nudes", "十八+", "av"],
-        "check_display_keywords": True,
-        "message_keywords": ["qq:", "qq号", "微信", "wx:", "幼女", "萝莉", "福利", "约炮", "onlyfans"],
-        "check_message_keywords": True,
-        "message_keyword_normalize": True,  # 防拼字规避：忽略空格标点后匹配（如 A  bc，D 命中 abcd）
-        "short_msg_detection": True,
-        "short_msg_threshold": 3,
-        "min_consecutive_count": 2,
-        "time_window_seconds": 60,
-        "fill_garbage_detection": True,
-        "fill_garbage_min_raw_len": 12,
-        "fill_garbage_max_clean_len": 8,
-        "fill_space_ratio": 0.30,
-        "report_history_threshold": 3,
-        "report_history_mute_hours": 24,
-        "report_history_whitelist": [],
-        "exempt_users": [],  # 管理员手动维护的豁免（与发图权限无关）
-        "misjudge_whitelist": [],  # 仅管理员点击「误判」后加入，豁免多层内容检测
-        "mild_exempt_whitelist": [],  # 轻度触发豁免名单（管理员通过私聊按钮设置）
         "repeat_window_seconds": 2 * 3600,
         "repeat_max_count": 3,
         "repeat_ban_seconds": 86400,
         "repeat_exempt_keywords": [],  # 含任一词的消息不触发重复发言检测（白名单词）
         "media_unlock_msg_count": 50,
-        "media_unlock_boosts": 4,
-        "media_unlock_whitelist": [],
         "media_report_cooldown_sec": 20 * 60,
         "media_report_max_per_day": 3,
-        "media_report_delete_threshold": 3,
-        "media_rules_broadcast": True,
-        "media_rules_broadcast_interval_minutes": 120,
+        "media_report_delete_threshold": 2,
         "semantic_ad_enabled": False,
     }
 
@@ -499,9 +462,32 @@ async def load_config():
                     "check_bio_link",
                     "bio_keywords",
                     "check_bio_keywords",
+                    "check_display_keywords",
+                    "display_keywords",
+                    "check_message_keywords",
+                    "message_keywords",
                     "check_message_link",
+                    "message_keyword_normalize",
+                    "short_msg_detection",
+                    "short_msg_threshold",
+                    "min_consecutive_count",
+                    "time_window_seconds",
+                    "fill_garbage_detection",
+                    "fill_garbage_min_raw_len",
+                    "fill_garbage_max_clean_len",
+                    "fill_space_ratio",
                     "violation_mute_hours",
                     "reported_message_threshold",
+                    "report_history_mute_hours",
+                    "report_history_threshold",
+                    "report_history_whitelist",
+                    "exempt_users",
+                    "misjudge_whitelist",
+                    "mild_exempt_whitelist",
+                    "media_unlock_boosts",
+                    "media_unlock_whitelist",
+                    "media_rules_broadcast",
+                    "media_rules_broadcast_interval_minutes",
                     "autoreply",
                 ):
                     saved.pop(obsolete_key, None)
@@ -527,57 +513,6 @@ async def save_config():
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"配置保存失败: {e}")
-
-async def load_user_violations():
-    global user_violations
-    try:
-        if os.path.exists(USER_VIOLATIONS_FILE):
-            with open(USER_VIOLATIONS_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            user_violations = {}
-            for key, entries in raw.items():
-                user_violations[key] = {}
-                for msg_id, v in (entries or {}).items():
-                    vv = dict(v)
-                    if "reporters" in vv and isinstance(vv["reporters"], list):
-                        vv["reporters"] = set(vv["reporters"])
-                    user_violations[key][msg_id] = vv
-    except Exception as e:
-        print(f"违规记录加载失败: {e}")
-
-def _prune_user_violations():
-    """保留每用户最近 50 条且 30 天内的举报记录，避免文件无限增长"""
-    now = time.time()
-    cutoff = now - 30 * 86400
-    for key in list(user_violations.keys()):
-        entries = user_violations.get(key, {})
-        if not isinstance(entries, dict):
-            continue
-        items = [(k, v) for k, v in entries.items() if (v.get("time") or 0) >= cutoff]
-        items.sort(key=lambda x: x[1].get("time", 0), reverse=True)
-        out = {}
-        for k, v in items[:50]:
-            vv = dict(v)
-            if "reporters" in vv and isinstance(vv["reporters"], set):
-                vv["reporters"] = list(vv["reporters"])
-            out[k] = vv
-        user_violations[key] = out
-
-async def save_user_violations():
-    try:
-        _prune_user_violations()
-        to_save = {}
-        for key, entries in user_violations.items():
-            to_save[key] = {}
-            for msg_id, v in entries.items():
-                vv = dict(v)
-                if "reporters" in vv and isinstance(vv["reporters"], set):
-                    vv["reporters"] = list(vv["reporters"])
-                to_save[key][msg_id] = vv
-        with open(USER_VIOLATIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(to_save, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"违规记录保存失败: {e}")
 
 async def load_forward_match_memory():
     global forward_match_memory
@@ -606,46 +541,6 @@ async def save_forward_match_memory():
             json.dump(forward_match_memory, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"forward match memory save failed: {e}")
-
-async def load_report_action_state():
-    global report_action_state
-    try:
-        if os.path.exists(REPORT_ACTIONS_FILE):
-            with open(REPORT_ACTIONS_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            report_action_state = raw if isinstance(raw, dict) else {}
-        else:
-            report_action_state = {}
-    except Exception as e:
-        print(f"report action state load failed: {e}")
-        report_action_state = {}
-
-async def save_report_action_state():
-    try:
-        with open(REPORT_ACTIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(report_action_state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"report action state save failed: {e}")
-
-async def load_ad_delete_summaries():
-    global pending_ad_delete_summaries
-    try:
-        if os.path.exists(AD_DELETE_SUMMARY_FILE):
-            with open(AD_DELETE_SUMMARY_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            pending_ad_delete_summaries = raw if isinstance(raw, list) else []
-        else:
-            pending_ad_delete_summaries = []
-    except Exception as e:
-        print(f"ad delete summary load failed: {e}")
-        pending_ad_delete_summaries = []
-
-async def save_ad_delete_summaries():
-    try:
-        with open(AD_DELETE_SUMMARY_FILE, "w", encoding="utf-8") as f:
-            json.dump(pending_ad_delete_summaries, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"ad delete summary save failed: {e}")
 
 def _prune_recent_messages_cache():
     cutoff = time.time() - USER_MSG_24H_SEC
@@ -716,8 +611,9 @@ async def load_media_stats():
                 "message_counts": data.get("message_counts", {}),
                 "text_counts": data.get("text_counts", {}),
                 "unlocked": data.get("unlocked", {}),
-                "boosts": data.get("boosts", {}),
             }
+        else:
+            media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}}
         media_stats_loaded = True
     except Exception as e:
         print(f"媒体统计加载失败: {e}（本次运行不写入，避免覆盖磁盘原有数据）")
@@ -758,121 +654,38 @@ async def save_repeat_levels():
         print(f"重复违规级别保存失败: {e}")
 
 
-def load_link_ref_levels():
-    global external_ref_level, message_link_level
-    try:
-        if os.path.exists(LINK_REF_LEVELS_FILE):
-            with open(LINK_REF_LEVELS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            external_ref_level = {}
-            for k, v in (data.get("external_ref") or {}).items():
-                parts = k.split("_", 1)
-                if len(parts) == 2:
-                    try:
-                        external_ref_level[(int(parts[0]), int(parts[1]))] = int(v)
-                    except ValueError:
-                        pass
-            message_link_level = {}
-            for k, v in (data.get("message_link") or {}).items():
-                parts = k.split("_", 1)
-                if len(parts) == 2:
-                    try:
-                        message_link_level[(int(parts[0]), int(parts[1]))] = int(v)
-                    except ValueError:
-                        pass
-    except Exception as e:
-        print(f"链接/引用级别加载失败: {e}")
-
-
-async def save_link_ref_levels():
-    try:
-        data = {
-            "external_ref": {f"{g}_{u}": v for (g, u), v in external_ref_level.items()},
-            "message_link": {f"{g}_{u}": v for (g, u), v in message_link_level.items()},
-        }
-        with open(LINK_REF_LEVELS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception as e:
-        print(f"链接/引用级别保存失败: {e}")
-
-
 def _media_key(group_id: int, user_id: int) -> str:
     return f"{group_id}_{user_id}"
 
-async def _refresh_user_boosts(group_id: int, user_id: int) -> None:
-    """用 Telegram API 拉取用户对本群的助力数并写回 media_stats（仅会员可助力）"""
-    if not media_stats_loaded:
-        return
-    try:
-        res = await bot.get_user_chat_boosts(chat_id=group_id, user_id=user_id)
-        count = len(getattr(res, "boosts", []) or [])
-        key = _media_key(group_id, user_id)
-        media_stats["boosts"][key] = count
-        await save_media_stats()
 
-        # 如果助力数已达到解锁条件，则标记为已解锁并尝试恢复其发媒体权限
-        cfg = get_group_config(group_id)
-        need_boosts = cfg.get("media_unlock_boosts", 4)
-        if count >= need_boosts and not media_stats["unlocked"].get(key):
-            media_stats["unlocked"][key] = True
-            await save_media_stats()
-            try:
-                await bot.restrict_chat_member(
-                    chat_id=group_id,
-                    user_id=user_id,
-                    permissions=ChatPermissions(
-                        can_send_messages=True,
-                        can_send_media_messages=True,
-                        can_send_polls=True,
-                        can_send_other_messages=True,
-                        can_add_web_page_previews=True,
-                        can_change_info=False,
-                        can_invite_users=True,
-                        can_pin_messages=False,
-                    ),
-                )
-            except Exception:
-                # 恢复权限失败不会影响后续解锁判断
-                pass
-    except Exception:
-        pass
+def _media_text_fingerprint(normalized_text: str) -> str:
+    """用短哈希代替原文存储媒体解锁计数，降低内存和落盘体积。"""
+    return hashlib.blake2b(normalized_text.encode("utf-8"), digest_size=8).hexdigest()
 
 def _can_send_media(group_id: int, user_id: int, username: str | None = None) -> bool:
-    """是否已解锁发媒体：仅看本处媒体解锁白名单 / 合规消息数 / 助力次数（与豁免检测 exempt_users 无关）。"""
-    cfg = get_group_config(group_id)
-    wl = cfg.get("media_unlock_whitelist", [])
-    if not isinstance(wl, list):
-        wl = []
-    sid = str(user_id)
-    if sid in wl:
-        return True
-    if username:
-        un = (username or "").strip().lstrip("@").lower()
-        if un and any(un == (x.strip().lstrip("@").lower()) for x in wl if isinstance(x, str) and not x.isdigit()):
-            return True
+    """是否已解锁发媒体：仅看合规文本累计是否达到阈值。"""
     key = _media_key(group_id, user_id)
     if media_stats["unlocked"].get(key):
-        return True
-    need_boosts = cfg.get("media_unlock_boosts", 4)
-    if media_stats["boosts"].get(key, 0) >= need_boosts:
         return True
     return False
 
 async def _increment_media_count(group_id: int, user_id: int, normalized_text: str) -> bool:
-    """合规消息计数（同一条超过 10 次不计数）。已解锁=满50条/白名单/助力的用户不再统计（不含一发图就被删的用户，避免逻辑循环）。返回是否因本次达到阈值而刚解锁。"""
+    """合规消息计数（同一条超过 10 次不计数）。达到阈值后解锁媒体权限。"""
     cfg = get_group_config(group_id)
     need_count = cfg.get("media_unlock_msg_count", 50)
     key = _media_key(group_id, user_id)
     if media_stats["unlocked"].get(key):  # 已能发媒体，不再统计
         return False
     tc = media_stats["text_counts"].setdefault(key, {})
-    if tc.get(normalized_text, 0) >= 10:
+    fp = _media_text_fingerprint(normalized_text)
+    if tc.get(fp, 0) >= 10:
         return False
-    tc[normalized_text] = tc.get(normalized_text, 0) + 1
+    tc[fp] = tc.get(fp, 0) + 1
     count = media_stats["message_counts"].get(key, 0) + 1
     media_stats["message_counts"][key] = count
     if count >= need_count:
         media_stats["unlocked"][key] = True
+        media_stats["text_counts"].pop(key, None)
         await save_media_stats()
         return True
     await save_media_stats()
@@ -1025,11 +838,11 @@ async def get_group_list_keyboard(bot):
 def get_group_menu_keyboard(group_id: int):
     buttons = [
         [InlineKeyboardButton(text="🧠 AD机器学习", callback_data=f"submenu_semantic_ad:{group_id}")],
-        [InlineKeyboardButton(text="⏱️ 短消息/垃圾", callback_data=f"submenu_short:{group_id}")],
-        [InlineKeyboardButton(text="⚠️ 举报处罚", callback_data=f"submenu_violation:{group_id}")],
         [InlineKeyboardButton(text="🔁 重复发言", callback_data=f"submenu_repeat:{group_id}")],
         [InlineKeyboardButton(text="📎 媒体权限", callback_data=f"submenu_media_perm:{group_id}")],
         [InlineKeyboardButton(text="📣 媒体举报", callback_data=f"submenu_media_report:{group_id}")],
+        [InlineKeyboardButton(text="🚪 入群审批记录", callback_data=f"view_join_logs:{group_id}:0")],
+        [InlineKeyboardButton(text="📝 处理记录", callback_data=f"view_mod_logs:{group_id}:0")],
         [InlineKeyboardButton(text="🎛️ 基础设置", callback_data=f"submenu_basic:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1103,37 +916,35 @@ def get_semantic_ad_menu_keyboard(group_id: int):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_violation_menu_keyboard(group_id: int):
-    cfg = get_group_config(group_id)
-    mute_h = cfg.get("report_history_mute_hours", 24)
-    mute_sec = mute_h * 3600
-    whitelist = cfg.get("report_history_whitelist", []) or []
-    whitelist_count = len(whitelist) if isinstance(whitelist, list) else 0
-    buttons = [
-        [InlineKeyboardButton(text=f"🔇 禁言时长: {fmt_duration(mute_sec)}", callback_data=f"edit_mute:{group_id}")],
-        [InlineKeyboardButton(text=f"阈值: {cfg.get('report_history_threshold', 3)}", callback_data=f"edit_report_threshold:{group_id}")],
-        [InlineKeyboardButton(text=f"豁免白名单: {whitelist_count}", callback_data=f"edit_report_whitelist:{group_id}")],
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="该功能已下线", callback_data="noop")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    ])
 
 def get_basic_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     enabled = "✅" if cfg.get("enabled") else "❌"
-    exempt = cfg.get("exempt_users") or []
-    n = len(exempt) if isinstance(exempt, list) else 0
     buttons = [
         [InlineKeyboardButton(text=f"状态: {enabled}", callback_data=f"toggle_group:{group_id}")],
-        [InlineKeyboardButton(text=f"🛡️ 豁免用户 ({n})", callback_data=f"submenu_exempt:{group_id}")],
         [InlineKeyboardButton(text="📄 导出监听日志（近10条）", callback_data=f"export_listen_log:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_exempt_menu_keyboard(group_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 编辑", callback_data=f"edit_exempt:{group_id}")],
-        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_basic:{group_id}")],
-    ])
+
+def _build_log_pager(prefix: str, group_id: int, page: int, total: int, page_size: int = 10) -> InlineKeyboardMarkup:
+    last_page = max(0, (max(total, 1) - 1) // page_size)
+    page = max(0, min(page, last_page))
+    buttons = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"{prefix}:{group_id}:{page-1}"))
+    if page < last_page:
+        nav.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"{prefix}:{group_id}:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_repeat_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
@@ -1154,52 +965,17 @@ def get_repeat_menu_keyboard(group_id: int):
 def get_media_perm_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     msg = cfg.get("media_unlock_msg_count", 50)
-    boost = cfg.get("media_unlock_boosts", 4)
-    wl = cfg.get("media_unlock_whitelist", [])
-    n = len(wl) if isinstance(wl, list) else 0
-    broadcast_on = "✅" if cfg.get("media_rules_broadcast", True) else "❌"
-    interval = cfg.get("media_rules_broadcast_interval_minutes", 120)
     buttons = [
         [InlineKeyboardButton(text=f"解锁所需消息数: {msg}", callback_data=f"edit_media_msg:{group_id}")],
-        [InlineKeyboardButton(text=f"解锁所需助力: {boost}", callback_data=f"edit_media_boosts:{group_id}")],
-        [InlineKeyboardButton(text=f"📋 媒体解锁白名单 ({n})", callback_data=f"submenu_media_whitelist:{group_id}")],
-        [InlineKeyboardButton(text=f"规则广播: {broadcast_on}", callback_data=f"toggle_media_broadcast:{group_id}")],
-        [InlineKeyboardButton(text=f"广播间隔: {interval}分钟", callback_data=f"edit_media_broadcast_interval:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_media_whitelist_keyboard(group_id: int, page: int = 0):
-    cfg = get_group_config(group_id)
-    wl = cfg.get("media_unlock_whitelist", [])
-    if not isinstance(wl, list):
-        wl = []
-    page_size = 15
-    total = len(wl)
-    max_page = max(0, (total - 1) // page_size) if total else 0
-    page = max(0, min(page, max_page))
-    start = page * page_size
-    end = start + page_size
-    buttons = []
-    for i, v in enumerate(wl[start:end], start=start):
-        s = str(v)[:30]
-        buttons.append([InlineKeyboardButton(text=f"❌ {s}", callback_data=f"remove_mw:{group_id}:{i}:{page}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"submenu_media_whitelist:{group_id}:{page-1}"))
-    if page < max_page:
-        nav.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"submenu_media_whitelist:{group_id}:{page+1}"))
-    if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton(text="➕ 添加", callback_data=f"add_media_whitelist:{group_id}:{page}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_media_perm:{group_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_media_report_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     cooldown = cfg.get("media_report_cooldown_sec", 20 * 60)
     max_day = cfg.get("media_report_max_per_day", 3)
-    del_th = cfg.get("media_report_delete_threshold", 3)
+    del_th = cfg.get("media_report_delete_threshold", 2)
     buttons = [
         [InlineKeyboardButton(text=f"⏱ 连续举报冷却: {fmt_duration(cooldown)}", callback_data=f"edit_media_cooldown:{group_id}")],
         [InlineKeyboardButton(text=f"每日举报上限: {max_day}次", callback_data=f"edit_media_maxday:{group_id}")],
@@ -1374,6 +1150,71 @@ async def semantic_ad_submenu(callback: CallbackQuery):
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("view_join_logs:"), F.from_user.id.in_(ADMIN_IDS))
+async def view_join_logs(callback: CallbackQuery):
+    try:
+        _, group_id_str, page_str = callback.data.split(":", 2)
+        group_id = int(group_id_str)
+        page = max(0, int(page_str))
+        page_size = 10
+        items = list(join_review_logs)
+        items.reverse()
+        start = page * page_size
+        chunk = items[start : start + page_size]
+        if not chunk:
+            text = "🚪 入群审批记录\n\n暂无记录。"
+        else:
+            lines = []
+            for idx, item in enumerate(chunk, start=1 + start):
+                ts = time.strftime("%m-%d %H:%M", time.localtime(int(item.get("ts", 0) or 0)))
+                lines.append(
+                    f"{idx}. [{ts}] {item.get('user_label', '-')}\n"
+                    f"   结果: {item.get('decision_label', '-')}\n"
+                    f"   原因: {item.get('reason_label', '-')}"
+                )
+            text = "🚪 入群审批记录\n\n" + "\n".join(lines)
+        kb = _build_log_pager("view_join_logs", group_id, page, len(items), page_size)
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("view_mod_logs:"), F.from_user.id.in_(ADMIN_IDS))
+async def view_mod_logs(callback: CallbackQuery):
+    try:
+        _, group_id_str, page_str = callback.data.split(":", 2)
+        group_id = int(group_id_str)
+        page = max(0, int(page_str))
+        page_size = 10
+        items = list(moderation_logs)
+        items.reverse()
+        start = page * page_size
+        chunk = items[start : start + page_size]
+        if not chunk:
+            text = "📝 处理记录\n\n暂无记录。"
+        else:
+            lines = []
+            for idx, item in enumerate(chunk, start=1 + start):
+                ts = time.strftime("%m-%d %H:%M", time.localtime(int(item.get("ts", 0) or 0)))
+                lines.append(
+                    f"{idx}. [{ts}] {item.get('user_label', '-')}\n"
+                    f"   动作: {item.get('action', '-')}\n"
+                    f"   原因: {item.get('reason', '-')}"
+                )
+            text = "📝 处理记录\n\n" + "\n".join(lines)
+        kb = _build_log_pager("view_mod_logs", group_id, page, len(items), page_size)
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data == "noop", F.from_user.id.in_(ADMIN_IDS))
+async def noop_callback(callback: CallbackQuery):
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("toggle_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
@@ -2055,139 +1896,34 @@ async def process_fill_min(message: Message, state: FSMContext):
 # ==================== 违规处理 ====================
 @router.callback_query(F.data.startswith("submenu_violation:"), F.from_user.id.in_(ADMIN_IDS))
 async def violation_submenu(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        mute_hours = cfg.get("report_history_mute_hours", 24)
-        mute_sec = mute_hours * 3600
-        threshold = cfg.get("report_history_threshold", 3)
-        whitelist = cfg.get("report_history_whitelist", []) or []
-        whitelist_count = len(whitelist) if isinstance(whitelist, list) else 0
-        text = (
-            f"<b>{title}</b> › 举报处罚\n\n"
-            f"🔇 禁言: {fmt_duration(mute_sec)}\n"
-            f"触发: {threshold} 条历史举报\n"
-            f"📋 豁免白名单: {whitelist_count} 人"
-        )
-        kb = get_violation_menu_keyboard(group_id)
-        await callback.message.edit_text(text, reply_markup=kb)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("历史举报处罚已下线。", show_alert=True)
 
 @router.callback_query(F.data.startswith("edit_mute:"), F.from_user.id.in_(ADMIN_IDS))
 async def edit_mute_hours(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        current = cfg.get("report_history_mute_hours", 24)
-        text = f"禁言时长小时数（当前: {current}）："
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditMuteHours)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("历史举报处罚已下线。", show_alert=True)
 
 @router.message(StateFilter(AdminStates.EditMuteHours), F.from_user.id.in_(ADMIN_IDS))
 async def process_mute_hours(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        old_h = cfg.get("report_history_mute_hours", 24)
-        value = int(message.text.strip())
-        apply_global_config_value("report_history_mute_hours", value)
-        await save_config()
-        kb = get_violation_menu_keyboard(group_id)
-        await message.reply(f"✅ 已更新全局举报禁言时长: {old_h}h → {value}h", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except ValueError:
-        await message.reply("❌ 请输入数字")
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
+    await state.set_state(AdminStates.GroupMenu)
+    await message.reply("历史举报处罚已下线。")
 
 @router.callback_query(F.data.startswith("edit_report_threshold:"), F.from_user.id.in_(ADMIN_IDS))
 async def edit_report_threshold(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        current = cfg.get("report_history_threshold", 3)
-        text = f"触发禁言的举报数（当前: {current}）："
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditReportedThreshold)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("历史举报处罚已下线。", show_alert=True)
 
 @router.message(StateFilter(AdminStates.EditReportedThreshold), F.from_user.id.in_(ADMIN_IDS))
 async def process_report_threshold(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        value = int(message.text.strip())
-        apply_global_config_value("report_history_threshold", value)
-        await save_config()
-        kb = get_violation_menu_keyboard(group_id)
-        await message.reply(f"✅ 已更新全局举报触发阈值为 {value}", reply_markup=kb)
-        await state.set_state(AdminStates.GroupMenu)
-    except ValueError:
-        await message.reply("❌ 请输入数字")
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
+    await state.set_state(AdminStates.GroupMenu)
+    await message.reply("历史举报处罚已下线。")
 
 @router.callback_query(F.data.startswith("edit_report_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
 async def edit_report_whitelist(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        whitelist = cfg.get("report_history_whitelist", []) or []
-        if not isinstance(whitelist, list):
-            whitelist = []
-        current = "\n".join(str(item) for item in whitelist) if whitelist else "（空）"
-        text = (
-            "编辑举报处罚豁免白名单\n"
-            "每行一个用户ID或用户名，发送 /clear 可清空。\n\n"
-            f"当前列表：\n{current}"
-        )
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditReportHistoryWhitelist)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("历史举报处罚已下线。", show_alert=True)
 
 @router.message(StateFilter(AdminStates.EditReportHistoryWhitelist), F.from_user.id.in_(ADMIN_IDS))
 async def process_report_history_whitelist(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        if (message.text or "").strip() == "/clear":
-            apply_global_config_value("report_history_whitelist", [])
-            await save_config()
-            await message.reply("✅ 已清空举报处罚豁免白名单", reply_markup=get_violation_menu_keyboard(group_id))
-        else:
-            current = get_global_config().get("report_history_whitelist", []) or []
-            if not isinstance(current, list):
-                current = []
-            additions = [line.strip() for line in (message.text or "").splitlines() if line.strip()]
-            merged = list(current)
-            for item in additions:
-                if item not in merged:
-                    merged.append(item)
-            apply_global_config_value("report_history_whitelist", merged)
-            await save_config()
-            await message.reply(
-                f"✅ 已更新举报处罚豁免白名单，当前 {len(merged)} 项",
-                reply_markup=get_violation_menu_keyboard(group_id),
-            )
-        await state.set_state(AdminStates.GroupMenu)
-    except ValueError:
-        await message.reply("❌ 请输入数字")
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
+    await state.set_state(AdminStates.GroupMenu)
+    await message.reply("历史举报处罚已下线。")
 
 # ==================== 重复发言 ====================
 @router.callback_query(F.data.startswith("submenu_repeat:"), F.from_user.id.in_(ADMIN_IDS))
@@ -2335,8 +2071,7 @@ async def media_perm_submenu(callback: CallbackQuery):
         title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         msg = cfg.get("media_unlock_msg_count", 50)
-        boost = cfg.get("media_unlock_boosts", 4)
-        text = f"<b>{title}</b> › 媒体权限\n\n解锁所需消息: {msg}\n解锁所需助力: {boost}"
+        text = f"<b>{title}</b> › 媒体权限\n\n解锁所需合规消息: {msg}"
         kb = get_media_perm_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -2371,166 +2106,42 @@ async def process_media_msg(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("edit_media_boosts:"), F.from_user.id.in_(ADMIN_IDS))
 async def edit_media_boosts(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        current = cfg.get("media_unlock_boosts", 4)
-        await callback.message.edit_text(f"解锁发媒体所需助力次数（当前: {current}）：", reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditMediaUnlockBoosts)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("助力解锁已下线，媒体权限仅按合规文本条数解锁。", show_alert=True)
 
 @router.message(StateFilter(AdminStates.EditMediaUnlockBoosts), F.from_user.id.in_(ADMIN_IDS))
 async def process_media_boosts(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        cfg["media_unlock_boosts"] = int(message.text.strip())
-        await save_config()
-        await message.reply("✅ 已更新", reply_markup=get_media_perm_menu_keyboard(group_id))
-        await state.set_state(AdminStates.GroupMenu)
-    except (ValueError, Exception) as e:
-        await message.reply(f"❌ 请输入数字: {e}")
+    await state.set_state(AdminStates.GroupMenu)
+    await message.reply("助力解锁已下线，媒体权限仅按合规文本条数解锁。")
 
 @router.callback_query(F.data.startswith("toggle_media_broadcast:"), F.from_user.id.in_(ADMIN_IDS))
 async def toggle_media_broadcast(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        cfg["media_rules_broadcast"] = not cfg.get("media_rules_broadcast", True)
-        await save_config()
-        on = "✅" if cfg["media_rules_broadcast"] else "❌"
-        await callback.answer(f"规则广播: {on}", show_alert=True)
-        title = await get_chat_title_safe(callback.bot, group_id)
-        msg = cfg.get("media_unlock_msg_count", 50)
-        boost = cfg.get("media_unlock_boosts", 4)
-        text = f"<b>{title}</b> › 媒体权限\n\n解锁所需消息: {msg}\n解锁所需助力: {boost}"
-        await callback.message.edit_text(text, reply_markup=get_media_perm_menu_keyboard(group_id))
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("媒体规则广播已下线。", show_alert=True)
 
 @router.callback_query(F.data.startswith("edit_media_broadcast_interval:"), F.from_user.id.in_(ADMIN_IDS))
 async def edit_media_broadcast_interval(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        current = cfg.get("media_rules_broadcast_interval_minutes", 120)
-        await callback.message.edit_text(f"规则广播间隔（分钟）（当前: {current}）：", reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditMediaBroadcastInterval)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("媒体规则广播已下线。", show_alert=True)
 
 @router.message(StateFilter(AdminStates.EditMediaBroadcastInterval), F.from_user.id.in_(ADMIN_IDS))
 async def process_media_broadcast_interval(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        cfg["media_rules_broadcast_interval_minutes"] = max(1, int(message.text.strip()))
-        await save_config()
-        await message.reply("✅ 已更新", reply_markup=get_media_perm_menu_keyboard(group_id))
-        await state.set_state(AdminStates.GroupMenu)
-    except (ValueError, Exception) as e:
-        await message.reply(f"❌ 请输入数字: {e}")
+    await state.set_state(AdminStates.GroupMenu)
+    await message.reply("媒体规则广播已下线。")
 
 @router.callback_query(F.data.startswith("submenu_media_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
 async def media_whitelist_submenu(callback: CallbackQuery):
-    try:
-        parts = callback.data.split(":")
-        group_id = int(parts[1])
-        page = int(parts[2]) if len(parts) >= 3 else 0
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        wl = cfg.get("media_unlock_whitelist", [])
-        if not isinstance(wl, list):
-            wl = []
-        page_size = 15
-        total = len(wl)
-        max_page = max(0, (total - 1) // page_size) if total else 0
-        page = max(0, min(page, max_page))
-        start = page * page_size
-        end = start + page_size
-        visible = wl[start:end]
-        text = (
-            f"<b>{title}</b> › 媒体解锁白名单\n\n"
-            "用户ID或用户名，满足即无需消息/助力可发媒体。\n"
-            f"总数: {total}  页码: {page + 1}/{max_page + 1}\n\n"
-            + ("\n".join(str(x) for x in visible) if visible else "（空）")
-        )
-        await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id, page))
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("媒体解锁白名单已下线。", show_alert=True)
 
 @router.callback_query(F.data.startswith("add_media_whitelist:"), F.from_user.id.in_(ADMIN_IDS))
 async def add_media_whitelist(callback: CallbackQuery, state: FSMContext):
-    try:
-        parts = callback.data.split(":")
-        group_id = int(parts[1])
-        await callback.message.edit_text("输入要添加的用户ID或用户名（一行一个，支持多行）：", reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditMediaWhitelistAdd)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("媒体解锁白名单已下线。", show_alert=True)
 
 @router.message(StateFilter(AdminStates.EditMediaWhitelistAdd), F.from_user.id.in_(ADMIN_IDS))
 async def process_media_whitelist_add(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        wl = cfg.get("media_unlock_whitelist", [])
-        if not isinstance(wl, list):
-            wl = []
-        for line in message.text.strip().splitlines():
-            s = line.strip().lstrip("@")
-            if s and s not in wl:
-                wl.append(s)
-        cfg["media_unlock_whitelist"] = wl
-        await save_config()
-        last_page = max(0, (len(wl) - 1) // 15) if wl else 0
-        await message.reply(f"✅ 已添加，当前共 {len(wl)} 项", reply_markup=get_media_whitelist_keyboard(group_id, last_page))
-        await state.set_state(AdminStates.GroupMenu)
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
+    await state.set_state(AdminStates.GroupMenu)
+    await message.reply("媒体解锁白名单已下线。")
 
 @router.callback_query(F.data.startswith("remove_mw:"), F.from_user.id.in_(ADMIN_IDS))
 async def remove_media_whitelist(callback: CallbackQuery):
-    try:
-        parts = callback.data.split(":")
-        group_id = int(parts[1])
-        idx = int(parts[2])
-        page = int(parts[3]) if len(parts) >= 4 else 0
-        cfg = get_group_config(group_id)
-        wl = cfg.get("media_unlock_whitelist", [])
-        if not isinstance(wl, list):
-            wl = []
-        if 0 <= idx < len(wl):
-            wl.pop(idx)
-            cfg["media_unlock_whitelist"] = wl
-            await save_config()
-        title = await get_chat_title_safe(callback.bot, group_id)
-        total = len(wl)
-        max_page = max(0, (total - 1) // 15) if total else 0
-        page = max(0, min(page, max_page))
-        start = page * 15
-        end = start + 15
-        visible = wl[start:end]
-        text = (
-            f"<b>{title}</b> › 媒体解锁白名单\n\n"
-            f"总数: {total}  页码: {page + 1}/{max_page + 1}\n\n"
-            + ("\n".join(str(x) for x in visible) if visible else "（空）")
-        )
-        await callback.message.edit_text(text, reply_markup=get_media_whitelist_keyboard(group_id, page))
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("媒体解锁白名单已下线。", show_alert=True)
 
 # ==================== 媒体举报 ====================
 @router.callback_query(F.data.startswith("submenu_media_report:"), F.from_user.id.in_(ADMIN_IDS))
@@ -2541,7 +2152,7 @@ async def media_report_submenu(callback: CallbackQuery):
         cfg = get_group_config(group_id)
         cooldown = cfg.get("media_report_cooldown_sec", 20 * 60)
         max_day = cfg.get("media_report_max_per_day", 3)
-        del_th = cfg.get("media_report_delete_threshold", 3)
+        del_th = cfg.get("media_report_delete_threshold", 2)
         text = f"<b>{title}</b> › 媒体举报\n\n⏱ 连续举报冷却: {fmt_duration(cooldown)}\n每日上限: {max_day} 次\n举报达 {del_th} 人删媒体"
         kb = get_media_report_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
@@ -2606,7 +2217,7 @@ async def edit_media_delete_threshold(callback: CallbackQuery, state: FSMContext
     try:
         group_id = int(callback.data.split(":", 1)[1])
         cfg = get_group_config(group_id)
-        current = cfg.get("media_report_delete_threshold", 3)
+        current = cfg.get("media_report_delete_threshold", 2)
         await callback.message.edit_text(f"举报达多少人删除媒体（当前: {current}）：", reply_markup=None)
         await state.update_data(group_id=group_id)
         await state.set_state(AdminStates.EditMediaDeleteThreshold)
@@ -2892,58 +2503,16 @@ async def export_listen_log(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("submenu_exempt:"), F.from_user.id.in_(ADMIN_IDS))
 async def exempt_submenu(callback: CallbackQuery):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        exempt = cfg.get("exempt_users") or []
-        if isinstance(exempt, dict):
-            exempt = list(exempt.keys())
-        text = f"<b>{title}</b> › 豁免检测（简介/昵称等，与发图白名单无关）\n\n当前: " + (", ".join(str(x) for x in exempt) if exempt else "（无）")
-        await callback.message.edit_text(text, reply_markup=get_exempt_menu_keyboard(group_id))
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("旧豁免名单已下线。", show_alert=True)
 
 @router.callback_query(F.data.startswith("edit_exempt:"), F.from_user.id.in_(ADMIN_IDS))
 async def edit_exempt(callback: CallbackQuery, state: FSMContext):
-    try:
-        group_id = int(callback.data.split(":", 1)[1])
-        cfg = get_group_config(group_id)
-        exempt = cfg.get("exempt_users") or []
-        if isinstance(exempt, dict):
-            exempt = list(exempt.keys())
-        text = f"编辑豁免检测用户（用户ID，一行一个；豁免简介/昵称等检测，发图另有白名单）\n\n当前列表：\n" + ("\n".join(str(x) for x in exempt) if exempt else "（空）") + "\n\n发送新用户ID（一行一个）会追加到列表，/clear 清空全部"
-        await callback.message.edit_text(text, reply_markup=None)
-        await state.update_data(group_id=group_id)
-        await state.set_state(AdminStates.EditExemptUsers)
-        await callback.answer()
-    except Exception as e:
-        await callback.answer(f"❌ {str(e)}", show_alert=True)
+    await callback.answer("旧豁免名单已下线。", show_alert=True)
 
 @router.message(StateFilter(AdminStates.EditExemptUsers), F.from_user.id.in_(ADMIN_IDS))
 async def process_exempt(message: Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        group_id = data.get("group_id")
-        cfg = get_group_config(group_id)
-        if message.text.strip() == "/clear":
-            cfg["exempt_users"] = []
-            await save_config()
-            await message.reply("✅ 已清空豁免用户列表", reply_markup=get_exempt_menu_keyboard(group_id))
-        else:
-            existing = cfg.get("exempt_users", []) or []
-            if not isinstance(existing, list):
-                existing = []
-            new_users = [x.strip() for x in message.text.strip().splitlines() if x.strip()]
-            added = [u for u in new_users if u not in existing]
-            existing.extend(added)
-            cfg["exempt_users"] = existing
-            await save_config()
-            await message.reply(f"✅ 已追加 {len(added)} 人，当前共 {len(existing)} 人", reply_markup=get_exempt_menu_keyboard(group_id))
-        await state.set_state(AdminStates.GroupMenu)
-    except Exception as e:
-        await message.reply(f"❌ {str(e)}")
+    await state.set_state(AdminStates.GroupMenu)
+    await message.reply("旧豁免名单已下线。")
 
 # ==================== 状态查看 ====================
 async def _build_status_text(bot) -> str:
@@ -2963,11 +2532,8 @@ async def _build_status_text(bot) -> str:
     lines.append("")
     lines.append("<b>数据统计</b>:")
     lines.append(f"├ 进行中举报: {report_count} 条")
-    try:
-        uv_total = len(user_violations) if user_violations else 0
-        lines.append(f"├ 违规用户记录: {uv_total} 条")
-    except Exception:
-        lines.append("├ 违规用户记录: —")
+    lines.append(f"├ 入群审批记录: {len(join_review_logs)} 条")
+    lines.append(f"├ 处理记录: {len(moderation_logs)} 条")
     lines.append("")
     lines.append("<b>系统</b>: ✅ 运行正常  |  管理员: %d" % admin_count)
     return "\n".join(lines)
@@ -3163,6 +2729,13 @@ async def _handle_repeat_signature(message: Message, signature: str, repeat_labe
                 await bot.send_message(group_id, notice)
             except Exception:
                 pass
+            await _record_moderation_log(
+                group_id=group_id,
+                user_id=user_id,
+                user_label=display_name,
+                action="禁言",
+                reason=f"重复发送{repeat_label}",
+            )
             return True
 
         else:
@@ -3195,6 +2768,13 @@ async def _handle_repeat_signature(message: Message, signature: str, repeat_labe
                 await bot.send_message(group_id, notice)
             except Exception:
                 pass
+            await _record_moderation_log(
+                group_id=group_id,
+                user_id=user_id,
+                user_label=display_name,
+                action="永久封禁",
+                reason=f"重复发送{repeat_label}",
+            )
             return True
 
     return False
@@ -3290,37 +2870,6 @@ async def save_data():
                 json.dump(data_to_save, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print("保存失败:", e)
-
-def count_user_reported_messages(user_id: int, group_id: int) -> int:
-    """仅统计被非管理员举报的消息条数"""
-    key = f"{group_id}_{user_id}"
-    user_vio = user_violations.get(key, {})
-    count = 0
-    for v in user_vio.values():
-        reporters = v.get("reporters") or []
-        if isinstance(reporters, set):
-            reporters = list(reporters)
-        if reporters and any(r not in ADMIN_IDS for r in reporters):
-            count += 1
-        elif not reporters and v.get("reported"):
-            count += 1
-    return count
-
-def _report_action_key(group_id: int, user_id: int) -> str:
-    return f"{group_id}_{user_id}"
-
-def get_report_history_action_count(group_id: int, user_id: int) -> int:
-    data = report_action_state.get(_report_action_key(group_id, user_id), {})
-    if not isinstance(data, dict):
-        return 0
-    return int(data.get("last_trigger_count", 0) or 0)
-
-def build_report_history_exempt_keyboard(group_id: int, user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="举报处罚豁免👮‍♂️", callback_data=f"report_history_exempt:{group_id}:{user_id}")]
-        ]
-    )
 
 def build_warning_buttons(group_id: int, msg_id: int, report_count: int):
     """构建警告消息按钮；callback 带 group_id 避免多群串案；举报按钮显示当前人数"""
@@ -3438,48 +2987,16 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
         try:
             sent = await bot.send_message(group_id, keep_one_text)
             if auto_delete_sec > 0:
-                async def _auto_del(cid: int, mid: int):
-                    await asyncio.sleep(auto_delete_sec)
-                    try:
-                        await bot.delete_message(cid, mid)
-                    except Exception:
-                        pass
-                asyncio.create_task(_auto_del(group_id, sent.message_id))
+                _track_bot_message(group_id, sent.message_id, auto_delete_sec)
         except Exception:
             pass
-
-@router.message(Command("setboost"), F.chat.id.in_(GROUP_IDS), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
-async def cmd_set_boost(message: Message):
-    """管理员在群内回复某条消息并发送 /setboost 4，将该用户的群组助力次数设为 4（用于解锁发媒体）"""
-    try:
-        text = (message.text or "").strip().split()
-        if len(text) != 2:
-            await message.reply("用法：回复要设置的用户的消息，发送 /setboost 数字（如 /setboost 4）")
-            return
-        count = int(text[1])
-        if count < 0 or count > 100:
-            await message.reply("助力次数请填 0～100")
-            return
-        target = message.reply_to_message.from_user
-        if not target or target.is_bot:
-            await message.reply("请回复真实用户的消息")
-            return
-        key = _media_key(message.chat.id, target.id)
-        media_stats["boosts"][key] = count
-        await save_media_stats()
-        name = target.full_name or target.username or target.id
-        await message.reply(f"已将该用户在本群的助力次数设为 {count}。{name} 现可发媒体。")
-    except ValueError:
-        await message.reply("请发送数字，如 /setboost 4")
-    except Exception as e:
-        await message.reply(f"设置失败: {e}")
 
 @router.message(
     F.chat.id.in_(GROUP_IDS),
     F.photo | F.video | F.voice | F.video_note | F.document | F.animation | F.audio,
 )
 async def on_media_message(message: Message):
-    """媒体消息统一入口：先跑广告匹配，再做媒体权限拦截，最后挂举报/点赞按钮。"""
+    """媒体消息统一入口：先跑广告匹配，再做媒体权限拦截，最后挂举报按钮。"""
     if not message.from_user or message.from_user.is_bot:
         return
     cfg = get_group_config(message.chat.id)
@@ -3493,15 +3010,11 @@ async def on_media_message(message: Message):
     if semantic_text:
         if await _check_and_delete_semantic_ad_message(message, semantic_text, group_id=group_id, user_id=user_id):
             return
-    username = message.from_user.username if message.from_user else None
-    await _refresh_user_boosts(group_id, user_id)
-    if not _can_send_media(group_id, user_id, username):
+    if not _can_send_media(group_id, user_id):
         await _delete_original_and_linked_reply(group_id, message.message_id)
         need_msg = cfg.get("media_unlock_msg_count", 50)
-        need_boosts = cfg.get("media_unlock_boosts", 4)
         key = _media_key(group_id, user_id)
         count = media_stats["message_counts"].get(key, 0)
-        boosts = media_stats["boosts"].get(key, 0)
         name = _get_display_name_from_message(message, user_id)
         sk = (group_id, user_id)
         # 计算连续无权限发媒体次数（超过一定时间未再触发则重置）
@@ -3544,23 +3057,16 @@ async def on_media_message(message: Message):
                 await bot.delete_message(group_id, prev_msg_id)
             except Exception:
                 pass
+            finally:
+                bot_sent_messages.pop((group_id, prev_msg_id), None)
         sent = await bot.send_message(
             group_id,
             f"⚠️ {name} 尚未解锁发媒体。\n"
-            f"📊 您的进度：发送合规消息 {count}/{need_msg}，助力 {boosts}/{need_boosts}（满其一即可解锁）。\n"
-            f"输入「权限」查进度，输入「召唤」使用机器人代发图。"
+            f"📊 您的进度：发送合规消息 {count}/{need_msg}。\n"
+            f"达到条数后会自动解锁发图权限。输入「权限」可查询进度。"
         )
         last_media_no_perm_msg[sk] = sent.message_id
-        if prev_msg_id is None:
-            async def _delete_after():
-                await asyncio.sleep(MEDIA_NO_PERM_DELETE_AFTER_SEC)
-                try:
-                    await bot.delete_message(group_id, sent.message_id)
-                except Exception:
-                    pass
-                if last_media_no_perm_msg.get(sk) == sent.message_id:
-                    last_media_no_perm_msg.pop(sk, None)
-            asyncio.create_task(_delete_after())
+        _track_bot_message(group_id, sent.message_id, MEDIA_NO_PERM_DELETE_AFTER_SEC)
         return
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id:
@@ -3617,18 +3123,8 @@ def _track_user_message(group_id: int, user_id: int, msg_id: int, text: str = ""
 
 
 def _track_bot_message(group_id: int, msg_id: int, auto_delete_sec: int = BOT_MSG_AUTO_DELETE_SEC):
-    """跟踪机器人发送的消息，安排自动删除"""
-    bot_sent_messages[(group_id, msg_id)] = time.time()
-    
-    async def _auto_delete():
-        await asyncio.sleep(auto_delete_sec)
-        try:
-            await bot.delete_message(group_id, msg_id)
-        except Exception:
-            pass
-        bot_sent_messages.pop((group_id, msg_id), None)
-    
-    asyncio.create_task(_auto_delete())
+    """跟踪机器人发送的消息，交由统一清理协程删除，避免大量 sleep 任务常驻内存。"""
+    bot_sent_messages[(group_id, msg_id)] = time.time() + max(1, int(auto_delete_sec))
 
 
 def _track_group_reply(message: Message, reply: Message):
@@ -3751,59 +3247,14 @@ async def _enable_semantic_detection_for_group(group_id: int) -> bool:
     await save_config()
     return True
 
-async def _flush_ad_delete_summary_batch() -> None:
-    async with ad_delete_summary_lock:
-        if len(pending_ad_delete_summaries) < 10:
-            return
-        batch = pending_ad_delete_summaries[:10]
-        del pending_ad_delete_summaries[:10]
-        await save_ad_delete_summaries()
-
-    lines = []
-    learned_count = 0
-    for idx, item in enumerate(batch, start=1):
-        if item.get("learned"):
-            learned_count += 1
-        ts = time.strftime("%m-%d %H:%M:%S", time.localtime(int(item.get("ts", time.time()))))
-        lines.append(
-            f"{idx}. [{ts}] gid={item.get('group_id')} uid={item.get('user_id')} "
-            f"score={float(item.get('score', 0.0)):.3f} learned={'Y' if item.get('learned') else 'N'}\n"
-            f"   {item.get('text', '')}"
-        )
-
-    summary_text = (
-        "AD 删除汇总（10条）\n\n"
-        f"总数: 10\n"
-        f"新增学习入库: {learned_count}\n\n"
-        + "\n".join(lines)
-    )
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, summary_text)
-        except Exception as e:
-            print(f"send AD delete summary failed for admin {admin_id}: {e}")
-
-async def _record_semantic_ad_deletion(group_id: int, user_id: int, message_id: int, text: str, score: float) -> None:
+async def _record_semantic_ad_deletion(group_id: int, user_id: int, message_id: int, text: str, score: float) -> bool:
     learned = False
     try:
         sample = semantic_ad_detector.add_ad_sample(text)
         learned = sample is not None
     except Exception as e:
         print(f"learn ad sample on delete failed: {e}")
-
-    event = {
-        "ts": int(time.time()),
-        "group_id": group_id,
-        "user_id": user_id,
-        "message_id": message_id,
-        "text": _clip_text(text, 120),
-        "score": round(float(score), 3),
-        "learned": learned,
-    }
-    async with ad_delete_summary_lock:
-        pending_ad_delete_summaries.append(event)
-        await save_ad_delete_summaries()
-    await _flush_ad_delete_summary_batch()
+    return learned
 
 
 async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, group_id: int, user_id: int) -> bool:
@@ -3814,19 +3265,6 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
     if not _semantic_detection_enabled_for_group(group_id):
         return False
     if len((text or "").strip()) < 4:
-        return False
-
-    cfg = get_group_config(group_id)
-    exempt_users = cfg.get("exempt_users") or []
-    if isinstance(exempt_users, list) and str(user_id) in exempt_users:
-        _push_listen_log(
-            group_id=group_id,
-            user_id=user_id,
-            msg_id=message.message_id,
-            text=text,
-            verdict="PASS",
-            details="进入AD检测但命中豁免用户 exempt_users，跳过AD匹配",
-        )
         return False
 
     is_semantic_ad, sim, _ = semantic_ad_detector.check_text(text)
@@ -3841,8 +3279,15 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
     if not is_semantic_ad:
         return False
 
-    await _record_semantic_ad_deletion(group_id, user_id, message.message_id, text, sim)
+    learned = await _record_semantic_ad_deletion(group_id, user_id, message.message_id, text, sim)
     await _delete_original_and_linked_reply(group_id, message.message_id)
+    await _record_moderation_log(
+        group_id=group_id,
+        user_id=user_id,
+        user_label=_get_display_name_from_message(message, user_id),
+        action="广告删除",
+        reason=f"命中AD语义库，score={sim:.3f}，学习={'是' if learned else '否'}",
+    )
     _push_listen_log(
         group_id=group_id,
         user_id=user_id,
@@ -3973,43 +3418,9 @@ async def _delete_all_banned_warnings(group_id: int):
         except Exception:
             pass
     banned_warning_messages[group_id] = []
-
-def _message_has_link_or_external_at(text: str) -> bool:
-    """文本引流：包含链接 或 @外部用户（任意 @xxx 均视为外部）。"""
-    if not text:
-        return False
-    has_link = any(x in text for x in ["http://", "https://", "t.me/"])
-    mentions = re.findall(r"@(\w+)", text)
-    has_external_at = bool(mentions)
-    return has_link or has_external_at
-
-
-def _has_external_reference(message: Message) -> bool:
-    """外部引用：A. 消息为转发 或 B. 回复了转发消息"""
-    if getattr(message, "forward_origin", None) is not None:
-        return True
-    if getattr(message, "forward_from", None) is not None:
-        return True
-    if getattr(message, "forward_from_chat", None) is not None:
-        return True
-    if getattr(message, "forward_sender_name", None) is not None:
-        return True
-    reply = getattr(message, "reply_to_message", None)
-    if not reply:
-        return False
-    if getattr(reply, "forward_origin", None) is not None:
-        return True
-    if getattr(reply, "forward_from", None) is not None:
-        return True
-    if getattr(reply, "forward_from_chat", None) is not None:
-        return True
-    if getattr(reply, "forward_sender_name", None) is not None:
-        return True
-    return False
-
 @router.message(F.chat.id.in_(GROUP_IDS), F.text)
 async def detect_and_warn(message: Message):
-    """发言时检测并发送警告。顺序：豁免 -> 召唤(无操作) -> 权限 -> 举报阈值 -> 多层 -> 5.1 -> 5.3 -> 重复；合规仅当 triggers<=1 且无处罚。"""
+    """文本消息主流程：AD 语义匹配 -> 权限查询 -> 重复文字处罚 -> 合规计入媒体解锁。"""
     if not message.from_user or message.from_user.is_bot:
         _push_listen_log(
             group_id=getattr(message.chat, "id", None),
@@ -4057,221 +3468,21 @@ async def detect_and_warn(message: Message):
                 details="未进入AD检测: " + "，".join(reason),
             )
 
-    # 误判豁免：仅不做多层内容检测，举报阈值/外部引用/5.1/重复等检测仍执行
-    misjudge_wl = cfg.get("misjudge_whitelist") or []
-    misjudge_exempt = isinstance(misjudge_wl, list) and str(user_id) in misjudge_wl
-
-    mild_wl = cfg.get("mild_exempt_whitelist") or []
-    mild_exempt = isinstance(mild_wl, list) and str(user_id) in mild_wl
-
-    # 「召唤」：本机器人不做任何动作，由群内其他机器人处理
-    if message.text and message.text.strip() == "召唤":
-        return
-
-    # 「权限」查询发媒体进度（拉取最新助力数）
+    # 「权限」查询发媒体进度
     if message.text and message.text.strip() == "权限":
-        await _refresh_user_boosts(group_id, user_id)
         key = _media_key(group_id, user_id)
         count = media_stats["message_counts"].get(key, 0)
         unlocked = media_stats["unlocked"].get(key, False)
-        boosts = media_stats["boosts"].get(key, 0)
         need_msg = cfg.get("media_unlock_msg_count", 50)
-        need_boosts = cfg.get("media_unlock_boosts", 4)
         if unlocked:
             await message.reply(f"✅ 已解锁发媒体（发送合规消息已满 {need_msg} 条）。")
-            return
-        if boosts >= need_boosts:
-            await message.reply(f"✅ 已解锁发媒体（已助力 {boosts} 次）。")
             return
         await message.reply(
             f"📊 发媒体进度\n"
             f"· 发送合规消息：{count}/{need_msg}\n"
-            f"· 群组助力：{boosts}/{need_boosts}\n"
-            f"（刷屏/重复/短消息不计入）"
+            f"（刷屏/重复内容不计入）"
         )
         return
-
-    report_history_whitelist = cfg.get("report_history_whitelist", []) or []
-    report_history_exempt = (
-        isinstance(report_history_whitelist, list)
-        and (
-            str(user_id) in report_history_whitelist
-            or (
-                message.from_user.username
-                and any(
-                    isinstance(item, str)
-                    and item.strip().lstrip("@").lower() == message.from_user.username.lower()
-                    for item in report_history_whitelist
-                )
-            )
-        )
-    )
-    reported_count = count_user_reported_messages(user_id, group_id)
-    threshold = cfg.get("report_history_threshold", 3)
-    last_action_count = get_report_history_action_count(group_id, user_id)
-    if (
-        not report_history_exempt
-        and reported_count >= threshold
-        and reported_count > last_action_count
-    ):
-        try:
-            mute_hours = min(cfg.get("report_history_mute_hours", 24), REPORT_BAN_HOURS_CAP)
-            until_date = int(time.time()) + (mute_hours * 3600)
-            await bot.restrict_chat_member(
-                chat_id=group_id,
-                user_id=user_id,
-                permissions=ChatPermissions(
-                    can_send_messages=False,
-                    can_send_media_messages=False,
-                    can_send_polls=False,
-                    can_send_other_messages=False,
-                    can_add_web_page_previews=False,
-                    can_change_info=False,
-                    can_invite_users=False,
-                    can_pin_messages=False
-                ),
-                until_date=until_date
-            )
-            await _delete_original_and_linked_reply(group_id, message.message_id)
-            report_action_state[_report_action_key(group_id, user_id)] = {
-                "last_trigger_count": reported_count,
-                "last_trigger_at": int(time.time()),
-            }
-            await save_report_action_state()
-            display_name = _get_display_name_from_message(message, user_id)
-            warning = await bot.send_message(
-                group_id,
-                f"🚫 用户 {display_name}\n"
-                f"📌 触发原因：历史被举报消息累计 {reported_count} 条。\n"
-                f"🔒 处理结果：已被限制发言 {mute_hours} 小时。\n"
-                "如需取消这条历史举报处罚，管理员可点下方豁免。",
-                reply_markup=build_report_history_exempt_keyboard(group_id, user_id),
-            )
-            _track_bot_message(group_id, warning.message_id)
-            return
-        except Exception as e:
-            print(f"历史举报处罚失败: {e}")
-
-    # 多层内容检测：当前仅保留昵称敏感词
-    triggers = []
-    if not misjudge_exempt:
-        if cfg.get("check_display_keywords", True):
-            display_name = (message.from_user.full_name or "").lower()
-            if any(kw.lower() in display_name for kw in cfg.get("display_keywords", [])):
-                triggers.append("昵称词汇")
-
-    # 5.2 统一警告（非仅引流时）- 同用户连续触发只发一条警告（防刷屏）
-    if len(triggers) > 0:
-        reason = "+".join(triggers)
-        display_name = _get_display_name_from_message(message, user_id)
-        
-        # 检查是否应该发送警告（同用户60秒内只发一条）
-        should_warn = _should_send_warning(group_id, user_id)
-        
-        if should_warn:
-            warning_text = (
-                f"🚨 检测到 👤 用户 {display_name} 疑似广告，包含 {reason} 内容。\n"
-                f"⚠️ 警惕该用户，可点举报或由管理员标记。"
-            )
-            try:
-                kb = build_warning_buttons(group_id, message.message_id, 0)
-                warning = await _send_delayed_reply_if_original_exists(
-                    message,
-                    warning_text,
-                    reply_markup=kb,
-                )
-                if not warning:
-                    return
-                _track_group_reply(message, warning)
-                rk = _report_key(group_id, message.message_id)
-                async with lock:
-                    reports[rk] = {
-                        "warning_id": warning.message_id,
-                        "suspect_id": user_id,
-                        "chat_id": group_id,
-                        "reporters": set(),
-                        "reporter_labels": {},
-                        "reason": reason,
-                        "trigger_count": len(triggers),
-                        "suspect_name": display_name,
-                        "original_message_id": message.message_id,
-                        "original_text": message.text or "",
-                        "timestamp": time.time(),
-                    }
-                await save_data()
-                _record_warning_sent(group_id, user_id, warning.message_id)
-                # 机器人警告消息24小时后自动删除
-                _track_bot_message(group_id, warning.message_id)
-            except Exception as e:
-                print(f"发送警告失败: {e}")
-        else:
-            # 同用户连续触发，不发新警告，但仍记录到reports
-            rk = _report_key(group_id, message.message_id)
-            async with lock:
-                reports[rk] = {
-                    "warning_id": 0,  # 无警告消息
-                    "suspect_id": user_id,
-                    "chat_id": group_id,
-                    "reporters": set(),
-                    "reporter_labels": {},
-                    "reason": reason,
-                    "trigger_count": len(triggers),
-                    "suspect_name": display_name,
-                    "original_message_id": message.message_id,
-                    "original_text": message.text or "",
-                    "timestamp": time.time(),
-                }
-            await save_data()
-
-    # 5.3 按触发层数处理
-    if len(triggers) >= 3:
-        try:
-            await bot.restrict_chat_member(
-                chat_id=group_id,
-                user_id=user_id,
-                permissions=ChatPermissions(
-                    can_send_messages=False,
-                    can_send_media_messages=False,
-                    can_send_polls=False,
-                    can_send_other_messages=False,
-                    can_add_web_page_previews=False,
-                    can_change_info=False,
-                    can_invite_users=False,
-                    can_pin_messages=False
-                )
-            )
-            reason = "+".join(triggers)
-            display_name = _get_display_name_from_message(message, user_id)
-            await _delete_user_recent_and_warnings(group_id, user_id, message.message_id, keep_one_text=
-                f"🚫 用户 {display_name}\n📌 触发原因：{reason}\n🔒 处理结果：已被本群永久限制发言。\n{MISJUDGE_BOT_MENTION}",
-                auto_delete_sec=10)
-        except Exception as e:
-            print(f"自动封禁失败: {e}")
-    elif len(triggers) <= 2 and len(triggers) > 0 and not mild_exempt:
-        mild_key = (group_id, user_id)
-        entries = mild_trigger_entries.get(mild_key, [])
-        rk = _report_key(group_id, message.message_id)
-        warning_id = reports.get(rk, {}).get("warning_id") if rk in reports else None
-        if warning_id:
-            entries = (entries + [(message.message_id, warning_id)])[-3:]
-        mild_trigger_entries[mild_key] = entries
-        if len(entries) >= 3:
-            link = _message_link(group_id, entries[2][0])
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        admin_id,
-                        f"⚠️ 用户 {user_id} 已第三次触发轻度警告。\n定位: {link}",
-                        reply_markup=InlineKeyboardMarkup(
-                            inline_keyboard=[[
-                                InlineKeyboardButton(text="定位到消息", url=link),
-                                InlineKeyboardButton(text="豁免轻度", callback_data=f"mild_exempt:{group_id}:{user_id}")
-                            ]]
-                        ),
-                    )
-                except Exception:
-                    pass
-            mild_trigger_entries[mild_key] = [entries[2]]
 
     # 重复发言检测（多层之后执行）
     if await handle_repeat_message(message):
@@ -4285,29 +3496,15 @@ async def detect_and_warn(message: Message):
         )
         return
 
-    # 走到这里说明没有触发任何处罚型规则
-    if triggers:
-        _push_listen_log(
-            group_id=group_id,
-            user_id=user_id,
-            msg_id=message.message_id,
-            text=text,
-            verdict="PASS",
-            details="多层监听触发项: " + "、".join(triggers),
-        )
-    else:
-        _push_listen_log(
-            group_id=group_id,
-            user_id=user_id,
-            msg_id=message.message_id,
-            text=text,
-            verdict="PASS",
-            details="未命中AD语义库；多层监听无触发项",
-        )
-
-    # 合规文本：仅在本条消息未触发处罚，且轻度命中不超过 1 层时计入媒体解锁进度
-    if len(triggers) <= 1:
-        await _try_count_media_and_notify(message, group_id, user_id, cfg)
+    _push_listen_log(
+        group_id=group_id,
+        user_id=user_id,
+        msg_id=message.message_id,
+        text=text,
+        verdict="PASS",
+        details="未命中AD语义库；未触发重复文本处罚",
+    )
+    await _try_count_media_and_notify(message, group_id, user_id, cfg)
 
 
 @router.message(Command(commands=["ad", "AD", "Ad"]), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
@@ -4482,6 +3679,7 @@ async def handle_admin_ban(callback: CallbackQuery):
             await callback.answer("仅管理员操作", show_alert=True)
             return
         
+        display_name = f"ID {user_id}"
         await bot.restrict_chat_member(
             chat_id=group_id,
             user_id=user_id,
@@ -4496,6 +3694,13 @@ async def handle_admin_ban(callback: CallbackQuery):
                 can_pin_messages=False
             )
         )
+        await _record_moderation_log(
+            group_id=group_id,
+            user_id=user_id,
+            user_label=display_name,
+            action="永久封禁",
+            reason="管理员一键封禁",
+        )
         await callback.answer("✅ 已处理")
     except Exception as e:
         print(f"管理员封禁失败: {e}")
@@ -4503,7 +3708,7 @@ async def handle_admin_ban(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("report:"))
 async def handle_report(callback: CallbackQuery):
-    """举报处理；仅非管理员举报计入历史阈值；优化响应速度"""
+    """举报处理；动态更新举报人名单，达到当前规则阈值时执行删除/封禁。"""
     try:
         parts = callback.data.split(":", 2)
         if len(parts) != 3:
@@ -4531,15 +3736,6 @@ async def handle_report(callback: CallbackQuery):
         
         # 尽早返回响应，后续操作不阻塞用户
         await callback.answer(f"✅ 举报({count}人)")
-        
-        # 后台保存
-        key = f"{group_id}_{user_id}"
-        if key not in user_violations:
-            user_violations[key] = {}
-        if str(msg_id) not in user_violations[key]:
-            user_violations[key][str(msg_id)] = {"time": time.time(), "reporters": set()}
-        user_violations[key][str(msg_id)]["reporters"].add(reporter_id)
-        asyncio.create_task(save_user_violations())
         
         # 修改警告消息 - 关键：显示举报数 + 根据举报数决定按钮
         display_name = data.get("suspect_name") or f"ID {user_id}"
@@ -4595,6 +3791,13 @@ async def handle_report(callback: CallbackQuery):
                     _track_bot_message(group_id, sent.message_id, 10)
                 except Exception:
                     pass
+                await _record_moderation_log(
+                    group_id=group_id,
+                    user_id=user_id,
+                    user_label=display_name,
+                    action="永久封禁",
+                    reason=f"{reason}（{count}人举报）",
+                )
                 async with lock:
                     reports.pop(rk, None)
                 asyncio.create_task(save_data())
@@ -4675,6 +3878,13 @@ async def handle_ban(callback: CallbackQuery):
                 _track_bot_message(group_id, sent.message_id, 10)  # 10秒后删除
             except Exception:
                 pass
+            await _record_moderation_log(
+                group_id=group_id,
+                user_id=user_id,
+                user_label=display_name,
+                action="永久封禁",
+                reason=f"{reason}（管理员处理）",
+            )
         else:
             # 24小时禁言：删除源消息，更新警告
             await _delete_original_and_linked_reply(group_id, msg_id)
@@ -4695,6 +3905,13 @@ async def handle_ban(callback: CallbackQuery):
                     _add_banned_warning(group_id, warning_id)
                 except Exception:
                     pass
+            await _record_moderation_log(
+                group_id=group_id,
+                user_id=user_id,
+                user_label=display_name,
+                action="禁言24小时",
+                reason=f"{reason}（管理员处理）",
+            )
 
         # 删除所有已封禁的警告消息（替换原来的只删上一条）
         await _delete_all_banned_warnings(group_id)
@@ -4712,7 +3929,7 @@ async def handle_ban(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("exempt:"))
 async def handle_exempt(callback: CallbackQuery):
-    """误判豁免：删除警告、移除报告，并将该用户加入多层检测白名单"""
+    """误判处理：仅删除当前警告并移除对应举报记录，不再写入旧白名单。"""
     try:
         parts = callback.data.split(":", 2)
         if len(parts) != 3:
@@ -4728,7 +3945,6 @@ async def handle_exempt(callback: CallbackQuery):
                 return
             data = reports[rk]
             warning_id = data["warning_id"]
-            suspect_id = data["suspect_id"]
         if caller_id not in ADMIN_IDS:
             await callback.answer("仅管理员操作", show_alert=True)
             return
@@ -4736,15 +3952,6 @@ async def handle_exempt(callback: CallbackQuery):
             await bot.delete_message(group_id, warning_id)
         except Exception:
             pass
-        cfg = get_group_config(group_id)
-        wl = cfg.get("misjudge_whitelist") or []
-        if not isinstance(wl, list):
-            wl = []
-        sid = str(suspect_id)
-        if sid not in wl:
-            wl.append(sid)
-            cfg["misjudge_whitelist"] = wl
-            await save_config()
         await callback.answer("✅ 已豁免")
         async with lock:
             reports.pop(rk, None)
@@ -4755,54 +3962,7 @@ async def handle_exempt(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("report_history_exempt:"), F.from_user.id.in_(ADMIN_IDS))
 async def handle_report_history_exempt(callback: CallbackQuery):
-    try:
-        parts = callback.data.split(":", 2)
-        if len(parts) != 3:
-            await callback.answer("已过期", show_alert=True)
-            return
-        group_id = int(parts[1])
-        user_id = int(parts[2])
-        cfg = get_group_config(group_id)
-        whitelist = cfg.get("report_history_whitelist", []) or []
-        if not isinstance(whitelist, list):
-            whitelist = []
-        user_key = str(user_id)
-        if user_key not in whitelist:
-            whitelist.append(user_key)
-            apply_global_config_value("report_history_whitelist", whitelist)
-            await save_config()
-        current_count = count_user_reported_messages(user_id, group_id)
-        report_action_state[_report_action_key(group_id, user_id)] = {
-            "last_trigger_count": max(current_count, get_report_history_action_count(group_id, user_id)),
-            "last_trigger_at": int(time.time()),
-            "whitelisted_by": callback.from_user.id,
-        }
-        await save_report_action_state()
-        try:
-            await bot.restrict_chat_member(
-                chat_id=group_id,
-                user_id=user_id,
-                permissions=ChatPermissions(
-                    can_send_messages=True,
-                    can_send_media_messages=True,
-                    can_send_polls=True,
-                    can_send_other_messages=True,
-                    can_add_web_page_previews=True,
-                    can_change_info=False,
-                    can_invite_users=True,
-                    can_pin_messages=False,
-                ),
-            )
-        except Exception:
-            pass
-        await callback.message.edit_text(
-            f"✅ 已将用户 {user_id} 加入举报处罚豁免白名单。\n后续只有出现新的举报增量，才会再次进入处罚判断。",
-            reply_markup=None,
-        )
-        await callback.answer("已豁免")
-    except Exception as e:
-        print("历史举报豁免异常:", e)
-        await callback.answer("❌ 失败", show_alert=True)
+    await callback.answer("该功能已下线", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("markad:"), F.from_user.id.in_(ADMIN_IDS))
@@ -4851,33 +4011,7 @@ async def handle_mark_ad(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("mild_exempt:"))
 async def handle_mild_exempt(callback: CallbackQuery):
-    """轻度触发豁免：仅关闭该用户的轻度检测，不影响其他检测"""
-    try:
-        parts = callback.data.split(":", 2)
-        if len(parts) != 3:
-            await callback.answer("已过期")
-            return
-        group_id = int(parts[1])
-        user_id = int(parts[2])
-        caller_id = callback.from_user.id
-        if caller_id not in ADMIN_IDS:
-            await callback.answer("仅管理员操作", show_alert=True)
-            return
-
-        cfg = get_group_config(group_id)
-        wl = cfg.get("mild_exempt_whitelist") or []
-        if not isinstance(wl, list):
-            wl = []
-        sid = str(user_id)
-        if sid not in wl:
-            wl.append(sid)
-            cfg["mild_exempt_whitelist"] = wl
-            await save_config()
-
-        await callback.answer("✅ 已豁免该用户的轻度检测")
-    except Exception as e:
-        print("轻度豁免异常:", e)
-        await callback.answer("❌ 失败", show_alert=True)
+    await callback.answer("该功能已下线", show_alert=True)
 
 @router.callback_query(F.data.startswith("mr:"))
 async def handle_media_report(callback: CallbackQuery):
@@ -5053,6 +4187,30 @@ async def cleanup_deleted_messages():
         await asyncio.sleep(1)
 
 
+async def cleanup_bot_messages():
+    """统一清理到期的机器人临时消息，避免为每条消息创建单独延迟任务。"""
+    while True:
+        await asyncio.sleep(BOT_MESSAGE_SWEEP_SEC)
+        now = time.time()
+        due_items = [
+            (group_id, msg_id)
+            for (group_id, msg_id), expire_at in list(bot_sent_messages.items())
+            if now >= float(expire_at)
+        ]
+        if not due_items:
+            continue
+        for group_id, msg_id in due_items:
+            try:
+                await bot.delete_message(group_id, msg_id)
+            except Exception:
+                pass
+            finally:
+                bot_sent_messages.pop((group_id, msg_id), None)
+                for key, tracked_msg_id in list(last_media_no_perm_msg.items()):
+                    if key[0] == group_id and tracked_msg_id == msg_id:
+                        last_media_no_perm_msg.pop(key, None)
+
+
 async def cleanup_orphan_replies():
     """每 5 分钟清理一次孤儿引用回复；对无法确认的旧回复也做兜底回收。"""
     while True:
@@ -5076,26 +4234,18 @@ async def cleanup_orphan_replies():
 
 async def main():
     print("🚀 机器人启动")
-    if admin_router is not None:
-        try:
-            from bot_config import validate_immutable_config
-            validate_immutable_config()
-        except Exception as e:
-            print(f"⚠️ 全局配置未加载（全局系统配置面板不可用）: {e}")
     await load_config()
     for gid in GROUP_IDS:
         get_group_config(gid)
     await save_config()
     await load_data()
-    await load_user_violations()
-    await load_report_action_state()
-    await load_ad_delete_summaries()
     await load_recent_messages_cache()
     await load_forward_match_memory()
+    await load_join_review_logs()
+    await load_moderation_logs()
     load_repeat_levels()
-    load_link_ref_levels()
     await load_media_stats()
-    await _notify_join_approval_startup_status()
+    asyncio.create_task(cleanup_bot_messages())
     asyncio.create_task(cleanup_deleted_messages())
     asyncio.create_task(cleanup_orphan_replies())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

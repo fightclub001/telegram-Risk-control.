@@ -4,7 +4,7 @@ from __future__ import annotations
 轻量级广告检测模块（替换原来的深度学习方案）
 
 约束：
-- 只能使用轻量依赖：simhash / rapidfuzz / jieba / sqlite3 / re / collections / time 等
+- 只能使用轻量依赖：simhash / rapidfuzz / sqlite3 / re / collections / time 等
 - 不依赖 torch / transformers / sentence-transformers / faiss
 
 接口保持与原先 SemanticAdDetector 一致：
@@ -23,7 +23,6 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import jieba  # type: ignore
 from rapidfuzz import fuzz  # type: ignore
 from simhash import Simhash  # type: ignore
 

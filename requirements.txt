@@ -1,8 +1,6 @@
 aiogram>=3.14.0
 simhash>=2.1.2
 rapidfuzz>=3.9.0
-jieba>=0.42.1
 rapidocr-onnxruntime>=1.4,<2
-opencc-python-reimplemented>=0.1.7,<1
 Pillow>=10,<12
 numpy>=1.26,<3
