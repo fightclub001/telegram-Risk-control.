@@ -78,16 +78,22 @@ media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
 pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message": Message, "user_id": int, "last_update_ts": float, "repeat_signatures": set[str]}
 MEDIA_GROUP_SETTLE_SEC = 2.5
+MEDIA_GROUP_STALE_SEC = 10 * 60
+MEDIA_REPORT_ENTRY_TTL_SEC = 6 * 3600
+MEDIA_REPORT_DELETED_TTL_SEC = 15 * 60
+MEDIA_REPORT_LAST_TTL_SEC = 24 * 3600
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
 join_approval_avatar_ocr = JoinApprovalAvatarOCR()
-JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "86400").strip()))
-JOIN_APPROVAL_OCR_CACHE_MAX = max(32, int((os.getenv("OCR_CACHE_MAX") or "256").strip()))
+JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "21600").strip()))
+JOIN_APPROVAL_OCR_CACHE_MAX = max(32, int((os.getenv("OCR_CACHE_MAX") or "96").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
 JOIN_APPROVAL_REQUEST_TIMEOUT = 10
 join_approval_avatar_cache = {}  # file_unique_id -> {ocr_text, normalized_text, is_text_avatar, chinese_char_count, total_char_count, matched_term, timestamp}
-join_review_logs = deque(maxlen=1000)
-moderation_logs = deque(maxlen=1000)
+join_review_logs = deque(maxlen=500)
+moderation_logs = deque(maxlen=500)
+join_review_logs_dirty = False
+moderation_logs_dirty = False
 # 无权限发媒体警告：同用户删上一条；(group_id, user_id) -> 上一条机器人警告 message_id
 last_media_no_perm_msg = {}
 MEDIA_NO_PERM_DELETE_AFTER_SEC = 60  # 不同用户的警告 1 分钟后自动删除
@@ -250,49 +256,63 @@ def _format_join_review_user(user) -> str:
 
 
 async def load_join_review_logs() -> None:
-    global join_review_logs
+    global join_review_logs, join_review_logs_dirty
     try:
         if not os.path.exists(JOIN_REVIEW_LOG_FILE):
-            join_review_logs = deque(maxlen=1000)
+            join_review_logs = deque(maxlen=500)
+            join_review_logs_dirty = False
             return
         with open(JOIN_REVIEW_LOG_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if not isinstance(raw, list):
             raw = []
-        join_review_logs = deque(raw[-1000:], maxlen=1000)
+        join_review_logs = deque(raw[-500:], maxlen=500)
+        join_review_logs_dirty = False
     except Exception as e:
         print(f"join review logs load failed: {e}")
-        join_review_logs = deque(maxlen=1000)
+        join_review_logs = deque(maxlen=500)
+        join_review_logs_dirty = False
 
 
-async def save_join_review_logs() -> None:
+async def save_join_review_logs(force: bool = False) -> None:
+    global join_review_logs_dirty
+    if not force and not join_review_logs_dirty:
+        return
     try:
         with open(JOIN_REVIEW_LOG_FILE, "w", encoding="utf-8") as f:
             json.dump(list(join_review_logs), f, ensure_ascii=False, indent=2)
+        join_review_logs_dirty = False
     except Exception as e:
         print(f"join review logs save failed: {e}")
 
 
 async def load_moderation_logs() -> None:
-    global moderation_logs
+    global moderation_logs, moderation_logs_dirty
     try:
         if not os.path.exists(MOD_ACTION_LOG_FILE):
-            moderation_logs = deque(maxlen=1000)
+            moderation_logs = deque(maxlen=500)
+            moderation_logs_dirty = False
             return
         with open(MOD_ACTION_LOG_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if not isinstance(raw, list):
             raw = []
-        moderation_logs = deque(raw[-1000:], maxlen=1000)
+        moderation_logs = deque(raw[-500:], maxlen=500)
+        moderation_logs_dirty = False
     except Exception as e:
         print(f"moderation logs load failed: {e}")
-        moderation_logs = deque(maxlen=1000)
+        moderation_logs = deque(maxlen=500)
+        moderation_logs_dirty = False
 
 
-async def save_moderation_logs() -> None:
+async def save_moderation_logs(force: bool = False) -> None:
+    global moderation_logs_dirty
+    if not force and not moderation_logs_dirty:
+        return
     try:
         with open(MOD_ACTION_LOG_FILE, "w", encoding="utf-8") as f:
             json.dump(list(moderation_logs), f, ensure_ascii=False, indent=2)
+        moderation_logs_dirty = False
     except Exception as e:
         print(f"moderation logs save failed: {e}")
 
@@ -304,6 +324,7 @@ async def _record_join_review_log(
     final_decision: str,
     reason: str,
 ) -> None:
+    global join_review_logs_dirty
     join_review_logs.append(
         {
             "ts": int(time.time()),
@@ -313,7 +334,7 @@ async def _record_join_review_log(
             "reason_label": _join_review_reason_text(reason),
         }
     )
-    await save_join_review_logs()
+    join_review_logs_dirty = True
 
 
 async def _record_moderation_log(
@@ -324,6 +345,7 @@ async def _record_moderation_log(
     action: str,
     reason: str,
 ) -> None:
+    global moderation_logs_dirty
     moderation_logs.append(
         {
             "ts": int(time.time()),
@@ -334,7 +356,7 @@ async def _record_moderation_log(
             "reason": reason,
         }
     )
-    await save_moderation_logs()
+    moderation_logs_dirty = True
 
 
 @router.chat_join_request(F.chat.id.in_(GROUP_IDS))
@@ -2842,7 +2864,7 @@ repeat_message_history_last = {}  # key -> last_activity_time，用于淘汰
 REPEAT_HISTORY_MAX_KEYS = 12000
 # key: (group_id, user_id) -> int（0/1/2）；持久化到 REPEAT_LEVEL_FILE）
 repeat_violation_level = {}
-MEDIA_REPORT_LAST_MAX = 5000
+MEDIA_REPORT_LAST_MAX = 2000
 
 
 def _normalize_text(text: str) -> str:
@@ -3224,6 +3246,7 @@ async def _attach_to_existing_media_group_report(
                 repeat_signatures.add(repeat_signature)
         if message.caption:
             data["caption"] = message.caption
+        data["updated_ts"] = time.time()
         reply_id = int(data["reply_msg_id"])
         report_count = len(data.get("reporters", set()))
         garbage_count = len(data.get("garbage_reporters", set()))
@@ -3281,6 +3304,7 @@ async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
                     repeat_signatures = report_data.setdefault("repeat_signatures", set())
                     if isinstance(repeat_signatures, set):
                         repeat_signatures.update(set(data.get("repeat_signatures", set())))
+                    report_data["updated_ts"] = time.time()
         return
     if await handle_repeat_media_group_message(first_message, set(data.get("repeat_signatures", set()))):
         return
@@ -3304,6 +3328,8 @@ async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
             "deleted": False,
             "caption": caption,
             "repeat_signatures": set(data.get("repeat_signatures", set())),
+            "created_ts": time.time(),
+            "updated_ts": time.time(),
         }
         media_group_report_index[(chat_id, media_group_id)] = message_ids[0]
 
@@ -3472,6 +3498,8 @@ async def on_media_message(message: Message):
             "garbage_reporters": set(),
             "deleted": False,
             "caption": message.caption or "",
+            "created_ts": time.time(),
+            "updated_ts": time.time(),
         }
 
 def _track_user_message(group_id: int, user_id: int, msg_id: int, text: str = ""):
@@ -4355,6 +4383,7 @@ async def handle_media_report(callback: CallbackQuery):
             garbage_count = len(data.get("garbage_reporters", set()))
             reply_id = data["reply_msg_id"]
             media_msg_ids = list(data.get("media_msg_ids", [media_msg_id]))
+            data["updated_ts"] = time.time()
 
         try:
             await bot.edit_message_reply_markup(
@@ -4417,6 +4446,7 @@ async def handle_media_garbage_report(callback: CallbackQuery):
             reply_id = data["reply_msg_id"]
             report_count = len(data["reporters"])
             media_msg_ids = list(data.get("media_msg_ids", [media_msg_id]))
+            data["updated_ts"] = time.time()
         try:
             await bot.edit_message_reply_markup(
                 chat_id=chat_id,
@@ -4524,6 +4554,83 @@ async def cleanup_orphan_replies():
                 bot_reply_links.pop((group_id, bot_msg_id), None)
                 await _drop_report_by_warning_id(group_id, bot_msg_id)
 
+
+async def cleanup_media_runtime_state():
+    """定期回收媒体举报相关热表，限制高活跃群下的内存增长。"""
+    while True:
+        await asyncio.sleep(120)
+        now = time.time()
+
+        stale_group_keys = [
+            key
+            for key, data in list(pending_media_groups.items())
+            if now - float(data.get("last_update_ts", 0.0) or 0.0) >= MEDIA_GROUP_STALE_SEC
+        ]
+        for key in stale_group_keys:
+            pending_media_groups.pop(key, None)
+
+        for uid, (_mid, last_ts) in list(media_report_last.items()):
+            if now - float(last_ts) >= MEDIA_REPORT_LAST_TTL_SEC:
+                media_report_last.pop(uid, None)
+
+        today_str = time.strftime("%Y-%m-%d", time.localtime(now))
+        for key in list(media_report_day_count.keys()):
+            if key[1] != today_str:
+                media_report_day_count.pop(key, None)
+
+        expired_warning_keys = [
+            key
+            for key, (_count, last_ts) in list(media_no_perm_strikes.items())
+            if now - float(last_ts) >= MEDIA_NO_PERM_STRIKE_RESET_SEC
+        ]
+        for key in expired_warning_keys:
+            media_no_perm_strikes.pop(key, None)
+
+        expired_cooldown_keys = [
+            key
+            for key, (last_ts, _msg_id) in list(user_last_warning.items())
+            if now - float(last_ts) >= USER_WARNING_COOLDOWN_SEC
+        ]
+        for key in expired_cooldown_keys:
+            user_last_warning.pop(key, None)
+
+        _prune_join_approval_avatar_cache()
+
+        expired_reply_updates: list[tuple[int, int]] = []
+        async with media_reports_lock:
+            expired_report_keys = []
+            expired_group_index_keys = []
+            for key, data in list(media_reports.items()):
+                base_ts = float(data.get("updated_ts") or data.get("created_ts") or 0.0)
+                ttl = MEDIA_REPORT_DELETED_TTL_SEC if data.get("deleted") else MEDIA_REPORT_ENTRY_TTL_SEC
+                if base_ts and (now - base_ts) < ttl:
+                    continue
+                expired_report_keys.append(key)
+                expired_reply_updates.append((int(data.get("chat_id", key[0])), int(data.get("reply_msg_id", 0) or 0)))
+                media_group_id = data.get("media_group_id")
+                if media_group_id:
+                    expired_group_index_keys.append((int(data.get("chat_id", key[0])), str(media_group_id)))
+            for group_key in expired_group_index_keys:
+                media_group_report_index.pop(group_key, None)
+            for key in expired_report_keys:
+                media_reports.pop(key, None)
+
+        for chat_id, reply_id in expired_reply_updates:
+            if reply_id <= 0:
+                continue
+            try:
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=reply_id, reply_markup=None)
+            except Exception:
+                pass
+
+
+async def _logs_flush_worker() -> None:
+    """批量刷盘审批/处理日志，减少高频 JSON 序列化抖动。"""
+    while True:
+        await asyncio.sleep(10)
+        await save_join_review_logs()
+        await save_moderation_logs()
+
 async def main():
     print("🚀 机器人启动")
     await load_config()
@@ -4539,9 +4646,11 @@ async def main():
     await load_media_stats()
     asyncio.create_task(_recent_messages_flush_worker())
     asyncio.create_task(_media_stats_flush_worker())
+    asyncio.create_task(_logs_flush_worker())
     asyncio.create_task(cleanup_bot_messages())
     asyncio.create_task(cleanup_deleted_messages())
     asyncio.create_task(cleanup_orphan_replies())
+    asyncio.create_task(cleanup_media_runtime_state())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
