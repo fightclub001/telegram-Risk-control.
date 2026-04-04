@@ -484,6 +484,7 @@ def _default_group_config():
     return {
         "enabled": True,
         "repeat_window_seconds": 2 * 3600,
+        "repeat_media_window_seconds": 2 * 3600,
         "repeat_max_count": 3,
         "repeat_ban_seconds": 86400,
         "repeat_exempt_keywords": [],  # 含任一词的消息不触发重复发言检测（白名单词）
@@ -1101,6 +1102,7 @@ class AdminStates(StatesGroup):
     MainMenu = State()
     GroupMenu = State()
     EditRepeatWindow = State()
+    EditRepeatMediaWindow = State()
     EditRepeatMaxCount = State()
     EditRepeatBanSec = State()
     EditRepeatExemptKeywords = State()
@@ -1172,13 +1174,15 @@ def _build_log_pager(prefix: str, group_id: int, page: int, total: int, page_siz
 
 def get_repeat_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
-    w = cfg.get("repeat_window_seconds", 7200)
+    text_w = cfg.get("repeat_window_seconds", 7200)
+    media_w = cfg.get("repeat_media_window_seconds", text_w)
     m = cfg.get("repeat_max_count", 3)
     b = cfg.get("repeat_ban_seconds", 86400)
     kw = cfg.get("repeat_exempt_keywords", []) or []
     n_kw = len(kw) if isinstance(kw, list) else 0
     buttons = [
-        [InlineKeyboardButton(text=f"⏱ 时间窗口: {fmt_duration(w)}", callback_data=f"edit_repeat_window:{group_id}")],
+        [InlineKeyboardButton(text=f"⏱ 文字窗口: {fmt_duration(text_w)}", callback_data=f"edit_repeat_window:{group_id}")],
+        [InlineKeyboardButton(text=f"🖼 媒体窗口: {fmt_duration(media_w)}", callback_data=f"edit_repeat_media_window:{group_id}")],
         [InlineKeyboardButton(text=f"触发次数: {m}次", callback_data=f"edit_repeat_max:{group_id}")],
         [InlineKeyboardButton(text=f"🔇 首次禁言: {fmt_duration(b)}", callback_data=f"edit_repeat_ban:{group_id}")],
         [InlineKeyboardButton(text=f"📋 豁免词(白名单) ({n_kw})", callback_data=f"edit_repeat_exempt:{group_id}")],
@@ -1583,12 +1587,20 @@ async def repeat_submenu(callback: CallbackQuery):
         group_id = int(callback.data.split(":", 1)[1])
         title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
-        w = cfg.get("repeat_window_seconds", 7200)
+        text_w = cfg.get("repeat_window_seconds", 7200)
+        media_w = cfg.get("repeat_media_window_seconds", text_w)
         m = cfg.get("repeat_max_count", 3)
         b = cfg.get("repeat_ban_seconds", 86400)
         kw = cfg.get("repeat_exempt_keywords", []) or []
         n_kw = len(kw) if isinstance(kw, list) else 0
-        text = f"<b>{title}</b> › 重复发言\n\n⏱ 窗口: {fmt_duration(w)}\n触发: {m} 次\n🔇 首次禁言: {fmt_duration(b)}\n📋 豁免词: {n_kw} 个"
+        text = (
+            f"<b>{title}</b> › 重复发言\n\n"
+            f"⏱ 文字窗口: {fmt_duration(text_w)}\n"
+            f"🖼 媒体窗口: {fmt_duration(media_w)}\n"
+            f"触发: {m} 次\n"
+            f"🔇 首次禁言: {fmt_duration(b)}\n"
+            f"📋 豁免词: {n_kw} 个"
+        )
         kb = get_repeat_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1656,6 +1668,32 @@ async def process_repeat_window(message: Message, state: FSMContext):
         group_id = data.get("group_id")
         cfg = get_group_config(group_id)
         cfg["repeat_window_seconds"] = int(message.text.strip()) * 3600
+        await save_config()
+        await message.reply("✅ 已更新", reply_markup=get_repeat_menu_keyboard(group_id))
+        await state.set_state(AdminStates.GroupMenu)
+    except (ValueError, Exception) as e:
+        await message.reply(f"❌ 请输入数字: {e}")
+
+@router.callback_query(F.data.startswith("edit_repeat_media_window:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_repeat_media_window(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = cfg.get("repeat_media_window_seconds", cfg.get("repeat_window_seconds", 7200))
+        await callback.message.edit_text(f"媒体重复检测时间窗口（小时）（当前: {current // 3600}）：", reply_markup=None)
+        await state.update_data(group_id=group_id)
+        await state.set_state(AdminStates.EditRepeatMediaWindow)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+@router.message(StateFilter(AdminStates.EditRepeatMediaWindow), F.from_user.id.in_(ADMIN_IDS))
+async def process_repeat_media_window(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = data.get("group_id")
+        cfg = get_group_config(group_id)
+        cfg["repeat_media_window_seconds"] = int(message.text.strip()) * 3600
         await save_config()
         await message.reply("✅ 已更新", reply_markup=get_repeat_menu_keyboard(group_id))
         await state.set_state(AdminStates.GroupMenu)
@@ -2030,12 +2068,13 @@ def _prune_repeat_history(now: float, window_sec: int) -> None:
         repeat_message_history_last.pop(key, None)
 
 
-async def _handle_repeat_signature(message: Message, signature: str, repeat_label: str) -> bool:
+async def _handle_repeat_signature(message: Message, signature: str, repeat_label: str, window_sec: int | None = None) -> bool:
     """按统一规则处理重复文字或重复媒体。"""
     user_id = message.from_user.id
     group_id = message.chat.id
     cfg = get_group_config(group_id)
-    window_sec = cfg.get("repeat_window_seconds", 2 * 3600)
+    if window_sec is None:
+        window_sec = cfg.get("repeat_window_seconds", 2 * 3600)
     max_count = cfg.get("repeat_max_count", 3)
     ban_sec = cfg.get("repeat_ban_seconds", 86400)
     now = time.time()
@@ -2205,7 +2244,9 @@ async def handle_repeat_media_message(message: Message) -> bool:
     signature = _get_media_repeat_signature(message)
     if not signature:
         return False
-    return await _handle_repeat_signature(message, signature, "同一图片/媒体")
+    cfg = get_group_config(message.chat.id)
+    window_sec = cfg.get("repeat_media_window_seconds", cfg.get("repeat_window_seconds", 2 * 3600))
+    return await _handle_repeat_signature(message, signature, "同一图片/媒体", window_sec=window_sec)
 
 
 async def handle_repeat_media_group_message(message: Message, signatures: set[str]) -> bool:
@@ -2214,7 +2255,9 @@ async def handle_repeat_media_group_message(message: Message, signatures: set[st
     if not cleaned:
         return False
     group_signature = "album:" + "|".join(cleaned)
-    return await _handle_repeat_signature(message, group_signature, "同一组图片/媒体")
+    cfg = get_group_config(message.chat.id)
+    window_sec = cfg.get("repeat_media_window_seconds", cfg.get("repeat_window_seconds", 2 * 3600))
+    return await _handle_repeat_signature(message, group_signature, "同一组图片/媒体", window_sec=window_sec)
 
 def _report_key(gid: int, mid: int) -> tuple:
     return (gid, mid)
