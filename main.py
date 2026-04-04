@@ -48,7 +48,7 @@ dp.include_router(router)
 # ==================== 数据文件 ====================
 # 使用环境变量 DATA_DIR；Railway 需将 Volume 挂载到该路径（如 /data），重新部署后配置与名单才不丢失
 # 以下数据均持久化，重启不丢失：CONFIG_FILE（核心面板配置）、DATA_FILE（进行中举报记录）、
-# MEDIA_STATS_FILE（合规消息数/解锁状态）、RECENT_MESSAGES_FILE（最近24小时消息缓存）。
+# MEDIA_STATS_FILE / REPEAT_LEVEL_FILE（仅用于旧 JSON 迁移）、RECENT_MESSAGES_DB_FILE（最近24小时消息缓存 + 轻量运行时状态）。
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "reports.json")
@@ -66,10 +66,6 @@ lock = asyncio.Lock()
 repeat_warning_msg_id = {}  # (group_id, user_id) -> msg_id of "2次" repeat warning, delete if orig deleted
 config = {}
 forward_match_memory = {}  # normalized_text -> {"group_id": int, "user_id": int, "updated_at": int}
-# 媒体权限统计：合规消息数、同条超过10次不计数、已解锁名单（持久化到 MEDIA_STATS_FILE）
-media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}}
-media_stats_loaded = False
-media_stats_dirty = False
 # 媒体消息举报/点赞（内存即可，按消息维度）
 media_reports = {}
 media_reports_lock = asyncio.Lock()
@@ -642,6 +638,49 @@ def _get_recent_messages_conn() -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_recent_messages_norm_ts "
             "ON recent_messages(group_id, norm_text, ts DESC)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_unlock_stats (
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                unlocked INTEGER NOT NULL DEFAULT 0,
+                updated_ts REAL NOT NULL,
+                PRIMARY KEY (group_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_unlock_text_counts (
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                updated_ts REAL NOT NULL,
+                PRIMARY KEY (group_id, user_id, fingerprint)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_unlock_updated_ts "
+            "ON media_unlock_stats(updated_ts DESC)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repeat_violation_levels (
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                level INTEGER NOT NULL,
+                updated_ts REAL NOT NULL,
+                PRIMARY KEY (group_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_repeat_levels_updated_ts "
+            "ON repeat_violation_levels(updated_ts DESC)"
+        )
         recent_messages_conn = conn
     return recent_messages_conn
 
@@ -914,80 +953,295 @@ async def _recent_messages_delete_by_text(group_id: int, text: str) -> list[int]
                     message_ids.append(msg_id)
     return message_ids
 
-async def load_media_stats():
-    global media_stats, media_stats_loaded, media_stats_dirty
-    media_stats_loaded = False
-    media_stats_dirty = False
-    try:
-        if os.path.exists(MEDIA_STATS_FILE):
-            with open(MEDIA_STATS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            media_stats = {
-                "message_counts": data.get("message_counts", {}),
-                "text_counts": data.get("text_counts", {}),
-                "unlocked": data.get("unlocked", {}),
-            }
-        else:
-            media_stats = {"message_counts": {}, "text_counts": {}, "unlocked": {}}
-        media_stats_loaded = True
-    except Exception as e:
-        print(f"媒体统计加载失败: {e}（本次运行不写入，避免覆盖磁盘原有数据）")
-
-async def save_media_stats():
-    global media_stats_loaded, media_stats_dirty
-    if not media_stats_loaded:
-        return
-    if not media_stats_dirty:
-        return
-    try:
-        with open(MEDIA_STATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(media_stats, f, ensure_ascii=False, indent=2)
-        media_stats_dirty = False
-    except Exception as e:
-        print(f"媒体统计保存失败: {e}")
-
-
-def _mark_media_stats_dirty() -> None:
-    global media_stats_dirty
-    media_stats_dirty = True
-
-
-async def _media_stats_flush_worker() -> None:
-    while True:
-        await asyncio.sleep(5)
-        try:
-            await save_media_stats()
-        except Exception as e:
-            print(f"media stats flush failed: {e}")
-
-def load_repeat_levels():
-    global repeat_violation_level
-    try:
-        if os.path.exists(REPEAT_LEVEL_FILE):
-            with open(REPEAT_LEVEL_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            repeat_violation_level = {}
-            for k, v in data.items():
-                parts = k.split("_", 1)
-                if len(parts) == 2:
-                    try:
-                        repeat_violation_level[(int(parts[0]), int(parts[1]))] = int(v)
-                    except ValueError:
-                        pass
-    except Exception as e:
-        print(f"重复违规级别加载失败: {e}")
-
-async def save_repeat_levels():
-    try:
-        data = {f"{g}_{u}": v for (g, u), v in repeat_violation_level.items()}
-        with open(REPEAT_LEVEL_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception as e:
-        print(f"重复违规级别保存失败: {e}")
-
-
 def _media_key(group_id: int, user_id: int) -> str:
     return f"{group_id}_{user_id}"
+
+
+def _parse_media_key(key: str) -> tuple[int, int] | None:
+    parts = str(key or "").split("_", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return None
+
+
+async def _migrate_media_stats_from_legacy_json() -> None:
+    if not os.path.exists(MEDIA_STATS_FILE):
+        return
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        row = conn.execute("SELECT 1 FROM media_unlock_stats LIMIT 1").fetchone()
+        if row is not None:
+            return
+    try:
+        with open(MEDIA_STATS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"媒体统计迁移失败: {e}")
+        return
+
+    message_counts = raw.get("message_counts", {}) if isinstance(raw, dict) else {}
+    text_counts = raw.get("text_counts", {}) if isinstance(raw, dict) else {}
+    unlocked = raw.get("unlocked", {}) if isinstance(raw, dict) else {}
+    now = time.time()
+    stats_rows: list[tuple[int, int, int, int, float]] = []
+    fp_rows: list[tuple[int, int, str, int, float]] = []
+    seen_stats: set[tuple[int, int]] = set()
+
+    for raw_key, raw_count in (message_counts or {}).items():
+        parsed = _parse_media_key(raw_key)
+        if parsed is None:
+            continue
+        group_id, user_id = parsed
+        stats_rows.append(
+            (
+                group_id,
+                user_id,
+                max(0, int(raw_count or 0)),
+                1 if unlocked.get(raw_key) else 0,
+                now,
+            )
+        )
+        seen_stats.add((group_id, user_id))
+
+    for raw_key, raw_unlocked in (unlocked or {}).items():
+        parsed = _parse_media_key(raw_key)
+        if parsed is None:
+            continue
+        if parsed in seen_stats:
+            continue
+        group_id, user_id = parsed
+        stats_rows.append((group_id, user_id, 0, 1 if raw_unlocked else 0, now))
+        seen_stats.add((group_id, user_id))
+
+    for raw_key, raw_fps in (text_counts or {}).items():
+        parsed = _parse_media_key(raw_key)
+        if parsed is None or not isinstance(raw_fps, dict):
+            continue
+        group_id, user_id = parsed
+        if parsed not in seen_stats:
+            stats_rows.append((group_id, user_id, 0, 1 if unlocked.get(raw_key) else 0, now))
+            seen_stats.add((group_id, user_id))
+        for fp, raw_count in raw_fps.items():
+            try:
+                count = max(0, int(raw_count or 0))
+            except (TypeError, ValueError):
+                continue
+            if count <= 0:
+                continue
+            fp_rows.append((group_id, user_id, str(fp), count, now))
+
+    async with recent_messages_lock:
+        conn.execute("BEGIN")
+        try:
+            if stats_rows:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO media_unlock_stats
+                    (group_id, user_id, message_count, unlocked, updated_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    stats_rows,
+                )
+            if fp_rows:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO media_unlock_text_counts
+                    (group_id, user_id, fingerprint, count, updated_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    fp_rows,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+async def _migrate_repeat_levels_from_legacy_json() -> None:
+    if not os.path.exists(REPEAT_LEVEL_FILE):
+        return
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        row = conn.execute("SELECT 1 FROM repeat_violation_levels LIMIT 1").fetchone()
+        if row is not None:
+            return
+    try:
+        with open(REPEAT_LEVEL_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"重复违规级别迁移失败: {e}")
+        return
+
+    rows: list[tuple[int, int, int, float]] = []
+    now = time.time()
+    if isinstance(raw, dict):
+        for raw_key, raw_level in raw.items():
+            parsed = _parse_media_key(raw_key)
+            if parsed is None:
+                continue
+            try:
+                level = max(0, int(raw_level or 0))
+            except (TypeError, ValueError):
+                continue
+            if level <= 0:
+                continue
+            rows.append((parsed[0], parsed[1], level, now))
+
+    async with recent_messages_lock:
+        conn.execute("BEGIN")
+        try:
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO repeat_violation_levels
+                    (group_id, user_id, level, updated_ts)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+async def load_media_stats() -> None:
+    await _migrate_media_stats_from_legacy_json()
+
+
+async def load_repeat_levels() -> None:
+    await _migrate_repeat_levels_from_legacy_json()
+
+
+async def _get_media_progress(group_id: int, user_id: int) -> tuple[int, bool]:
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        row = conn.execute(
+            """
+            SELECT message_count, unlocked
+            FROM media_unlock_stats
+            WHERE group_id = ? AND user_id = ?
+            """,
+            (int(group_id), int(user_id)),
+        ).fetchone()
+    if row is None:
+        return 0, False
+    return int(row["message_count"] or 0), bool(row["unlocked"])
+
+
+async def _can_send_media(group_id: int, user_id: int, username: str | None = None) -> bool:
+    """是否已解锁发媒体：仅看合规文本累计是否达到阈值。"""
+    _count, unlocked = await _get_media_progress(group_id, user_id)
+    return unlocked
+
+
+async def _increment_media_count(group_id: int, user_id: int, normalized_text: str) -> bool:
+    """合规消息计数（同一条超过 10 次不计数）。达到阈值后解锁媒体权限。"""
+    cfg = get_group_config(group_id)
+    need_count = cfg.get("media_unlock_msg_count", 50)
+    fp = _media_text_fingerprint(normalized_text)
+    now = time.time()
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        row = conn.execute(
+            """
+            SELECT message_count, unlocked
+            FROM media_unlock_stats
+            WHERE group_id = ? AND user_id = ?
+            """,
+            (int(group_id), int(user_id)),
+        ).fetchone()
+        message_count = int(row["message_count"] or 0) if row else 0
+        unlocked = bool(row["unlocked"]) if row else False
+        if unlocked:
+            return False
+
+        fp_row = conn.execute(
+            """
+            SELECT count
+            FROM media_unlock_text_counts
+            WHERE group_id = ? AND user_id = ? AND fingerprint = ?
+            """,
+            (int(group_id), int(user_id), fp),
+        ).fetchone()
+        fp_count = int(fp_row["count"] or 0) if fp_row else 0
+        if fp_count >= 10:
+            return False
+
+        new_count = message_count + 1
+        new_unlocked = 1 if new_count >= need_count else 0
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """
+                INSERT INTO media_unlock_stats
+                (group_id, user_id, message_count, unlocked, updated_ts)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(group_id, user_id) DO UPDATE SET
+                    message_count = excluded.message_count,
+                    unlocked = excluded.unlocked,
+                    updated_ts = excluded.updated_ts
+                """,
+                (int(group_id), int(user_id), new_count, new_unlocked, now),
+            )
+            if new_unlocked:
+                conn.execute(
+                    "DELETE FROM media_unlock_text_counts WHERE group_id = ? AND user_id = ?",
+                    (int(group_id), int(user_id)),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO media_unlock_text_counts
+                    (group_id, user_id, fingerprint, count, updated_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(group_id, user_id, fingerprint) DO UPDATE SET
+                        count = excluded.count,
+                        updated_ts = excluded.updated_ts
+                    """,
+                    (int(group_id), int(user_id), fp, fp_count + 1, now),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return bool(new_unlocked)
+
+
+async def _get_repeat_violation_level(group_id: int, user_id: int) -> int:
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        row = conn.execute(
+            """
+            SELECT level
+            FROM repeat_violation_levels
+            WHERE group_id = ? AND user_id = ?
+            """,
+            (int(group_id), int(user_id)),
+        ).fetchone()
+    if row is None:
+        return 0
+    return max(0, int(row["level"] or 0))
+
+
+async def _set_repeat_violation_level(group_id: int, user_id: int, level: int) -> None:
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        conn.execute(
+            """
+            INSERT INTO repeat_violation_levels
+            (group_id, user_id, level, updated_ts)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(group_id, user_id) DO UPDATE SET
+                level = excluded.level,
+                updated_ts = excluded.updated_ts
+            """,
+            (int(group_id), int(user_id), max(0, int(level)), time.time()),
+        )
+        conn.commit()
 
 
 def _pack_forward_match_value(group_id: int, user_id: int, updated_at: int) -> list[int]:
@@ -1016,41 +1270,11 @@ def _media_text_fingerprint(normalized_text: str) -> str:
     """用短哈希代替原文存储媒体解锁计数，降低内存和落盘体积。"""
     return hashlib.blake2b(normalized_text.encode("utf-8"), digest_size=8).hexdigest()
 
-def _can_send_media(group_id: int, user_id: int, username: str | None = None) -> bool:
-    """是否已解锁发媒体：仅看合规文本累计是否达到阈值。"""
-    key = _media_key(group_id, user_id)
-    if media_stats["unlocked"].get(key):
-        return True
-    return False
-
-async def _increment_media_count(group_id: int, user_id: int, normalized_text: str) -> bool:
-    """合规消息计数（同一条超过 10 次不计数）。达到阈值后解锁媒体权限。"""
-    cfg = get_group_config(group_id)
-    need_count = cfg.get("media_unlock_msg_count", 50)
-    key = _media_key(group_id, user_id)
-    if media_stats["unlocked"].get(key):  # 已能发媒体，不再统计
-        return False
-    tc = media_stats["text_counts"].setdefault(key, {})
-    fp = _media_text_fingerprint(normalized_text)
-    if tc.get(fp, 0) >= 10:
-        return False
-    tc[fp] = tc.get(fp, 0) + 1
-    count = media_stats["message_counts"].get(key, 0) + 1
-    media_stats["message_counts"][key] = count
-    if count >= need_count:
-        media_stats["unlocked"][key] = True
-        media_stats["text_counts"].pop(key, None)
-        _mark_media_stats_dirty()
-        await save_media_stats()
-        return True
-    _mark_media_stats_dirty()
-    return False
-
 
 async def _try_count_media_and_notify(message: Message, group_id: int, user_id: int, cfg: dict) -> None:
     """合规消息计入媒体解锁进度。达到阈值后静默解锁，不再主动群内提示。"""
-    media_key = _media_key(group_id, user_id)
-    if media_stats["unlocked"].get(media_key):
+    _count, unlocked = await _get_media_progress(group_id, user_id)
+    if unlocked:
         return
     try:
         norm = _normalize_text(message.text or "")
@@ -1979,8 +2203,6 @@ user_short_msg_history = {}
 repeat_message_history = {}
 repeat_message_history_last = {}  # key -> last_activity_time，用于淘汰
 REPEAT_HISTORY_MAX_KEYS = 6000
-# key: (group_id, user_id) -> int（0/1/2）；持久化到 REPEAT_LEVEL_FILE）
-repeat_violation_level = {}
 MEDIA_REPORT_LAST_MAX = 800
 
 
@@ -2106,8 +2328,7 @@ async def _handle_repeat_signature(message: Message, signature: str, repeat_labe
         return False
 
     if count >= max_count:
-        level_key = (group_id, user_id)
-        current_level = repeat_violation_level.get(level_key, 0)
+        current_level = await _get_repeat_violation_level(group_id, user_id)
         display_name = _get_display_name_from_message(message, user_id)
         try:
             await _delete_original_and_linked_reply(group_id, message.message_id)
@@ -2140,8 +2361,7 @@ async def _handle_repeat_signature(message: Message, signature: str, repeat_labe
             except Exception as e:
                 print(f"重复发言禁言失败: {e}")
                 return False
-            repeat_violation_level[level_key] = 1
-            await save_repeat_levels()
+            await _set_repeat_violation_level(group_id, user_id, 1)
             notice = (
                 f"🚫 用户 {display_name}\n"
                 f"📌 触发原因：在配置时间窗口内多次重复发送{repeat_label}（{max_count}/{max_count}）。\n"
@@ -2179,8 +2399,7 @@ async def _handle_repeat_signature(message: Message, signature: str, repeat_labe
             except Exception as e:
                 print(f"重复发言永封失败: {e}")
                 return False
-            repeat_violation_level[level_key] = 2
-            await save_repeat_levels()
+            await _set_repeat_violation_level(group_id, user_id, 2)
             notice = (
                 f"🚫 用户 {display_name}\n"
                 f"📌 触发原因：多次在 2 小时内重复发送{repeat_label}，且在被解禁后仍然继续违规。\n"
@@ -2510,11 +2729,10 @@ async def on_media_message(message: Message):
     if semantic_text:
         if await _check_and_delete_semantic_ad_message(message, semantic_text, group_id=group_id, user_id=user_id):
             return
-    if not _can_send_media(group_id, user_id):
+    if not await _can_send_media(group_id, user_id):
         await _delete_original_and_linked_reply(group_id, message.message_id)
         need_msg = cfg.get("media_unlock_msg_count", 50)
-        key = _media_key(group_id, user_id)
-        count = media_stats["message_counts"].get(key, 0)
+        count, _unlocked = await _get_media_progress(group_id, user_id)
         name = _get_display_name_from_message(message, user_id)
         sk = (group_id, user_id)
         # 计算连续无权限发媒体次数（超过一定时间未再触发则重置）
@@ -2884,9 +3102,7 @@ async def detect_and_warn(message: Message):
 
     # 「权限」查询发媒体进度
     if message.text and message.text.strip() == "权限":
-        key = _media_key(group_id, user_id)
-        count = media_stats["message_counts"].get(key, 0)
-        unlocked = media_stats["unlocked"].get(key, False)
+        count, unlocked = await _get_media_progress(group_id, user_id)
         need_msg = cfg.get("media_unlock_msg_count", 50)
         if unlocked:
             await message.reply(f"✅ 已解锁发媒体（发送合规消息已满 {need_msg} 条）。")
@@ -3737,10 +3953,9 @@ async def main():
     await load_forward_match_memory()
     await load_join_review_logs()
     await load_moderation_logs()
-    load_repeat_levels()
+    await load_repeat_levels()
     await load_media_stats()
     asyncio.create_task(_recent_messages_flush_worker())
-    asyncio.create_task(_media_stats_flush_worker())
     asyncio.create_task(_logs_flush_worker())
     asyncio.create_task(cleanup_bot_messages())
     asyncio.create_task(cleanup_deleted_messages())
