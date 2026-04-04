@@ -23,6 +23,17 @@ class AvatarResult:
     matched_term: str | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class PrefilterStats:
+    looks_like_text: bool
+    contrast_std: float
+    top_ratio: float
+    top2_ratio: float
+    reduced_top2_ratio: float
+    edge_density: float
+    palette_size: int
+
+
 class JoinApprovalAvatarOCR:
     """
     Lightweight join approval OCR wrapper.
@@ -46,8 +57,14 @@ class JoinApprovalAvatarOCR:
             "off",
         }
         self.prefilter_max_side = max(48, int((os.getenv("OCR_PREFILTER_MAX_SIDE") or "96").strip()))
+        self.fail_closed_on_prefilter_hit = (os.getenv("OCR_FAIL_CLOSED_ON_PREFILTER_HIT") or "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
 
-    def _looks_like_text_avatar(self, image_bytes: bytes) -> bool:
+    def _prefilter_stats(self, image_bytes: bytes) -> PrefilterStats:
         """
         Cheap prefilter for join approval.
 
@@ -59,18 +76,18 @@ class JoinApprovalAvatarOCR:
             image = ImageOps.exif_transpose(image).convert("RGB")
             image.thumbnail((self.prefilter_max_side, self.prefilter_max_side), Image.Resampling.BILINEAR)
         except Exception:
-            return True
+            return PrefilterStats(True, 0.0, 1.0, 1.0, 1.0, 1.0, 0)
 
         width, height = image.size
         if width < 24 or height < 24:
-            return True
+            return PrefilterStats(True, 0.0, 1.0, 1.0, 1.0, 1.0, 0)
 
         total = width * height
         gray = ImageOps.grayscale(image)
         gray_stat = ImageStat.Stat(gray)
         contrast_std = float(gray_stat.stddev[0] or 0.0)
         if contrast_std < 18.0:
-            return False
+            return PrefilterStats(False, contrast_std, 0.0, 0.0, 0.0, 0.0, 8)
 
         quantized = image.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
         colors = quantized.getcolors(maxcolors=total) or []
@@ -101,22 +118,36 @@ class JoinApprovalAvatarOCR:
                         edge_hits += 1
         edge_density = float(edge_hits) / max(1, edge_total)
 
+        looks_like_text = False
         if top_ratio >= 0.46 and edge_density >= 0.060 and contrast_std >= 24.0:
-            return True
-        if top2_ratio >= 0.76 and edge_density >= 0.048 and contrast_std >= 22.0:
-            return True
-        if palette_size <= 4 and edge_density >= 0.055 and contrast_std >= 20.0:
-            return True
-        if reduced_top2_ratio >= 0.70 and edge_density >= 0.050 and contrast_std >= 20.0:
-            return True
-        if reduced_top2_ratio >= 0.66 and edge_density >= 0.072 and contrast_std >= 22.0:
-            return True
-        return False
+            looks_like_text = True
+        elif top2_ratio >= 0.76 and edge_density >= 0.048 and contrast_std >= 22.0:
+            looks_like_text = True
+        elif palette_size <= 4 and edge_density >= 0.055 and contrast_std >= 20.0:
+            looks_like_text = True
+        elif reduced_top2_ratio >= 0.70 and edge_density >= 0.050 and contrast_std >= 20.0:
+            looks_like_text = True
+        elif reduced_top2_ratio >= 0.66 and edge_density >= 0.072 and contrast_std >= 22.0:
+            looks_like_text = True
+
+        return PrefilterStats(
+            looks_like_text=looks_like_text,
+            contrast_std=contrast_std,
+            top_ratio=top_ratio,
+            top2_ratio=top2_ratio,
+            reduced_top2_ratio=reduced_top2_ratio,
+            edge_density=edge_density,
+            palette_size=palette_size,
+        )
+
+    def _looks_like_text_avatar(self, image_bytes: bytes) -> bool:
+        return self._prefilter_stats(image_bytes).looks_like_text
 
     def analyze_avatar(self, image_bytes: bytes) -> AvatarResult:
         if not self.ocr_enabled:
             return AvatarResult("", "", False, 0, 0, None)
-        if self.prefilter_enabled and not self._looks_like_text_avatar(image_bytes):
+        prefilter = self._prefilter_stats(image_bytes)
+        if self.prefilter_enabled and not prefilter.looks_like_text:
             return AvatarResult("", "", False, 0, 0, None)
 
         temp_path = ""
@@ -143,6 +174,10 @@ class JoinApprovalAvatarOCR:
                 total_char_count=int(raw.get("total_char_count", 0)),
                 matched_term=None,
             )
+        except Exception:
+            if self.fail_closed_on_prefilter_hit and prefilter.looks_like_text:
+                return AvatarResult("", "", True, 0, 0, None)
+            raise
         finally:
             if temp_path:
                 try:
