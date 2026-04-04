@@ -111,6 +111,12 @@ class SemanticAdDetector:
 
     def _ensure_db(self) -> None:
         self._conn = sqlite3.connect(self.db_path)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA temp_store=FILE")
+        self._conn.execute("PRAGMA cache_size=-1024")
+        self._conn.execute("PRAGMA mmap_size=0")
+        self._conn.execute("PRAGMA cache_spill=ON")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ads (

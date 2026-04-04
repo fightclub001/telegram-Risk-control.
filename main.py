@@ -62,17 +62,19 @@ JOIN_REVIEW_LOG_FILE = os.path.join(DATA_DIR, "join_review_logs.json")
 MOD_ACTION_LOG_FILE = os.path.join(DATA_DIR, "moderation_logs.json")
 
 reports = {}  # key: (group_id, message_id)
+reports_dirty = False
 lock = asyncio.Lock()
 repeat_warning_msg_id = {}  # (group_id, user_id) -> msg_id of "2次" repeat warning, delete if orig deleted
 config = {}
 forward_match_memory = {}  # normalized_text -> {"group_id": int, "user_id": int, "updated_at": int}
+forward_match_memory_dirty = False
 # 媒体消息举报/点赞（内存即可，按消息维度）
 media_reports = {}
 media_reports_lock = asyncio.Lock()
 media_group_report_index = {}  # (chat_id, media_group_id) -> primary media_msg_id
 media_report_last = {}  # (uid,) -> (msg_id, time) 最近一次举报的媒体
 media_report_day_count = {}  # (uid, date_str) -> count
-pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message": Message, "user_id": int, "last_update_ts": float, "repeat_signatures": set[str]}
+pending_media_groups = {}  # (chat_id, media_group_id) -> {"message_ids": [], "caption": str, "first_message_id": int, "user_id": int, "display_name": str, "last_update_ts": float, "repeat_signatures": set[str]}
 MEDIA_GROUP_SETTLE_SEC = 2.5
 MEDIA_GROUP_STALE_SEC = 5 * 60
 MEDIA_REPORT_ENTRY_TTL_SEC = 2 * 3600
@@ -100,7 +102,6 @@ MEDIA_NO_PERM_STRIKE_RESET_SEC = 300  # 超过此时间未再触发则视为重�
 # 超过此时长仍未处理：仅隐藏按钮、保留消息文本，并从内存移除记录。
 REPORT_BUTTON_HIDE_AFTER_SEC = 24 * 3600
 REPORT_BAN_HOURS_CAP = 72
-last_ban_warning_msg = {}  # group_id -> warning_id：上一条已处理的封禁警告，下次封禁时 15 秒后删除
 MISJUDGE_BOT_MENTION = "如有误封，请直接联系本群管理员处理。"
 USER_MSG_TRACK_MAXLEN = 500
 USER_MSG_24H_SEC = 24 * 3600
@@ -170,6 +171,21 @@ def _join_approval_timeout_kwargs() -> dict:
     return {
         "request_timeout": timeout,
     }
+
+
+class _DeferredReplyMessageProxy:
+    """只保留 reply 所需最小字段，避免相册聚合阶段把完整 Message 常驻在内存里。"""
+
+    def __init__(self, chat_id: int, message_id: int, user_id: int, display_name: str, caption: str = "") -> None:
+        self.chat = SimpleNamespace(id=int(chat_id))
+        self.from_user = SimpleNamespace(id=int(user_id), full_name=str(display_name or f"ID {user_id}"), username=None)
+        self.message_id = int(message_id)
+        self.caption = str(caption or "")
+
+    async def reply(self, text: str, **kwargs):
+        kwargs.setdefault("reply_to_message_id", self.message_id)
+        kwargs.setdefault("allow_sending_without_reply", True)
+        return await bot.send_message(self.chat.id, text, **kwargs)
 
 
 def get_semantic_ad_detector() -> Any:
@@ -561,8 +577,13 @@ async def save_config():
     except Exception as e:
         print(f"配置保存失败: {e}")
 
+def _mark_forward_match_memory_dirty() -> None:
+    global forward_match_memory_dirty
+    forward_match_memory_dirty = True
+
+
 async def load_forward_match_memory():
-    global forward_match_memory
+    global forward_match_memory, forward_match_memory_dirty
     try:
         if os.path.exists(FORWARD_MATCH_FILE):
             with open(FORWARD_MATCH_FILE, "r", encoding="utf-8") as f:
@@ -577,14 +598,20 @@ async def load_forward_match_memory():
                 forward_match_memory = compacted
             else:
                 forward_match_memory = {}
-            await save_forward_match_memory()
+            _mark_forward_match_memory_dirty()
+            await save_forward_match_memory(force=True)
         else:
             forward_match_memory = {}
+        forward_match_memory_dirty = False
     except Exception as e:
         print(f"forward match memory load failed: {e}")
         forward_match_memory = {}
+        forward_match_memory_dirty = False
 
-async def save_forward_match_memory():
+async def save_forward_match_memory(force: bool = False):
+    global forward_match_memory_dirty
+    if not force and not forward_match_memory_dirty:
+        return
     try:
         now = int(time.time())
         cutoff = now - USER_MSG_24H_SEC
@@ -606,8 +633,18 @@ async def save_forward_match_memory():
                 forward_match_memory.pop(key, None)
         with open(FORWARD_MATCH_FILE, "w", encoding="utf-8") as f:
             json.dump(forward_match_memory, f, ensure_ascii=False, indent=2)
+        forward_match_memory_dirty = False
     except Exception as e:
         print(f"forward match memory save failed: {e}")
+
+
+async def _forward_match_flush_worker() -> None:
+    while True:
+        await asyncio.sleep(10)
+        try:
+            await save_forward_match_memory()
+        except Exception as e:
+            print(f"forward match flush failed: {e}")
 
 def _get_recent_messages_conn() -> sqlite3.Connection:
     global recent_messages_conn
@@ -616,7 +653,11 @@ def _get_recent_messages_conn() -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA temp_store=FILE")
+        conn.execute("PRAGMA cache_size=-2048")
+        conn.execute("PRAGMA mmap_size=0")
+        conn.execute("PRAGMA cache_spill=ON")
+        conn.execute("PRAGMA wal_autocheckpoint=200")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS recent_messages (
@@ -2197,8 +2238,6 @@ async def export_listen_log(callback: CallbackQuery):
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
 # ==================== 检测和回复核心逻辑 ====================
-user_short_msg_history = {}
-
 # key: (group_id, user_id, signature_hash) -> deque[timestamp]；避免长文本直接常驻内存
 repeat_message_history = {}
 repeat_message_history_last = {}  # key -> last_activity_time，用于淘汰
@@ -2215,6 +2254,7 @@ def _remember_forward_match(group_id: int, user_id: int, text: str) -> bool:
     if not norm:
         return False
     forward_match_memory[norm] = _pack_forward_match_value(group_id, user_id, int(time.time()))
+    _mark_forward_match_memory_dirty()
     return True
 
 def _get_remembered_user_id_by_text(group_id: int, text: str) -> int | None:
@@ -2485,7 +2525,7 @@ def _report_key_str(gid: int, mid: int) -> str:
     return f"{gid}_{mid}"
 
 async def load_data():
-    global reports
+    global reports, reports_dirty
     try:
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
         if os.path.exists(DATA_FILE):
@@ -2501,10 +2541,20 @@ async def load_data():
                             reports[(int(parts[0]), int(parts[1]))] = v
                         except ValueError:
                             pass
+        reports_dirty = False
     except Exception as e:
         print("数据加载失败（首次正常）:", e)
+        reports_dirty = False
 
-async def save_data():
+def _mark_reports_dirty() -> None:
+    global reports_dirty
+    reports_dirty = True
+
+
+async def save_data(force: bool = False):
+    global reports_dirty
+    if not force and not reports_dirty:
+        return
     async with lock:
         try:
             data_to_save = {
@@ -2513,8 +2563,18 @@ async def save_data():
             }
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(data_to_save, f, ensure_ascii=False, indent=2)
+            reports_dirty = False
         except Exception as e:
             print("保存失败:", e)
+
+
+async def _reports_flush_worker() -> None:
+    while True:
+        await asyncio.sleep(10)
+        try:
+            await save_data()
+        except Exception as e:
+            print(f"reports flush failed: {e}")
 
 def build_warning_buttons(group_id: int, msg_id: int, report_count: int):
     """构建警告消息按钮；callback 带 group_id 避免多群串案；举报按钮显示当前人数"""
@@ -2613,10 +2673,19 @@ async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
     if not data:
         return
 
-    first_message = data.get("first_message")
+    first_message_id = int(data.get("first_message_id", 0) or 0)
+    first_user_id = int(data.get("user_id", 0) or 0)
+    first_display_name = str(data.get("display_name") or f"ID {first_user_id}")
     message_ids = list(dict.fromkeys(data.get("message_ids", [])))
-    if not first_message or not message_ids:
+    if not first_message_id or not message_ids:
         return
+    first_message = _DeferredReplyMessageProxy(
+        chat_id=chat_id,
+        message_id=first_message_id,
+        user_id=first_user_id,
+        display_name=first_display_name,
+        caption=str(data.get("caption") or ""),
+    )
     if await _attach_to_existing_media_group_report(
         chat_id,
         media_group_id,
@@ -2687,7 +2756,7 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
                 print(f"删除用户消息时学习样本失败: {e}")
         await _delete_original_and_linked_reply(group_id, msg_id)
     if memory_changed:
-        asyncio.create_task(save_forward_match_memory())
+        _mark_forward_match_memory_dirty()
     to_remove = []
     async with lock:
         for (gid, mid), data in list(reports.items()):
@@ -2699,7 +2768,7 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
                 to_remove.append((gid, mid))
         for k in to_remove:
             reports.pop(k, None)
-    await save_data()
+    _mark_reports_dirty()
     if orig_msg_id:
         await _delete_original_and_linked_reply(group_id, orig_msg_id)
     if keep_one_text:
@@ -2782,8 +2851,9 @@ async def on_media_message(message: Message):
             group_data = {
                 "message_ids": [],
                 "caption": "",
-                "first_message": message,
+                "first_message_id": message.message_id,
                 "user_id": user_id,
+                "display_name": _get_display_name_from_message(message, user_id),
                 "last_update_ts": now,
                 "repeat_signatures": set(),
             }
@@ -2795,8 +2865,9 @@ async def on_media_message(message: Message):
             group_data["repeat_signatures"].add(repeat_signature)
         if message.caption:
             group_data["caption"] = message.caption
-        if message.message_id < group_data["first_message"].message_id:
-            group_data["first_message"] = message
+        if message.message_id < int(group_data.get("first_message_id", message.message_id) or message.message_id):
+            group_data["first_message_id"] = message.message_id
+            group_data["display_name"] = _get_display_name_from_message(message, user_id)
         return
     if await handle_repeat_media_message(message):
         return
@@ -2890,6 +2961,9 @@ async def _delete_linked_bot_replies(group_id: int, original_msg_id: int | None)
             pass
         finally:
             bot_reply_links.pop((group_id, bot_msg_id), None)
+            for key, warning_msg_id in list(repeat_warning_msg_id.items()):
+                if warning_msg_id == bot_msg_id:
+                    repeat_warning_msg_id.pop(key, None)
 
 
 async def _drop_report_by_warning_id(group_id: int, warning_id: int) -> None:
@@ -2900,7 +2974,7 @@ async def _drop_report_by_warning_id(group_id: int, warning_id: int) -> None:
                 reports.pop(rk, None)
                 removed = True
     if removed:
-        await save_data()
+        _mark_reports_dirty()
 
 
 async def _delete_original_and_linked_reply(group_id: int, original_msg_id: int | None):
@@ -3248,7 +3322,7 @@ async def on_forward_learn_ad(message: Message):
             print(f"按文案回群删除失败: {e}")
 
         if memory_changed:
-            asyncio.create_task(save_forward_match_memory())
+            _mark_forward_match_memory_dirty()
 
         if text:
             if deleted_by_user or deleted_by_text:
@@ -3363,6 +3437,7 @@ async def handle_report(callback: CallbackQuery):
             user_id = data["suspect_id"]
             warning_id = data["warning_id"]
             reason = data["reason"]
+            _mark_reports_dirty()
         
         # 尽早返回响应，后续操作不阻塞用户
         await callback.answer(f"✅ 举报({count}人)")
@@ -3430,11 +3505,11 @@ async def handle_report(callback: CallbackQuery):
                 )
                 async with lock:
                     reports.pop(rk, None)
-                asyncio.create_task(save_data())
+                _mark_reports_dirty()
                 return
             except Exception as e:
                 print("2层2举报永封失败:", e)
-        asyncio.create_task(save_data())
+        _mark_reports_dirty()
     except Exception as e:
         print("举报异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
@@ -3549,7 +3624,7 @@ async def handle_ban(callback: CallbackQuery):
         await callback.answer(f"✅ {ban_type}")
         async with lock:
             reports.pop(rk, None)
-        await save_data()
+        _mark_reports_dirty()
     
     except TelegramBadRequest:
         await callback.answer("❌ 失败", show_alert=True)
@@ -3585,7 +3660,7 @@ async def handle_exempt(callback: CallbackQuery):
         await callback.answer("✅ 已豁免")
         async with lock:
             reports.pop(rk, None)
-        await save_data()
+        _mark_reports_dirty()
     except Exception as e:
         print("豁免异常:", e)
         await callback.answer("❌ 失败", show_alert=True)
@@ -3631,7 +3706,7 @@ async def handle_mark_ad(callback: CallbackQuery):
 
         async with lock:
             reports.pop(rk, None)
-        await save_data()
+        _mark_reports_dirty()
         # 不弹窗，仅静默确认
         await callback.answer()
     except Exception as e:
@@ -3816,7 +3891,7 @@ async def cleanup_deleted_messages():
             async with lock:
                 for oid in to_remove:
                     reports.pop(oid, None)
-            await save_data()
+            _mark_reports_dirty()
         await asyncio.sleep(1)
 
 
@@ -3842,6 +3917,9 @@ async def cleanup_bot_messages():
                 for key, tracked_msg_id in list(last_media_no_perm_msg.items()):
                     if key[0] == group_id and tracked_msg_id == msg_id:
                         last_media_no_perm_msg.pop(key, None)
+                for key, warning_msg_id in list(repeat_warning_msg_id.items()):
+                    if warning_msg_id == msg_id:
+                        repeat_warning_msg_id.pop(key, None)
 
 
 async def cleanup_orphan_replies():
@@ -3863,6 +3941,9 @@ async def cleanup_orphan_replies():
                 pass
             finally:
                 bot_reply_links.pop((group_id, bot_msg_id), None)
+                for key, warning_msg_id in list(repeat_warning_msg_id.items()):
+                    if warning_msg_id == bot_msg_id:
+                        repeat_warning_msg_id.pop(key, None)
                 await _drop_report_by_warning_id(group_id, bot_msg_id)
 
 
@@ -3956,6 +4037,8 @@ async def main():
     await load_repeat_levels()
     await load_media_stats()
     asyncio.create_task(_recent_messages_flush_worker())
+    asyncio.create_task(_forward_match_flush_worker())
+    asyncio.create_task(_reports_flush_worker())
     asyncio.create_task(_logs_flush_worker())
     asyncio.create_task(cleanup_bot_messages())
     asyncio.create_task(cleanup_deleted_messages())
