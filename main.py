@@ -1598,8 +1598,11 @@ async def view_join_logs(callback: CallbackQuery):
         group_id = int(group_id_str)
         page = max(0, int(page_str))
         page_size = 10
-        items = list(join_review_logs)
-        items.reverse()
+        items = [
+            item for item in join_review_logs
+            if int(item.get("chat_id", 0) or 0) == group_id
+        ]
+        items.sort(key=lambda item: int(item.get("ts", 0) or 0), reverse=True)
         start = page * page_size
         chunk = items[start : start + page_size]
         if not chunk:
@@ -1607,7 +1610,7 @@ async def view_join_logs(callback: CallbackQuery):
         else:
             lines = []
             for idx, item in enumerate(chunk, start=1 + start):
-                ts = time.strftime("%m-%d %H:%M", time.localtime(int(item.get("ts", 0) or 0)))
+                ts = time.strftime("%m-%d %H:%M:%S", time.localtime(int(item.get("ts", 0) or 0)))
                 lines.append(
                     f"{idx}. [{ts}] {item.get('user_label', '-')}\n"
                     f"   结果: {item.get('decision_label', '-')}\n"
@@ -1628,8 +1631,11 @@ async def view_mod_logs(callback: CallbackQuery):
         group_id = int(group_id_str)
         page = max(0, int(page_str))
         page_size = 10
-        items = list(moderation_logs)
-        items.reverse()
+        items = [
+            item for item in moderation_logs
+            if int(item.get("group_id", 0) or 0) == group_id
+        ]
+        items.sort(key=lambda item: int(item.get("ts", 0) or 0), reverse=True)
         start = page * page_size
         chunk = items[start : start + page_size]
         if not chunk:
@@ -1637,7 +1643,7 @@ async def view_mod_logs(callback: CallbackQuery):
         else:
             lines = []
             for idx, item in enumerate(chunk, start=1 + start):
-                ts = time.strftime("%m-%d %H:%M", time.localtime(int(item.get("ts", 0) or 0)))
+                ts = time.strftime("%m-%d %H:%M:%S", time.localtime(int(item.get("ts", 0) or 0)))
                 lines.append(
                     f"{idx}. [{ts}] {item.get('user_label', '-')}\n"
                     f"   动作: {item.get('action', '-')}\n"
