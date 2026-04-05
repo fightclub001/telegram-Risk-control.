@@ -83,6 +83,7 @@ MEDIA_REPORT_LAST_TTL_SEC = 6 * 3600
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector: Any | None = None
 join_approval_avatar_ocr: Any | None = None
+join_approval_risk_matcher: Any | None = None
 JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "10800").strip()))
 JOIN_APPROVAL_OCR_CACHE_MAX = max(24, int((os.getenv("OCR_CACHE_MAX") or "64").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -206,6 +207,37 @@ def get_join_approval_avatar_ocr() -> Any:
     return join_approval_avatar_ocr
 
 
+def get_join_approval_risk_matcher() -> Any:
+    global join_approval_risk_matcher
+    if join_approval_risk_matcher is None:
+        from join_approval_risk_terms import JoinApprovalRiskMatcher
+
+        join_approval_risk_matcher = JoinApprovalRiskMatcher(os.path.dirname(os.path.abspath(__file__)))
+    return join_approval_risk_matcher
+
+
+def _get_join_approval_terms(group_id: int) -> list[str]:
+    try:
+        from join_approval_risk_terms import DEFAULT_RISK_TERMS
+
+        cfg = get_group_config(group_id)
+        terms = cfg.get("join_approval_avatar_terms")
+        if isinstance(terms, list) and terms:
+            return [str(item).strip() for item in terms if str(item).strip()]
+        return list(DEFAULT_RISK_TERMS)
+    except Exception:
+        return []
+
+
+def _match_join_approval_risk_term(group_id: int, text: str) -> str | None:
+    try:
+        from join_approval_risk_terms import match_terms
+
+        return match_terms(text, _get_join_approval_terms(group_id))
+    except Exception:
+        return None
+
+
 def _prune_join_approval_avatar_cache() -> None:
     now = time.time()
     expired = [
@@ -265,10 +297,11 @@ def _log_join_review(*, user_id: int, chat_id: int, final_decision: str, reason:
 
 def _join_review_reason_text(reason: str) -> str:
     mapping = {
-        "avatar_text_avatar": "头像属于文字头像，拒绝入群",
+        "avatar_text_risk_term": "文字头像命中敏感词，拒绝入群",
         "avatar_ocr_disabled": "头像OCR未启用",
         "no_avatar": "没有头像",
         "avatar_not_text": "头像不是文字头像",
+        "avatar_text_no_risk_term": "文字头像未命中敏感词，允许入群",
         "avatar_fetch_or_ocr_failed": "头像下载或OCR失败",
         "avatar_profile_check_failed": "头像资料检查失败",
         "no_rule_hit": "未触发任何规则",
@@ -391,7 +424,7 @@ async def _record_moderation_log(
 
 @router.chat_join_request(F.chat.id.in_(GROUP_IDS))
 async def handle_chat_join_request(join_request: ChatJoinRequest):
-    """Join approval: only reject text avatars; no nickname/bio screening."""
+    """Join approval: no avatar pass; non-text avatar pass; text avatar only declines on sensitive terms."""
     user = join_request.from_user
     user_id = user.id
     chat_id = join_request.chat.id
@@ -438,16 +471,21 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
                         print(f"join avatar fetch/ocr failed user_id={user_id}: {e}")
                         avatar_result = None
                 if avatar_result:
+                    matched_term = _match_join_approval_risk_term(chat_id, avatar_result.normalized_text or avatar_result.extracted_text)
                     print(
                         "join_avatar_ocr "
                         f"user_id={user_id} chat_id={chat_id} "
                         f"text={avatar_result.extracted_text!r} "
                         f"normalized={avatar_result.normalized_text!r} "
-                        f"is_text_avatar={avatar_result.is_text_avatar}"
+                        f"is_text_avatar={avatar_result.is_text_avatar} "
+                        f"matched_term={matched_term!r}"
                     )
                     if avatar_result.is_text_avatar:
-                        final_decision = "decline"
-                        reason = "avatar_text_avatar"
+                        if matched_term:
+                            final_decision = "decline"
+                            reason = "avatar_text_risk_term"
+                        else:
+                            reason = "avatar_text_no_risk_term"
                     else:
                         reason = "avatar_not_text"
         except Exception as e:
@@ -493,6 +531,11 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
 # ==================== 配置函数 ====================
 def _default_group_config():
     """单群默认配置：仅保留当前生产仍需的核心功能。"""
+    try:
+        from join_approval_risk_terms import DEFAULT_RISK_TERMS
+        join_terms = list(DEFAULT_RISK_TERMS)
+    except Exception:
+        join_terms = []
     return {
         "enabled": True,
         "repeat_window_seconds": 2 * 3600,
@@ -505,6 +548,7 @@ def _default_group_config():
         "media_report_max_per_day": 3,
         "media_report_delete_threshold": 2,
         "semantic_ad_enabled": False,
+        "join_approval_avatar_terms": join_terms,
     }
 
 async def load_config():
@@ -1366,6 +1410,7 @@ async def get_chat_title_safe(bot, chat_id: int) -> str:
 class AdminStates(StatesGroup):
     MainMenu = State()
     GroupMenu = State()
+    EditJoinApprovalTerms = State()
     EditRepeatWindow = State()
     EditRepeatMediaWindow = State()
     EditRepeatMaxCount = State()
@@ -1388,8 +1433,10 @@ def get_main_menu_keyboard():
 
 
 def get_group_menu_keyboard(group_id: int):
+    join_terms = _get_join_approval_terms(group_id)
     buttons = [
         [InlineKeyboardButton(text="🧠 AD机器学习", callback_data=f"submenu_semantic_ad:{group_id}")],
+        [InlineKeyboardButton(text=f"🛂 入群审批 ({len(join_terms)})", callback_data=f"submenu_join_approval:{group_id}")],
         [InlineKeyboardButton(text="🔁 重复发言", callback_data=f"submenu_repeat:{group_id}")],
         [InlineKeyboardButton(text="📎 媒体权限", callback_data=f"submenu_media_perm:{group_id}")],
         [InlineKeyboardButton(text="📣 媒体举报", callback_data=f"submenu_media_report:{group_id}")],
@@ -1408,6 +1455,15 @@ def get_semantic_ad_menu_keyboard(group_id: int):
         [InlineKeyboardButton(text="➕ 增加广告语句", callback_data=f"add_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="➖ 减少广告语句", callback_data=f"remove_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="📂 广告词库展示", callback_data=f"view_semantic_ad:{group_id}")],
+        [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_join_approval_menu_keyboard(group_id: int):
+    terms = _get_join_approval_terms(group_id)
+    buttons = [
+        [InlineKeyboardButton(text=f"✏️ 编辑敏感文字 ({len(terms)})", callback_data=f"edit_join_terms:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1589,6 +1645,88 @@ async def semantic_ad_submenu(callback: CallbackQuery):
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("submenu_join_approval:"), F.from_user.id.in_(ADMIN_IDS))
+async def join_approval_submenu(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
+        terms = _get_join_approval_terms(group_id)
+        preview = "\n".join(f"- {term}" for term in terms[:8]) if terms else "（空）"
+        if len(terms) > 8:
+            preview += f"\n… 共 {len(terms)} 条"
+        text = (
+            f"<b>{title}</b> › 入群审批\n\n"
+            "当前规则：\n"
+            "1. 没有头像：通过\n"
+            "2. 头像不是文字：通过\n"
+            "3. 文字头像但不含敏感词：通过\n"
+            "4. 文字头像且命中敏感词：拒绝\n\n"
+            f"当前敏感词预览：\n{preview}"
+        )
+        kb = get_join_approval_menu_keyboard(group_id)
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("edit_join_terms:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_join_terms_callback(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        await state.update_data(group_id=group_id)
+        terms = _get_join_approval_terms(group_id)
+        text = (
+            "编辑入群审批敏感文字\n"
+            "一行一个，发送后将覆盖当前列表。\n"
+            "发送 /default 恢复默认词表，发送 /clear 清空。\n\n"
+            "当前列表：\n"
+            + ("\n".join(terms) if terms else "（空）")
+        )
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_join_approval:{group_id}")]]
+            ),
+        )
+        await state.set_state(AdminStates.EditJoinApprovalTerms)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.message(StateFilter(AdminStates.EditJoinApprovalTerms), F.from_user.id.in_(ADMIN_IDS))
+async def process_join_terms(message: Message, state: FSMContext):
+    data = await state.get_data()
+    group_id = int(data.get("group_id"))
+    if message.text and message.text.strip().lower() == "/clear":
+        new_terms: list[str] = []
+    elif message.text and message.text.strip().lower() == "/default":
+        try:
+            from join_approval_risk_terms import DEFAULT_RISK_TERMS
+
+            new_terms = list(DEFAULT_RISK_TERMS)
+        except Exception:
+            new_terms = []
+    else:
+        raw_lines = (message.text or "").splitlines()
+        new_terms = [line.strip() for line in raw_lines if line.strip()]
+
+    cfg = get_group_config(group_id)
+    cfg["join_approval_avatar_terms"] = new_terms
+    await save_config()
+    kb = get_join_approval_menu_keyboard(group_id)
+    preview = "\n".join(f"- {term}" for term in new_terms[:12]) if new_terms else "（空）"
+    if len(new_terms) > 12:
+        preview += f"\n… 共 {len(new_terms)} 条"
+    await message.reply(
+        "✅ 已更新入群审批敏感文字列表。\n\n"
+        f"当前共 {len(new_terms)} 条：\n{preview}",
+        reply_markup=kb,
+    )
+    await state.set_state(AdminStates.GroupMenu)
 
 
 @router.callback_query(F.data.startswith("view_join_logs:"), F.from_user.id.in_(ADMIN_IDS))

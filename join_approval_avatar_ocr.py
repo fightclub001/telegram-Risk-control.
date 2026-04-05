@@ -57,7 +57,7 @@ class JoinApprovalAvatarOCR:
             "off",
         }
         self.prefilter_max_side = max(48, int((os.getenv("OCR_PREFILTER_MAX_SIDE") or "96").strip()))
-        self.fail_closed_on_prefilter_hit = (os.getenv("OCR_FAIL_CLOSED_ON_PREFILTER_HIT") or "true").strip().lower() not in {
+        self.fail_closed_on_prefilter_hit = (os.getenv("OCR_FAIL_CLOSED_ON_PREFILTER_HIT") or "false").strip().lower() not in {
             "0",
             "false",
             "no",
