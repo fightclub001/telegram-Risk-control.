@@ -96,7 +96,6 @@ SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector: Any | None = None
 join_approval_avatar_ocr: Any | None = None
 join_approval_risk_matcher: Any | None = None
-mtproto_invite_resolver: Any | None = None
 JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "10800").strip()))
 JOIN_APPROVAL_OCR_CACHE_MAX = max(24, int((os.getenv("OCR_CACHE_MAX") or "64").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -134,7 +133,7 @@ user_last_warning = {}
 USER_WARNING_COOLDOWN_SEC = 60  # 同用户60秒内只发一条警告
 # 已封禁警告消息列表：group_id -> list of warning_msg_id（用于一次性删除所有已封禁警告）
 banned_warning_messages = {}
-bio_watch_cache = {}  # user_id -> (expires_at, is_match, reason)
+bio_watch_cache = {}  # (group_id, user_id) -> (expires_at, is_match, reason)
 bio_watch_pending_heap = []  # (due_ts, seq, group_id, user_id, message_id)
 bio_watch_pending_keys = set()  # {(group_id, message_id)}
 bio_watch_seq = 0
@@ -174,22 +173,7 @@ BIO_WATCH_TARGET_CHANNEL_SHORT_IDS = {
     str(item).replace("-100", "", 1)
     for item in BIO_WATCH_TARGET_CHANNEL_IDS
 }
-BIO_WATCH_TARGET_INVITE_LINKS = _parse_env_text_set(os.getenv("BIO_WATCH_INVITE_LINKS", _BIO_WATCH_DEFAULT_INVITES))
-BIO_WATCH_TARGET_INVITE_TOKENS = set()
-for _link in BIO_WATCH_TARGET_INVITE_LINKS:
-    compact = _BIO_URL_SPACE_RE.sub("", html.unescape(_link.strip().lower()))
-    compact = compact.replace("\\/", "/")
-    for _ in range(2):
-        decoded = unquote(compact)
-        if decoded == compact:
-            break
-        compact = decoded
-    for marker in ("t.me/+", "telegram.me/+", "joinchat/", "domain=+", "invite="):
-        idx = compact.find(marker)
-        if idx >= 0:
-            token = compact[idx + len(marker):].split("&", 1)[0].split("/", 1)[0].split("#", 1)[0].strip()
-            if token:
-                BIO_WATCH_TARGET_INVITE_TOKENS.add(token)
+BIO_WATCH_DEFAULT_LINKS = [item for item in _parse_env_text_set(os.getenv("BIO_WATCH_INVITE_LINKS", _BIO_WATCH_DEFAULT_INVITES))]
 
 
 def _normalize_bio_watch_text(text: str) -> str:
@@ -203,14 +187,37 @@ def _normalize_bio_watch_text(text: str) -> str:
     return _BIO_URL_SPACE_RE.sub("", compact)
 
 
-def _match_bio_watch_target(bio_text: str) -> tuple[bool, str]:
+def _extract_bio_watch_invite_tokens(links: list[str]) -> set[str]:
+    tokens: set[str] = set()
+    for link in links:
+        compact = _normalize_bio_watch_text(link)
+        for marker in ("t.me/+", "telegram.me/+", "joinchat/", "domain=+", "invite="):
+            idx = compact.find(marker)
+            if idx >= 0:
+                token = compact[idx + len(marker):].split("&", 1)[0].split("/", 1)[0].split("#", 1)[0].strip()
+                if token:
+                    tokens.add(token)
+    return tokens
+
+
+def _get_bio_watch_links(group_id: int) -> list[str]:
+    cfg = get_group_config(group_id)
+    raw = cfg.get("bio_watch_blacklist_links")
+    if isinstance(raw, list):
+        cleaned = [str(item).strip() for item in raw if str(item).strip()]
+        if cleaned:
+            return cleaned
+    return list(BIO_WATCH_DEFAULT_LINKS)
+
+
+def _match_bio_watch_target(group_id: int, bio_text: str) -> tuple[bool, str]:
     compact = _normalize_bio_watch_text(bio_text)
     if not compact:
         return False, "bio_empty"
     if not any(marker in compact for marker in _BIO_TELEGRAM_HOST_MARKERS):
         return False, "bio_no_tg_link"
 
-    for token in BIO_WATCH_TARGET_INVITE_TOKENS:
+    for token in _extract_bio_watch_invite_tokens(_get_bio_watch_links(group_id)):
         if not token:
             continue
         if (
@@ -249,25 +256,6 @@ def _match_bio_watch_target(bio_text: str) -> tuple[bool, str]:
             return True, f"channel:{full_id}"
 
     return False, "bio_other_tg_link"
-
-
-async def _match_bio_watch_target_async(bio_text: str) -> tuple[bool, str]:
-    is_match, reason = _match_bio_watch_target(bio_text)
-    if is_match:
-        return True, reason
-    if reason in {"bio_empty", "bio_no_tg_link"}:
-        return False, reason
-
-    resolver = get_mtproto_invite_resolver()
-    resolved_chat_ids, resolve_reason = await resolver.resolve_text(bio_text)
-    if not resolved_chat_ids:
-        if resolve_reason and resolve_reason != "no_invite_hash":
-            return False, f"{reason}|{resolve_reason}"
-        return False, reason
-    for chat_id in resolved_chat_ids:
-        if int(chat_id) in BIO_WATCH_TARGET_CHANNEL_IDS:
-            return True, f"mtproto_channel:{chat_id}"
-    return False, f"mtproto_other:{','.join(str(item) for item in sorted(resolved_chat_ids))}"
 
 
 def _clip_text(s: str, n: int = 80) -> str:
@@ -354,15 +342,6 @@ def get_join_approval_risk_matcher() -> Any:
 
         join_approval_risk_matcher = JoinApprovalRiskMatcher(os.path.dirname(os.path.abspath(__file__)))
     return join_approval_risk_matcher
-
-
-def get_mtproto_invite_resolver() -> Any:
-    global mtproto_invite_resolver
-    if mtproto_invite_resolver is None:
-        from mtproto_invite_resolver import MTProtoInviteResolver
-
-        mtproto_invite_resolver = MTProtoInviteResolver(data_dir=DATA_DIR)
-    return mtproto_invite_resolver
 
 
 def _get_join_approval_terms(group_id: int) -> list[str]:
@@ -463,29 +442,30 @@ def _prune_bio_watch_cache() -> None:
         bio_watch_cache.pop(user_id, None)
 
 
-def _get_bio_watch_cached(user_id: int) -> tuple[bool, str] | None:
-    entry = bio_watch_cache.get(int(user_id))
+def _get_bio_watch_cached(group_id: int, user_id: int) -> tuple[bool, str] | None:
+    cache_key = (int(group_id), int(user_id))
+    entry = bio_watch_cache.get(cache_key)
     if not entry:
         return None
     expires_at, is_match, reason = entry
     if time.time() >= float(expires_at):
-        bio_watch_cache.pop(int(user_id), None)
+        bio_watch_cache.pop(cache_key, None)
         return None
     return bool(is_match), str(reason or "")
 
 
-async def _refresh_bio_watch_cache(user_id: int) -> tuple[bool, str]:
+async def _refresh_bio_watch_cache(group_id: int, user_id: int) -> tuple[bool, str]:
     reason = "bio_fetch_failed"
     is_match = False
     ttl = BIO_WATCH_CACHE_FAIL_TTL_SEC
     try:
         chat = await bot.get_chat(int(user_id))
         bio_text = (getattr(chat, "bio", None) or getattr(chat, "description", None) or "").strip()
-        is_match, reason = await _match_bio_watch_target_async(bio_text)
+        is_match, reason = _match_bio_watch_target(group_id, bio_text)
         ttl = BIO_WATCH_CACHE_HIT_TTL_SEC if is_match else BIO_WATCH_CACHE_MISS_TTL_SEC
     except Exception as e:
         reason = f"bio_fetch_failed:{type(e).__name__}"
-    bio_watch_cache[int(user_id)] = (time.time() + max(30, int(ttl)), bool(is_match), str(reason))
+    bio_watch_cache[(int(group_id), int(user_id))] = (time.time() + max(30, int(ttl)), bool(is_match), str(reason))
     _prune_bio_watch_cache()
     return bool(is_match), str(reason)
 
@@ -512,9 +492,9 @@ def _schedule_bio_watch_check(message: Message) -> None:
 
 
 async def _enforce_bio_watch_message(group_id: int, user_id: int, message_id: int) -> None:
-    cached = _get_bio_watch_cached(user_id)
+    cached = _get_bio_watch_cached(group_id, user_id)
     if cached is None:
-        is_match, reason = await _refresh_bio_watch_cache(user_id)
+        is_match, reason = await _refresh_bio_watch_cache(group_id, user_id)
     else:
         is_match, reason = cached
     if not is_match:
@@ -847,6 +827,7 @@ def _default_group_config():
         "media_report_delete_threshold": 2,
         "semantic_ad_enabled": False,
         "join_approval_avatar_terms": join_terms,
+        "bio_watch_blacklist_links": list(BIO_WATCH_DEFAULT_LINKS),
     }
 
 async def load_config():
@@ -1709,6 +1690,7 @@ class AdminStates(StatesGroup):
     MainMenu = State()
     GroupMenu = State()
     EditJoinApprovalTerms = State()
+    EditBioBlacklistLinks = State()
     EditRepeatWindow = State()
     EditRepeatMediaWindow = State()
     EditRepeatMaxCount = State()
@@ -1769,8 +1751,10 @@ def get_join_approval_menu_keyboard(group_id: int):
 def get_basic_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     enabled = "✅" if cfg.get("enabled") else "❌"
+    link_count = len(_get_bio_watch_links(group_id))
     buttons = [
         [InlineKeyboardButton(text=f"状态: {enabled}", callback_data=f"toggle_group:{group_id}")],
+        [InlineKeyboardButton(text=f"🔗 黑名单链接 ({link_count})", callback_data=f"edit_bio_links:{group_id}")],
         [InlineKeyboardButton(text="📄 导出监听日志（近10条）", callback_data=f"export_listen_log:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
@@ -2022,6 +2006,62 @@ async def process_join_terms(message: Message, state: FSMContext):
     await message.reply(
         "✅ 已更新入群审批敏感文字列表。\n\n"
         f"当前共 {len(new_terms)} 条：\n{preview}",
+        reply_markup=kb,
+    )
+    await state.set_state(AdminStates.GroupMenu)
+
+
+@router.callback_query(F.data.startswith("edit_bio_links:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_bio_links_callback(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        await state.update_data(group_id=group_id)
+        links = _get_bio_watch_links(group_id)
+        text = (
+            "编辑简介黑名单链接\n"
+            "一行一个，发送后将覆盖当前列表。\n"
+            "只要用户 bio 中出现这些 t.me/+... 链接之一，就会在其消息成功存活 2 秒后执行删除与封禁。\n"
+            "发送 /default 恢复默认列表，发送 /clear 清空。\n\n"
+            "当前列表：\n"
+            + ("\n".join(links) if links else "（空）")
+        )
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_basic:{group_id}")]]
+            ),
+        )
+        await state.set_state(AdminStates.EditBioBlacklistLinks)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.message(StateFilter(AdminStates.EditBioBlacklistLinks), F.from_user.id.in_(ADMIN_IDS))
+async def process_bio_links(message: Message, state: FSMContext):
+    data = await state.get_data()
+    group_id = int(data.get("group_id"))
+    if message.text and message.text.strip().lower() == "/clear":
+        new_links: list[str] = []
+    elif message.text and message.text.strip().lower() == "/default":
+        new_links = list(BIO_WATCH_DEFAULT_LINKS)
+    else:
+        raw_lines = (message.text or "").splitlines()
+        new_links = [line.strip() for line in raw_lines if line.strip()]
+
+    cfg = get_group_config(group_id)
+    cfg["bio_watch_blacklist_links"] = new_links
+    # 群配置发生变化时，清掉该群现有 bio 命中缓存，避免旧规则继续生效。
+    for key in [key for key in bio_watch_cache.keys() if key[0] == group_id]:
+        bio_watch_cache.pop(key, None)
+    await save_config()
+    kb = get_basic_menu_keyboard(group_id)
+    preview = "\n".join(f"- {item}" for item in new_links[:12]) if new_links else "（空）"
+    if len(new_links) > 12:
+        preview += f"\n… 共 {len(new_links)} 条"
+    await message.reply(
+        "✅ 已更新简介黑名单链接列表。\n\n"
+        f"当前共 {len(new_links)} 条：\n{preview}",
         reply_markup=kb,
     )
     await state.set_state(AdminStates.GroupMenu)
@@ -2603,7 +2643,13 @@ async def basic_submenu(callback: CallbackQuery):
         title = await get_chat_title_safe(callback.bot, group_id)
         cfg = get_group_config(group_id)
         status = "✅ 运行中" if cfg.get("enabled") else "❌ 已停用"
-        text = f"<b>{title}</b> › 基础设置\n\n<code>ID: {group_id}</code>\n状态: {status}"
+        links = _get_bio_watch_links(group_id)
+        text = (
+            f"<b>{title}</b> › 基础设置\n\n"
+            f"<code>ID: {group_id}</code>\n"
+            f"状态: {status}\n"
+            f"简介黑名单链接: {len(links)} 条"
+        )
         kb = get_basic_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -2622,7 +2668,13 @@ async def toggle_group(callback: CallbackQuery):
         kb = get_basic_menu_keyboard(group_id)
         status_display = "✅ 运行中" if cfg.get("enabled") else "❌ 已停用"
         title = await get_chat_title_safe(callback.bot, group_id)
-        text = f"<b>{title}</b> › 基础设置\n\n<code>ID: {group_id}</code>\n状态: {status_display}"
+        links = _get_bio_watch_links(group_id)
+        text = (
+            f"<b>{title}</b> › 基础设置\n\n"
+            f"<code>ID: {group_id}</code>\n"
+            f"状态: {status_display}\n"
+            f"简介黑名单链接: {len(links)} 条"
+        )
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
