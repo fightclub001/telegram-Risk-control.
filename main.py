@@ -3567,6 +3567,22 @@ async def _delete_all_banned_warnings(group_id: int):
         except Exception:
             pass
     banned_warning_messages[group_id] = []
+
+
+_OTHER_CONTENT = {
+    ContentType.STICKER,
+    ContentType.DOCUMENT,
+    ContentType.ANIMATION,
+    ContentType.AUDIO,
+    ContentType.LOCATION,
+    ContentType.CONTACT,
+    ContentType.DICE,
+    ContentType.POLL,
+    ContentType.VENUE,
+    ContentType.GAME,
+}
+
+
 @router.message(F.chat.id.in_(GROUP_IDS), F.text)
 async def detect_and_warn(message: Message):
     """文本消息主流程：AD 语义匹配 -> 权限查询 -> 重复文字处罚 -> 合规计入媒体解锁。"""
@@ -3808,21 +3824,6 @@ async def on_member_left(message: Message):
         await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
     except Exception as e:
         print(f"处理退群用户消息清理失败: {e}")
-
-# 其他内容类型（贴纸/文件/动画等）：仅做外部引用检测，与文本/媒体一致处理
-_OTHER_CONTENT = {
-    ContentType.STICKER,
-    ContentType.DOCUMENT,
-    ContentType.ANIMATION,
-    ContentType.AUDIO,
-    ContentType.LOCATION,
-    ContentType.CONTACT,
-    ContentType.DICE,
-    ContentType.POLL,
-    ContentType.VENUE,
-    ContentType.GAME,
-}
-
 
 # 外部引用检测已移除，交由其他机器人处理
 
