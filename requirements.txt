@@ -4,3 +4,4 @@ rapidfuzz>=3.9.0
 rapidocr-onnxruntime>=1.4,<2
 Pillow>=10,<12
 numpy>=1.26,<3
+telethon>=1.42,<2

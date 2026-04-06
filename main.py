@@ -96,6 +96,7 @@ SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector: Any | None = None
 join_approval_avatar_ocr: Any | None = None
 join_approval_risk_matcher: Any | None = None
+mtproto_invite_resolver: Any | None = None
 JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "10800").strip()))
 JOIN_APPROVAL_OCR_CACHE_MAX = max(24, int((os.getenv("OCR_CACHE_MAX") or "64").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -250,6 +251,25 @@ def _match_bio_watch_target(bio_text: str) -> tuple[bool, str]:
     return False, "bio_other_tg_link"
 
 
+async def _match_bio_watch_target_async(bio_text: str) -> tuple[bool, str]:
+    is_match, reason = _match_bio_watch_target(bio_text)
+    if is_match:
+        return True, reason
+    if reason in {"bio_empty", "bio_no_tg_link"}:
+        return False, reason
+
+    resolver = get_mtproto_invite_resolver()
+    resolved_chat_ids, resolve_reason = await resolver.resolve_text(bio_text)
+    if not resolved_chat_ids:
+        if resolve_reason and resolve_reason != "no_invite_hash":
+            return False, f"{reason}|{resolve_reason}"
+        return False, reason
+    for chat_id in resolved_chat_ids:
+        if int(chat_id) in BIO_WATCH_TARGET_CHANNEL_IDS:
+            return True, f"mtproto_channel:{chat_id}"
+    return False, f"mtproto_other:{','.join(str(item) for item in sorted(resolved_chat_ids))}"
+
+
 def _clip_text(s: str, n: int = 80) -> str:
     s = (s or "").replace("\n", " ").strip()
     if len(s) <= n:
@@ -334,6 +354,15 @@ def get_join_approval_risk_matcher() -> Any:
 
         join_approval_risk_matcher = JoinApprovalRiskMatcher(os.path.dirname(os.path.abspath(__file__)))
     return join_approval_risk_matcher
+
+
+def get_mtproto_invite_resolver() -> Any:
+    global mtproto_invite_resolver
+    if mtproto_invite_resolver is None:
+        from mtproto_invite_resolver import MTProtoInviteResolver
+
+        mtproto_invite_resolver = MTProtoInviteResolver(data_dir=DATA_DIR)
+    return mtproto_invite_resolver
 
 
 def _get_join_approval_terms(group_id: int) -> list[str]:
@@ -452,7 +481,7 @@ async def _refresh_bio_watch_cache(user_id: int) -> tuple[bool, str]:
     try:
         chat = await bot.get_chat(int(user_id))
         bio_text = (getattr(chat, "bio", None) or getattr(chat, "description", None) or "").strip()
-        is_match, reason = _match_bio_watch_target(bio_text)
+        is_match, reason = await _match_bio_watch_target_async(bio_text)
         ttl = BIO_WATCH_CACHE_HIT_TTL_SEC if is_match else BIO_WATCH_CACHE_MISS_TTL_SEC
     except Exception as e:
         reason = f"bio_fetch_failed:{type(e).__name__}"
