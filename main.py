@@ -1,7 +1,10 @@
 import asyncio
+import heapq
+import html
 import io
 import json
 import os
+import re
 import sqlite3
 import time
 import hashlib
@@ -9,6 +12,7 @@ from copy import deepcopy
 from collections import deque
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import unquote
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
@@ -80,6 +84,14 @@ MEDIA_GROUP_STALE_SEC = 5 * 60
 MEDIA_REPORT_ENTRY_TTL_SEC = 2 * 3600
 MEDIA_REPORT_DELETED_TTL_SEC = 15 * 60
 MEDIA_REPORT_LAST_TTL_SEC = 6 * 3600
+BIO_WATCH_DELAY_SEC = 2.0
+BIO_WATCH_CACHE_HIT_TTL_SEC = max(300, int((os.getenv("BIO_WATCH_HIT_TTL_SECONDS") or "7200").strip()))
+BIO_WATCH_CACHE_MISS_TTL_SEC = max(60, int((os.getenv("BIO_WATCH_MISS_TTL_SECONDS") or "1800").strip()))
+BIO_WATCH_CACHE_FAIL_TTL_SEC = max(30, int((os.getenv("BIO_WATCH_FAIL_TTL_SECONDS") or "300").strip()))
+BIO_WATCH_CACHE_MAX = max(128, int((os.getenv("BIO_WATCH_CACHE_MAX") or "4096").strip()))
+BIO_WATCH_WORKER_IDLE_SEC = 0.5
+_BIO_WATCH_DEFAULT_CHANNEL_IDS = "-1003816108283"
+_BIO_WATCH_DEFAULT_INVITES = "https://t.me/+1byYJLskCfAyMGZk"
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 semantic_ad_detector: Any | None = None
 join_approval_avatar_ocr: Any | None = None
@@ -121,6 +133,10 @@ user_last_warning = {}
 USER_WARNING_COOLDOWN_SEC = 60  # 同用户60秒内只发一条警告
 # 已封禁警告消息列表：group_id -> list of warning_msg_id（用于一次性删除所有已封禁警告）
 banned_warning_messages = {}
+bio_watch_cache = {}  # user_id -> (expires_at, is_match, reason)
+bio_watch_pending_heap = []  # (due_ts, seq, group_id, user_id, message_id)
+bio_watch_pending_keys = set()  # {(group_id, message_id)}
+bio_watch_seq = 0
 
 # ==================== 监听决策日志（仅保留最近10条） ====================
 listen_decision_logs = deque(maxlen=10)  # newest appended to right
@@ -128,6 +144,110 @@ recent_messages_conn: sqlite3.Connection | None = None
 recent_messages_pending_writes = deque()
 recent_messages_lock = asyncio.Lock()
 recent_messages_last_prune_ts = 0.0
+_BIO_URL_SPACE_RE = re.compile(r"[\s\u200b-\u200f\u2060\ufeff]+")
+_BIO_TELEGRAM_HOST_MARKERS = ("t.me/", "telegram.me/", "telegram.dog/", "tg://")
+
+
+def _parse_env_int_set(raw: str) -> set[int]:
+    values: set[int] = set()
+    for item in (raw or "").replace(",", " ").split():
+        try:
+            values.add(int(item.strip()))
+        except Exception:
+            continue
+    return values
+
+
+def _parse_env_text_set(raw: str) -> set[str]:
+    values: set[str] = set()
+    for item in (raw or "").replace(",", " ").split():
+        cleaned = item.strip()
+        if cleaned:
+            values.add(cleaned)
+    return values
+
+
+BIO_WATCH_TARGET_CHANNEL_IDS = _parse_env_int_set(os.getenv("BIO_WATCH_CHANNEL_IDS", _BIO_WATCH_DEFAULT_CHANNEL_IDS))
+BIO_WATCH_TARGET_CHANNEL_FULL_IDS = {str(item) for item in BIO_WATCH_TARGET_CHANNEL_IDS}
+BIO_WATCH_TARGET_CHANNEL_SHORT_IDS = {
+    str(item).replace("-100", "", 1)
+    for item in BIO_WATCH_TARGET_CHANNEL_IDS
+}
+BIO_WATCH_TARGET_INVITE_LINKS = _parse_env_text_set(os.getenv("BIO_WATCH_INVITE_LINKS", _BIO_WATCH_DEFAULT_INVITES))
+BIO_WATCH_TARGET_INVITE_TOKENS = set()
+for _link in BIO_WATCH_TARGET_INVITE_LINKS:
+    compact = _BIO_URL_SPACE_RE.sub("", html.unescape(_link.strip().lower()))
+    compact = compact.replace("\\/", "/")
+    for _ in range(2):
+        decoded = unquote(compact)
+        if decoded == compact:
+            break
+        compact = decoded
+    for marker in ("t.me/+", "telegram.me/+", "joinchat/", "domain=+", "invite="):
+        idx = compact.find(marker)
+        if idx >= 0:
+            token = compact[idx + len(marker):].split("&", 1)[0].split("/", 1)[0].split("#", 1)[0].strip()
+            if token:
+                BIO_WATCH_TARGET_INVITE_TOKENS.add(token)
+
+
+def _normalize_bio_watch_text(text: str) -> str:
+    compact = html.unescape((text or "").strip().lower())
+    compact = compact.replace("\\/", "/")
+    for _ in range(2):
+        decoded = unquote(compact)
+        if decoded == compact:
+            break
+        compact = decoded
+    return _BIO_URL_SPACE_RE.sub("", compact)
+
+
+def _match_bio_watch_target(bio_text: str) -> tuple[bool, str]:
+    compact = _normalize_bio_watch_text(bio_text)
+    if not compact:
+        return False, "bio_empty"
+    if not any(marker in compact for marker in _BIO_TELEGRAM_HOST_MARKERS):
+        return False, "bio_no_tg_link"
+
+    for token in BIO_WATCH_TARGET_INVITE_TOKENS:
+        if not token:
+            continue
+        if (
+            f"t.me/+{token}" in compact
+            or f"telegram.me/+{token}" in compact
+            or f"joinchat/{token}" in compact
+            or f"domain=+{token}" in compact
+            or f"invite={token}" in compact
+        ):
+            return True, f"invite:{token}"
+
+    for short_id in BIO_WATCH_TARGET_CHANNEL_SHORT_IDS:
+        if not short_id:
+            continue
+        if (
+            f"/c/{short_id}" in compact
+            or f"domain=c/{short_id}" in compact
+            or f"channel={short_id}" in compact
+            or f"channel=-100{short_id}" in compact
+            or f"chatid=-100{short_id}" in compact
+            or f"chat_id=-100{short_id}" in compact
+            or f"peer=-100{short_id}" in compact
+            or f"startchannel=-100{short_id}" in compact
+        ):
+            return True, f"channel:{short_id}"
+
+    for full_id in BIO_WATCH_TARGET_CHANNEL_FULL_IDS:
+        if not full_id:
+            continue
+        if (
+            f"channel={full_id}" in compact
+            or f"chatid={full_id}" in compact
+            or f"chat_id={full_id}" in compact
+            or f"peer={full_id}" in compact
+        ):
+            return True, f"channel:{full_id}"
+
+    return False, "bio_other_tg_link"
 
 
 def _clip_text(s: str, n: int = 80) -> str:
@@ -293,6 +413,155 @@ def _log_join_review(*, user_id: int, chat_id: int, final_decision: str, reason:
         f"user_id={user_id} chat_id={chat_id} "
         f"decision={final_decision} reason={reason}"
     )
+
+
+def _prune_bio_watch_cache() -> None:
+    now = time.time()
+    expired = [
+        user_id
+        for user_id, (expires_at, _is_match, _reason) in list(bio_watch_cache.items())
+        if now >= float(expires_at)
+    ]
+    for user_id in expired:
+        bio_watch_cache.pop(user_id, None)
+    if len(bio_watch_cache) <= BIO_WATCH_CACHE_MAX:
+        return
+    overflow = sorted(
+        bio_watch_cache.items(),
+        key=lambda item: float(item[1][0]),
+    )[: len(bio_watch_cache) - BIO_WATCH_CACHE_MAX]
+    for user_id, _value in overflow:
+        bio_watch_cache.pop(user_id, None)
+
+
+def _get_bio_watch_cached(user_id: int) -> tuple[bool, str] | None:
+    entry = bio_watch_cache.get(int(user_id))
+    if not entry:
+        return None
+    expires_at, is_match, reason = entry
+    if time.time() >= float(expires_at):
+        bio_watch_cache.pop(int(user_id), None)
+        return None
+    return bool(is_match), str(reason or "")
+
+
+async def _refresh_bio_watch_cache(user_id: int) -> tuple[bool, str]:
+    reason = "bio_fetch_failed"
+    is_match = False
+    ttl = BIO_WATCH_CACHE_FAIL_TTL_SEC
+    try:
+        chat = await bot.get_chat(int(user_id))
+        bio_text = (getattr(chat, "bio", None) or getattr(chat, "description", None) or "").strip()
+        is_match, reason = _match_bio_watch_target(bio_text)
+        ttl = BIO_WATCH_CACHE_HIT_TTL_SEC if is_match else BIO_WATCH_CACHE_MISS_TTL_SEC
+    except Exception as e:
+        reason = f"bio_fetch_failed:{type(e).__name__}"
+    bio_watch_cache[int(user_id)] = (time.time() + max(30, int(ttl)), bool(is_match), str(reason))
+    _prune_bio_watch_cache()
+    return bool(is_match), str(reason)
+
+
+def _schedule_bio_watch_check(message: Message) -> None:
+    global bio_watch_seq
+    if not BIO_WATCH_TARGET_CHANNEL_IDS:
+        return
+    if not message.from_user or message.from_user.is_bot:
+        return
+    if message.from_user.id in ADMIN_IDS:
+        return
+    if not message.chat or message.chat.id not in GROUP_IDS:
+        return
+    key = (int(message.chat.id), int(message.message_id))
+    if key in bio_watch_pending_keys:
+        return
+    bio_watch_pending_keys.add(key)
+    bio_watch_seq += 1
+    heapq.heappush(
+        bio_watch_pending_heap,
+        (time.time() + BIO_WATCH_DELAY_SEC, bio_watch_seq, int(message.chat.id), int(message.from_user.id), int(message.message_id)),
+    )
+
+
+async def _enforce_bio_watch_message(group_id: int, user_id: int, message_id: int) -> None:
+    cached = _get_bio_watch_cached(user_id)
+    if cached is None:
+        is_match, reason = await _refresh_bio_watch_cache(user_id)
+    else:
+        is_match, reason = cached
+    if not is_match:
+        if str(reason).startswith("bio_fetch_failed"):
+            _push_listen_log(
+                group_id=group_id,
+                user_id=user_id,
+                msg_id=message_id,
+                text="",
+                verdict="SKIP",
+                details=f"简介频道检查未执行成功: {reason}",
+            )
+        return
+
+    deleted = False
+    try:
+        await bot.delete_message(group_id, message_id)
+        deleted = True
+    except TelegramBadRequest:
+        return
+    except Exception:
+        return
+
+    if not deleted:
+        return
+
+    _forget_tracked_user_message(group_id, message_id)
+    await _delete_linked_bot_replies(group_id, message_id)
+    try:
+        await bot.restrict_chat_member(
+            chat_id=group_id,
+            user_id=user_id,
+            permissions=ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False,
+            ),
+            until_date=None,
+        )
+    except Exception as e:
+        print(f"bio watch restrict failed group_id={group_id} user_id={user_id}: {e}")
+    await _record_moderation_log(
+        group_id=group_id,
+        user_id=user_id,
+        user_label=f"ID {user_id}",
+        action="简介引流封禁",
+        reason=f"简介命中目标频道，来源={reason}",
+    )
+    _push_listen_log(
+        group_id=group_id,
+        user_id=user_id,
+        msg_id=message_id,
+        text="",
+        verdict="RULE_ACTION",
+        details=f"简介命中目标频道，消息存活超过 {int(BIO_WATCH_DELAY_SEC)} 秒后已删除并封禁",
+    )
+
+
+async def bio_watch_enforcement_worker() -> None:
+    while True:
+        if not bio_watch_pending_heap:
+            await asyncio.sleep(BIO_WATCH_WORKER_IDLE_SEC)
+            continue
+        due_ts, _seq, group_id, user_id, message_id = bio_watch_pending_heap[0]
+        now = time.time()
+        if now < float(due_ts):
+            await asyncio.sleep(min(BIO_WATCH_WORKER_IDLE_SEC, max(0.05, float(due_ts) - now)))
+            continue
+        heapq.heappop(bio_watch_pending_heap)
+        bio_watch_pending_keys.discard((int(group_id), int(message_id)))
+        await _enforce_bio_watch_message(int(group_id), int(user_id), int(message_id))
 
 
 def _join_review_reason_text(reason: str) -> str:
@@ -2938,6 +3207,7 @@ async def on_media_message(message: Message):
     group_id = message.chat.id
     now = time.time()
     _track_user_message(group_id, user_id, message.message_id, message.caption or "")
+    _schedule_bio_watch_check(message)
     semantic_text = (message.caption or "").strip()
     if semantic_text:
         if await _check_and_delete_semantic_ad_message(message, semantic_text, group_id=group_id, user_id=user_id):
@@ -3296,6 +3566,7 @@ async def detect_and_warn(message: Message):
     group_id = message.chat.id
     text = message.text or ""
     _track_user_message(group_id, user_id, message.message_id, text)
+    _schedule_bio_watch_check(message)
 
     # 语义广告检测（优先级最高；命中后直接删除不做提醒）
     if cfg.get("semantic_ad_enabled", False) and len((message.text or "").strip()) >= 4:
@@ -3353,6 +3624,18 @@ async def detect_and_warn(message: Message):
         details="未命中AD语义库；未触发重复文本处罚",
     )
     await _try_count_media_and_notify(message, group_id, user_id, cfg)
+
+
+@router.message(F.chat.id.in_(GROUP_IDS), F.content_type.in_(_OTHER_CONTENT))
+async def on_other_content_message(message: Message):
+    """其他内容类型只挂简介频道延迟执法，不额外做旧风控。"""
+    if not message.from_user or message.from_user.is_bot:
+        return
+    cfg = get_group_config(message.chat.id)
+    if not cfg.get("enabled", True):
+        return
+    _track_user_message(message.chat.id, message.from_user.id, message.message_id, "")
+    _schedule_bio_watch_check(message)
 
 
 @router.message(Command(commands=["ad", "AD", "Ad"]), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
@@ -4096,6 +4379,7 @@ async def cleanup_media_runtime_state():
     while True:
         await asyncio.sleep(120)
         now = time.time()
+        _prune_bio_watch_cache()
 
         stale_group_keys = [
             key
@@ -4188,6 +4472,7 @@ async def main():
     asyncio.create_task(cleanup_deleted_messages())
     asyncio.create_task(cleanup_orphan_replies())
     asyncio.create_task(cleanup_media_runtime_state())
+    asyncio.create_task(bio_watch_enforcement_worker())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
