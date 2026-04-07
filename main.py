@@ -93,9 +93,11 @@ BIO_WATCH_WORKER_IDLE_SEC = 0.5
 _BIO_WATCH_DEFAULT_CHANNEL_IDS = "-1003816108283"
 _BIO_WATCH_DEFAULT_INVITES = "https://t.me/+1byYJLskCfAyMGZk"
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
+IMAGE_FUZZY_BLOCK_FILE = os.path.join(DATA_DIR, "image_fuzzy_blocks.json")
 semantic_ad_detector: Any | None = None
 join_approval_avatar_ocr: Any | None = None
 join_approval_risk_matcher: Any | None = None
+image_fuzzy_blocker: Any | None = None
 JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "10800").strip()))
 JOIN_APPROVAL_OCR_CACHE_MAX = max(24, int((os.getenv("OCR_CACHE_MAX") or "64").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -344,6 +346,15 @@ def get_join_approval_risk_matcher() -> Any:
     return join_approval_risk_matcher
 
 
+def get_image_fuzzy_blocker() -> Any:
+    global image_fuzzy_blocker
+    if image_fuzzy_blocker is None:
+        from image_fuzzy_blocker import ImageFuzzyBlocker
+
+        image_fuzzy_blocker = ImageFuzzyBlocker(IMAGE_FUZZY_BLOCK_FILE)
+    return image_fuzzy_blocker
+
+
 def _get_join_approval_terms(group_id: int) -> list[str]:
     try:
         from join_approval_risk_terms import DEFAULT_RISK_TERMS
@@ -364,6 +375,21 @@ def _match_join_approval_risk_term(group_id: int, text: str) -> str | None:
         return match_terms(text, _get_join_approval_terms(group_id))
     except Exception:
         return None
+
+
+def _image_hash_enabled(group_id: int) -> bool:
+    cfg = get_group_config(group_id)
+    return bool(cfg.get("image_fuzzy_block_enabled", True))
+
+
+def _image_hash_max_distance(group_id: int) -> int:
+    cfg = get_group_config(group_id)
+    return max(0, int(cfg.get("image_fuzzy_block_distance", 10) or 10))
+
+
+def _image_hash_should_ban(group_id: int) -> bool:
+    cfg = get_group_config(group_id)
+    return bool(cfg.get("image_fuzzy_ban_on_match", True))
 
 
 def _prune_join_approval_avatar_cache() -> None:
@@ -575,6 +601,7 @@ async def bio_watch_enforcement_worker() -> None:
 
 def _join_review_reason_text(reason: str) -> str:
     mapping = {
+        "avatar_fuzzy_hash_match": "头像命中关键图相似哈希，拒绝入群",
         "avatar_text_risk_term": "文字头像命中敏感词，拒绝入群",
         "avatar_ocr_disabled": "头像OCR未启用",
         "no_avatar": "没有头像",
@@ -723,31 +750,37 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
                 reason = "no_avatar"
             else:
                 largest = photos.photos[0][-1]
-                avatar_result = _get_join_approval_avatar_cache(largest.file_unique_id)
-                if avatar_result is None:
-                    try:
-                        tg_file = await bot.get_file(
-                            largest.file_id,
-                            **_join_approval_timeout_kwargs(),
-                        )
-                        if not tg_file.file_path:
-                            raise ValueError("empty file_path")
-                        downloaded = await bot.download_file(
-                            tg_file.file_path,
-                            timeout=JOIN_APPROVAL_REQUEST_TIMEOUT,
-                        )
-                        if downloaded is None:
-                            raise ValueError("avatar download returned None")
-                        image_bytes = downloaded.getvalue() if isinstance(downloaded, io.BytesIO) else downloaded.read()
-                        avatar_result = await asyncio.to_thread(
-                            approval_ocr.analyze_avatar,
-                            image_bytes,
-                        )
-                        _set_join_approval_avatar_cache(largest.file_unique_id, avatar_result)
-                    except Exception as e:
-                        reason = "avatar_fetch_or_ocr_failed"
-                        print(f"join avatar fetch/ocr failed user_id={user_id}: {e}")
-                        avatar_result = None
+                avatar_result = None
+                try:
+                    tg_file = await bot.get_file(
+                        largest.file_id,
+                        **_join_approval_timeout_kwargs(),
+                    )
+                    if not tg_file.file_path:
+                        raise ValueError("empty file_path")
+                    downloaded = await bot.download_file(
+                        tg_file.file_path,
+                        timeout=JOIN_APPROVAL_REQUEST_TIMEOUT,
+                    )
+                    if downloaded is None:
+                        raise ValueError("avatar download returned None")
+                    image_bytes = downloaded.getvalue() if isinstance(downloaded, io.BytesIO) else downloaded.read()
+                    image_match = await _match_fuzzy_blocked_image(chat_id, image_bytes)
+                    if image_match is not None:
+                        final_decision = "decline"
+                        reason = "avatar_fuzzy_hash_match"
+                    else:
+                        avatar_result = _get_join_approval_avatar_cache(largest.file_unique_id)
+                        if avatar_result is None:
+                            avatar_result = await asyncio.to_thread(
+                                approval_ocr.analyze_avatar,
+                                image_bytes,
+                            )
+                            _set_join_approval_avatar_cache(largest.file_unique_id, avatar_result)
+                except Exception as e:
+                    reason = "avatar_fetch_or_ocr_failed"
+                    print(f"join avatar fetch/ocr failed user_id={user_id}: {e}")
+                    avatar_result = None
                 if avatar_result:
                     matched_term = _match_join_approval_risk_term(chat_id, avatar_result.normalized_text or avatar_result.extracted_text)
                     print(
@@ -805,6 +838,7 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
             final_decision=final_decision,
             reason=reason,
         )
+        await save_join_review_logs(force=True)
 
 # ==================== 配置函数 ====================
 def _default_group_config():
@@ -828,6 +862,9 @@ def _default_group_config():
         "semantic_ad_enabled": False,
         "join_approval_avatar_terms": join_terms,
         "bio_watch_blacklist_links": list(BIO_WATCH_DEFAULT_LINKS),
+        "image_fuzzy_block_enabled": True,
+        "image_fuzzy_block_distance": 10,
+        "image_fuzzy_ban_on_match": True,
     }
 
 async def load_config():
@@ -1690,6 +1727,9 @@ class AdminStates(StatesGroup):
     MainMenu = State()
     GroupMenu = State()
     EditJoinApprovalTerms = State()
+    EditJoinImageHashDistance = State()
+    AddJoinImageHashSample = State()
+    RemoveJoinImageHashSample = State()
     EditBioBlacklistLinks = State()
     EditRepeatWindow = State()
     EditRepeatMediaWindow = State()
@@ -1742,8 +1782,15 @@ def get_semantic_ad_menu_keyboard(group_id: int):
 
 def get_join_approval_menu_keyboard(group_id: int):
     terms = _get_join_approval_terms(group_id)
+    samples = get_image_fuzzy_blocker().list_group_samples(group_id)
+    image_enabled = "✅" if _image_hash_enabled(group_id) else "❌"
     buttons = [
         [InlineKeyboardButton(text=f"✏️ 编辑敏感文字 ({len(terms)})", callback_data=f"edit_join_terms:{group_id}")],
+        [InlineKeyboardButton(text=f"关键图相似拦截 {image_enabled}", callback_data=f"toggle_join_image_hash:{group_id}")],
+        [InlineKeyboardButton(text=f"🎯 相似阈值: {_image_hash_max_distance(group_id)}", callback_data=f"edit_join_image_hash_distance:{group_id}")],
+        [InlineKeyboardButton(text=f"➕ 添加关键图 ({len(samples)})", callback_data=f"add_join_image_hash_sample:{group_id}")],
+        [InlineKeyboardButton(text="📂 关键图样本库", callback_data=f"view_join_image_hash_samples:{group_id}")],
+        [InlineKeyboardButton(text="➖ 删除关键图样本", callback_data=f"remove_join_image_hash_sample:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1774,6 +1821,31 @@ def _build_log_pager(prefix: str, group_id: int, page: int, total: int, page_siz
         buttons.append(nav)
     buttons.append([InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _build_join_approval_summary(title: str, group_id: int) -> str:
+    terms = _get_join_approval_terms(group_id)
+    preview = "\n".join(f"- {term}" for term in terms[:8]) if terms else "（空）"
+    if len(terms) > 8:
+        preview += f"\n… 共 {len(terms)} 条"
+    samples = get_image_fuzzy_blocker().list_group_samples(group_id)
+    image_status = "✅ 已开启" if _image_hash_enabled(group_id) else "❌ 已关闭"
+    action_text = "命中后封禁" if _image_hash_should_ban(group_id) else "命中后删除"
+    return (
+        f"<b>{title}</b> › 入群审批\n\n"
+        "当前规则：\n"
+        "1. 关键图相似哈希命中：拒绝\n"
+        "2. 没有头像：通过\n"
+        "3. 头像不是文字：通过\n"
+        "4. 文字头像但不含敏感词：通过\n"
+        "5. 文字头像且命中敏感词：拒绝\n\n"
+        f"敏感词数量：{len(terms)}\n"
+        f"关键图拦截：{image_status}\n"
+        f"关键图阈值：{_image_hash_max_distance(group_id)}\n"
+        f"关键图样本：{len(samples)} 张\n"
+        f"命中动作：{action_text}\n\n"
+        f"当前敏感词预览：\n{preview}"
+    )
 
 def get_repeat_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
@@ -1934,19 +2006,7 @@ async def join_approval_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
         title = await get_chat_title_safe(callback.bot, group_id)
-        terms = _get_join_approval_terms(group_id)
-        preview = "\n".join(f"- {term}" for term in terms[:8]) if terms else "（空）"
-        if len(terms) > 8:
-            preview += f"\n… 共 {len(terms)} 条"
-        text = (
-            f"<b>{title}</b> › 入群审批\n\n"
-            "当前规则：\n"
-            "1. 没有头像：通过\n"
-            "2. 头像不是文字：通过\n"
-            "3. 文字头像但不含敏感词：通过\n"
-            "4. 文字头像且命中敏感词：拒绝\n\n"
-            f"当前敏感词预览：\n{preview}"
-        )
+        text = _build_join_approval_summary(title, group_id)
         kb = get_join_approval_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -1974,6 +2034,120 @@ async def edit_join_terms_callback(callback: CallbackQuery, state: FSMContext):
             ),
         )
         await state.set_state(AdminStates.EditJoinApprovalTerms)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("toggle_join_image_hash:"), F.from_user.id.in_(ADMIN_IDS))
+async def toggle_join_image_hash(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        current = bool(cfg.get("image_fuzzy_block_enabled", True))
+        cfg["image_fuzzy_block_enabled"] = not current
+        await save_config()
+        title = await get_chat_title_safe(callback.bot, group_id)
+        await callback.message.edit_text(
+            _build_join_approval_summary(title, group_id),
+            reply_markup=get_join_approval_menu_keyboard(group_id),
+        )
+        await callback.answer(f"关键图相似拦截已{'开启' if cfg['image_fuzzy_block_enabled'] else '关闭'}")
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("edit_join_image_hash_distance:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_join_image_hash_distance(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        await state.update_data(group_id=group_id)
+        current = _image_hash_max_distance(group_id)
+        await callback.message.edit_text(
+            "设置关键图相似阈值\n"
+            "数字越小越严格，越大越宽松。\n"
+            "建议范围：6-16。\n\n"
+            f"当前值：{current}\n"
+            "请发送新数字，发送 /cancel 取消。",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_join_approval:{group_id}")]]
+            ),
+        )
+        await state.set_state(AdminStates.EditJoinImageHashDistance)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("add_join_image_hash_sample:"), F.from_user.id.in_(ADMIN_IDS))
+async def add_join_image_hash_sample(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        await state.update_data(group_id=group_id)
+        await callback.message.edit_text(
+            "添加关键图样本\n"
+            "请直接发送一张图片，或回复一张图片后再发送任意文字。\n"
+            "支持照片和 image/* 文档。\n"
+            "发送 /cancel 取消。",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_join_approval:{group_id}")]]
+            ),
+        )
+        await state.set_state(AdminStates.AddJoinImageHashSample)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("view_join_image_hash_samples:"), F.from_user.id.in_(ADMIN_IDS))
+async def view_join_image_hash_samples(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
+        items = get_image_fuzzy_blocker().list_group_samples(group_id)
+        if not items:
+            text = f"<b>{title}</b> › 入群审批 › 关键图样本库\n\n当前没有样本。"
+        else:
+            lines = []
+            for item in items[:50]:
+                ts = time.strftime("%m-%d %H:%M", time.localtime(int(item.get("created_at", 0) or 0)))
+                lines.append(f"{item['id']}. [{ts}] {item.get('label', '-') or '-'}")
+            if len(items) > 50:
+                lines.append(f"… 共 {len(items)} 条")
+            text = (
+                f"<b>{title}</b> › 入群审批 › 关键图样本库\n\n"
+                f"当前共 {len(items)} 张：\n" + "\n".join(lines)
+            )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_join_approval:{group_id}")]]
+        )
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("remove_join_image_hash_sample:"), F.from_user.id.in_(ADMIN_IDS))
+async def remove_join_image_hash_sample(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        await state.update_data(group_id=group_id)
+        items = get_image_fuzzy_blocker().list_group_samples(group_id)
+        preview = "\n".join(
+            f"{item['id']}. {item.get('label', '-') or '-'}" for item in items[:20]
+        ) if items else "（空）"
+        if len(items) > 20:
+            preview += f"\n… 共 {len(items)} 条"
+        await callback.message.edit_text(
+            "删除关键图样本\n"
+            "请输入要删除的样本 ID，支持空格或换行分隔。\n"
+            "发送 /cancel 取消。\n\n"
+            f"当前样本预览：\n{preview}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_join_approval:{group_id}")]]
+            ),
+        )
+        await state.set_state(AdminStates.RemoveJoinImageHashSample)
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
@@ -2009,6 +2183,94 @@ async def process_join_terms(message: Message, state: FSMContext):
         reply_markup=kb,
     )
     await state.set_state(AdminStates.GroupMenu)
+
+
+@router.message(StateFilter(AdminStates.EditJoinImageHashDistance), F.from_user.id.in_(ADMIN_IDS))
+async def process_join_image_hash_distance(message: Message, state: FSMContext):
+    try:
+        if message.text and message.text.strip() == "/cancel":
+            data = await state.get_data()
+            group_id = int(data.get("group_id"))
+            await message.reply("已取消。", reply_markup=get_join_approval_menu_keyboard(group_id))
+            await state.set_state(AdminStates.GroupMenu)
+            return
+        value = int((message.text or "").strip())
+        if value < 0 or value > 64:
+            raise ValueError("范围必须在 0-64")
+        data = await state.get_data()
+        group_id = int(data.get("group_id"))
+        cfg = get_group_config(group_id)
+        cfg["image_fuzzy_block_distance"] = value
+        await save_config()
+        await message.reply(
+            f"✅ 已更新关键图相似阈值为 {value}",
+            reply_markup=get_join_approval_menu_keyboard(group_id),
+        )
+        await state.set_state(AdminStates.GroupMenu)
+    except Exception as e:
+        await message.reply(f"❌ 请输入 0-64 的数字。{e}")
+
+
+@router.message(StateFilter(AdminStates.AddJoinImageHashSample), F.from_user.id.in_(ADMIN_IDS))
+async def process_add_join_image_hash_sample(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = int(data.get("group_id"))
+        if message.text and message.text.strip() == "/cancel":
+            await message.reply("已取消。", reply_markup=get_join_approval_menu_keyboard(group_id))
+            await state.set_state(AdminStates.GroupMenu)
+            return
+        target = message.reply_to_message or message
+        image_bytes = await _extract_message_image_bytes(target)
+        if not image_bytes:
+            await message.reply("❌ 没检测到图片。请直接发送图片，或回复图片后再发送。发送 /cancel 取消。")
+            return
+        label_source = target.caption or target.text or message.caption or message.text or f"msg:{target.message_id}"
+        item = await asyncio.to_thread(
+            get_image_fuzzy_blocker().add_sample,
+            group_id=group_id,
+            label=_clip_text(label_source, 60),
+            image_bytes=image_bytes,
+        )
+        await message.reply(
+            f"✅ 已添加关键图样本。\nID: {item['id']}\n标签: {item['label'] or '-'}",
+            reply_markup=get_join_approval_menu_keyboard(group_id),
+        )
+        await state.set_state(AdminStates.GroupMenu)
+    except Exception as e:
+        print(f"添加关键图样本失败: {e}")
+        await message.reply("❌ 添加关键图样本失败。")
+
+
+@router.message(StateFilter(AdminStates.RemoveJoinImageHashSample), F.from_user.id.in_(ADMIN_IDS))
+async def process_remove_join_image_hash_sample(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = int(data.get("group_id"))
+        if message.text and message.text.strip() == "/cancel":
+            await message.reply("已取消。", reply_markup=get_join_approval_menu_keyboard(group_id))
+            await state.set_state(AdminStates.GroupMenu)
+            return
+        sample_ids: list[int] = []
+        for item in re.split(r"[\s,，]+", (message.text or "").strip()):
+            if not item:
+                continue
+            sample_ids.append(int(item))
+        removed = await asyncio.to_thread(
+            get_image_fuzzy_blocker().remove_samples,
+            group_id=group_id,
+            sample_ids=sample_ids,
+        )
+        if removed:
+            await message.reply(
+                f"✅ 已删除关键图样本: {', '.join(map(str, removed))}",
+                reply_markup=get_join_approval_menu_keyboard(group_id),
+            )
+            await state.set_state(AdminStates.GroupMenu)
+            return
+        await message.reply("❌ 没找到对应样本 ID。发送 /cancel 取消。")
+    except Exception as e:
+        await message.reply(f"❌ 请输入有效的数字 ID。{e}")
 
 
 @router.callback_query(F.data.startswith("edit_bio_links:"), F.from_user.id.in_(ADMIN_IDS))
@@ -2992,6 +3254,45 @@ def _get_media_repeat_signature(message: Message) -> str:
     return ""
 
 
+async def _download_tg_file_bytes(file_id: str) -> bytes:
+    tg_file = await bot.get_file(file_id)
+    if not tg_file.file_path:
+        raise ValueError("empty file_path")
+    downloaded = await bot.download_file(tg_file.file_path)
+    if downloaded is None:
+        raise ValueError("download returned None")
+    return downloaded.getvalue() if isinstance(downloaded, io.BytesIO) else downloaded.read()
+
+
+async def _extract_message_image_bytes(message: Message) -> bytes | None:
+    if message.photo:
+        largest = message.photo[-1]
+        if largest and getattr(largest, "file_id", None):
+            return await _download_tg_file_bytes(largest.file_id)
+    document = getattr(message, "document", None)
+    if document and getattr(document, "file_id", None):
+        mime_type = str(getattr(document, "mime_type", "") or "").lower()
+        file_name = str(getattr(document, "file_name", "") or "").lower()
+        if mime_type.startswith("image/") or file_name.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp")):
+            return await _download_tg_file_bytes(document.file_id)
+    return None
+
+
+async def _match_fuzzy_blocked_image(group_id: int, image_bytes: bytes) -> Any | None:
+    if not _image_hash_enabled(group_id):
+        return None
+    try:
+        return await asyncio.to_thread(
+            get_image_fuzzy_blocker().check_image,
+            group_id=group_id,
+            image_bytes=image_bytes,
+            max_total_distance=_image_hash_max_distance(group_id),
+        )
+    except Exception as e:
+        print(f"image fuzzy block match failed group_id={group_id}: {e}")
+        return None
+
+
 async def handle_repeat_media_message(message: Message) -> bool:
     """检测同一图片/媒体的重复发送，处罚规则与重复文字一致。"""
     signature = _get_media_repeat_signature(message)
@@ -3289,6 +3590,8 @@ async def on_media_message(message: Message):
     now = time.time()
     _track_user_message(group_id, user_id, message.message_id, message.caption or "")
     _schedule_bio_watch_check(message)
+    if await _check_and_block_fuzzy_image_message(message, group_id=group_id, user_id=user_id):
+        return
     semantic_text = (message.caption or "").strip()
     if semantic_text:
         if await _check_and_delete_semantic_ad_message(message, semantic_text, group_id=group_id, user_id=user_id):
@@ -3550,6 +3853,40 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
     return True
 
 
+async def _check_and_block_fuzzy_image_message(message: Message, *, group_id: int, user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return False
+    image_bytes = await _extract_message_image_bytes(message)
+    if not image_bytes:
+        return False
+    match = await _match_fuzzy_blocked_image(group_id, image_bytes)
+    if match is None:
+        return False
+
+    await _delete_original_and_linked_reply(group_id, message.message_id)
+    banned = False
+    if _image_hash_should_ban(group_id):
+        try:
+            await bot.ban_chat_member(chat_id=group_id, user_id=user_id)
+            banned = True
+        except Exception as e:
+            print(f"image fuzzy block ban failed group_id={group_id} user_id={user_id}: {e}")
+
+    action = "图片相似哈希封禁" if banned else "图片相似哈希删除"
+    reason = (
+        f"命中关键图样本#{match.sample_id}"
+        f"（ahash={match.ahash_distance}, dhash={match.dhash_distance}, total={match.total_distance}）"
+    )
+    await _record_moderation_log(
+        group_id=group_id,
+        user_id=user_id,
+        user_label=_get_display_name_from_message(message, user_id),
+        action=action,
+        reason=reason,
+    )
+    return True
+
+
 def _get_only_group_id() -> int | None:
     """仅配置了一个受控群时，返回该群 ID，便于单群模式兜底。"""
     if len(GROUP_IDS) != 1:
@@ -3733,6 +4070,81 @@ async def on_other_content_message(message: Message):
         return
     _track_user_message(message.chat.id, message.from_user.id, message.message_id, "")
     _schedule_bio_watch_check(message)
+
+
+@router.message(Command(commands=["imgban", "IMGBAN", "Imgban"]), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
+async def cmd_imgban(message: Message):
+    try:
+        target = message.reply_to_message
+        if not target:
+            await message.reply("请回复一张图片消息后再执行 /imgban。")
+            return
+        image_bytes = await _extract_message_image_bytes(target)
+        if not image_bytes:
+            await message.reply("目标消息不是可识别图片。支持照片和 image/* 文档。")
+            return
+        label = _clip_text(target.caption or target.text or f"msg:{target.message_id}", 60)
+        item = await asyncio.to_thread(
+            get_image_fuzzy_blocker().add_sample,
+            group_id=message.chat.id,
+            label=label,
+            image_bytes=image_bytes,
+        )
+        await message.reply(
+            f"✅ 已加入关键图黑样本库。\n"
+            f"ID: {item['id']}\n"
+            f"标签: {item['label'] or '-'}\n"
+            f"当前策略: 相似图自动{'封禁' if _image_hash_should_ban(message.chat.id) else '删除'}"
+        )
+    except Exception as e:
+        print(f"/imgban 命令异常: {e}")
+        await message.reply("❌ 加入关键图样本失败。")
+
+
+@router.message(Command(commands=["imgbanlist", "IMGBANLIST", "Imgbanlist"]), F.from_user.id.in_(ADMIN_IDS))
+async def cmd_imgbanlist(message: Message):
+    try:
+        items = get_image_fuzzy_blocker().list_group_samples(message.chat.id)
+        if not items:
+            await message.reply("当前群没有关键图黑样本。")
+            return
+        lines = ["🖼️ 关键图黑样本库："]
+        for item in items[:50]:
+            ts = time.strftime("%m-%d %H:%M", time.localtime(int(item.get("created_at", 0) or 0)))
+            lines.append(f"{item['id']}. [{ts}] {item.get('label', '-') or '-'}")
+        if len(items) > 50:
+            lines.append(f"… 共 {len(items)} 条")
+        await message.reply("\n".join(lines))
+    except Exception as e:
+        print(f"/imgbanlist 命令异常: {e}")
+        await message.reply("❌ 读取关键图样本失败。")
+
+
+@router.message(Command(commands=["imgunban", "IMGUNBAN", "Imgunban"]), F.from_user.id.in_(ADMIN_IDS))
+async def cmd_imgunban(message: Message):
+    try:
+        raw = (message.text or "").split()[1:]
+        sample_ids: list[int] = []
+        for item in raw:
+            try:
+                sample_ids.append(int(item))
+            except Exception:
+                continue
+        if not sample_ids:
+            await message.reply("用法：/imgunban 12 15 18")
+            return
+        removed = await asyncio.to_thread(
+            get_image_fuzzy_blocker().remove_samples,
+            group_id=message.chat.id,
+            sample_ids=sample_ids,
+        )
+        if removed:
+            await message.reply(f"✅ 已删除关键图样本: {', '.join(map(str, removed))}")
+        else:
+            await message.reply("没有找到可删除的关键图样本 ID。")
+    except Exception as e:
+        print(f"/imgunban 命令异常: {e}")
+        await message.reply("❌ 删除关键图样本失败。")
 
 
 @router.message(Command(commands=["ad", "AD", "Ad"]), F.reply_to_message, F.from_user.id.in_(ADMIN_IDS))
