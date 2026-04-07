@@ -17,7 +17,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove, BufferedInputFile, ChatJoinRequest
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove, BufferedInputFile, ChatJoinRequest, ChatMemberUpdated
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,6 +26,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # ==================== 环境配置 ====================
 GROUP_IDS = set()
 ADMIN_IDS = set()
+KNOWN_GROUP_IDS = set()
+SHARED_GROUP_CONFIG_KEY = "__shared__"
+GROUP_GUARD_CACHE_TTL_SEC = max(10, int((os.getenv("GROUP_GUARD_CACHE_TTL_SECONDS") or "60").strip()))
+group_guard_cache = {}
+BOT_SELF_ID: int | None = None
 
 try:
     for gid in os.getenv("GROUP_IDS", "").strip().split():
@@ -34,8 +39,9 @@ try:
     for uid in os.getenv("ADMIN_IDS", "").strip().split():
         if uid.strip(): 
             ADMIN_IDS.add(int(uid.strip()))
-    if not GROUP_IDS or not ADMIN_IDS:
-        raise ValueError("GROUP_IDS 或 ADMIN_IDS 为空")
+    KNOWN_GROUP_IDS.update(GROUP_IDS)
+    if not ADMIN_IDS:
+        raise ValueError("ADMIN_IDS 为空")
 except Exception as e:
     raise ValueError(f"❌ 环境变量错误: {e}")
 
@@ -167,6 +173,111 @@ def _parse_env_text_set(raw: str) -> set[str]:
         if cleaned:
             values.add(cleaned)
     return values
+
+
+def _remember_group(group_id: int | None) -> None:
+    try:
+        gid = int(group_id or 0)
+    except Exception:
+        return
+    if gid < 0:
+        KNOWN_GROUP_IDS.add(gid)
+
+
+def _get_managed_group_ids() -> set[int]:
+    return set(KNOWN_GROUP_IDS) if KNOWN_GROUP_IDS else set(GROUP_IDS)
+
+
+def _is_group_chat_message(message: Message) -> bool:
+    chat = getattr(message, "chat", None)
+    return bool(chat and getattr(chat, "type", None) in {"group", "supergroup"})
+
+
+def _is_member_present(status: ChatMemberStatus | str | None) -> bool:
+    return status in {
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.CREATOR,
+        ChatMemberStatus.RESTRICTED,
+    }
+
+
+def _is_bot_admin(member) -> bool:
+    status = getattr(member, "status", None)
+    return status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
+
+
+def _has_bot_moderation_capability(member) -> bool:
+    if getattr(member, "status", None) == ChatMemberStatus.CREATOR:
+        return True
+    return bool(
+        getattr(member, "can_restrict_members", False)
+        or getattr(member, "can_delete_messages", False)
+    )
+
+
+async def _get_bot_self_id() -> int:
+    global BOT_SELF_ID
+    if BOT_SELF_ID is None:
+        BOT_SELF_ID = int((await bot.get_me()).id)
+    return BOT_SELF_ID
+
+
+async def _check_group_guard(group_id: int) -> tuple[bool, str]:
+    gid = int(group_id)
+    _remember_group(gid)
+    try:
+        bot_self_id = await _get_bot_self_id()
+        me = await bot.get_chat_member(gid, bot_self_id)
+    except Exception as e:
+        return False, f"bot_member_check_failed:{type(e).__name__}"
+    if not _is_bot_admin(me):
+        return False, "bot_not_admin"
+    if not _has_bot_moderation_capability(me):
+        return False, "bot_admin_no_mod_permission"
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            member = await bot.get_chat_member(gid, int(admin_id))
+        except Exception:
+            continue
+        if _is_member_present(getattr(member, "status", None)):
+            return True, f"admin_present:{admin_id}"
+    return False, "admin_absent"
+
+
+async def _is_group_eligible(group_id: int, *, force_refresh: bool = False) -> tuple[bool, str]:
+    gid = int(group_id)
+    now = time.time()
+    if not force_refresh:
+        cached = group_guard_cache.get(gid)
+        if cached and now < float(cached[0]):
+            return bool(cached[1]), str(cached[2])
+    ok, reason = await _check_group_guard(gid)
+    group_guard_cache[gid] = (now + GROUP_GUARD_CACHE_TTL_SEC, ok, reason)
+    return ok, reason
+
+
+def _invalidate_group_guard_cache(group_id: int | None) -> None:
+    try:
+        gid = int(group_id or 0)
+    except Exception:
+        return
+    group_guard_cache.pop(gid, None)
+
+
+def _select_admin_group_id(current_chat_id: int | None = None) -> int | None:
+    if current_chat_id is not None:
+        try:
+            gid = int(current_chat_id)
+            if gid < 0:
+                _remember_group(gid)
+                return gid
+        except Exception:
+            pass
+    managed = sorted(_get_managed_group_ids())
+    if not managed:
+        return None
+    return managed[0]
 
 
 BIO_WATCH_TARGET_CHANNEL_IDS = _parse_env_int_set(os.getenv("BIO_WATCH_CHANNEL_IDS", _BIO_WATCH_DEFAULT_CHANNEL_IDS))
@@ -504,8 +615,9 @@ def _schedule_bio_watch_check(message: Message) -> None:
         return
     if message.from_user.id in ADMIN_IDS:
         return
-    if not message.chat or message.chat.id not in GROUP_IDS:
+    if not _is_group_chat_message(message):
         return
+    _remember_group(message.chat.id)
     key = (int(message.chat.id), int(message.message_id))
     if key in bio_watch_pending_keys:
         return
@@ -727,12 +839,17 @@ async def _record_moderation_log(
     moderation_logs_dirty = True
 
 
-@router.chat_join_request(F.chat.id.in_(GROUP_IDS))
+@router.chat_join_request()
 async def handle_chat_join_request(join_request: ChatJoinRequest):
     """Join approval: no avatar pass; non-text avatar pass; text avatar only declines on sensitive terms."""
     user = join_request.from_user
     user_id = user.id
     chat_id = join_request.chat.id
+    _remember_group(chat_id)
+    active, reason_guard = await _is_group_eligible(chat_id)
+    if not active:
+        print(f"join request skipped chat_id={chat_id}: {reason_guard}")
+        return
     final_decision = "approve"
     reason = "no_rule_hit"
     approval_ocr = get_join_approval_avatar_ocr()
@@ -840,6 +957,28 @@ async def handle_chat_join_request(join_request: ChatJoinRequest):
         )
         await save_join_review_logs(force=True)
 
+
+@router.my_chat_member()
+async def on_my_chat_member_update(event: ChatMemberUpdated):
+    """Bot 在群内权限变化时刷新群资格缓存。"""
+    chat = getattr(event, "chat", None)
+    if not chat:
+        return
+    _remember_group(chat.id)
+    _invalidate_group_guard_cache(chat.id)
+
+
+@router.chat_member()
+async def on_chat_member_update(event: ChatMemberUpdated):
+    """管理员进出群时刷新群资格缓存。"""
+    chat = getattr(event, "chat", None)
+    member = getattr(event, "new_chat_member", None)
+    user = getattr(member, "user", None)
+    if not chat:
+        return
+    if user and int(user.id) in ADMIN_IDS:
+        _invalidate_group_guard_cache(chat.id)
+
 # ==================== 配置函数 ====================
 def _default_group_config():
     """单群默认配置：仅保留当前生产仍需的核心功能。"""
@@ -874,47 +1013,59 @@ async def load_config():
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
-            if "groups" not in config:
+            if "groups" not in config or not isinstance(config["groups"], dict):
                 config["groups"] = {}
-            for gid, saved in list(config["groups"].items()):
-                default = _default_group_config()
-                for k, v in default.items():
-                    if k not in saved:
-                        saved[k] = v
-                for obsolete_key in (
-                    "check_bio_link",
-                    "bio_keywords",
-                    "check_bio_keywords",
-                    "check_display_keywords",
-                    "display_keywords",
-                    "check_message_keywords",
-                    "message_keywords",
-                    "check_message_link",
-                    "message_keyword_normalize",
-                    "short_msg_detection",
-                    "short_msg_threshold",
-                    "min_consecutive_count",
-                    "time_window_seconds",
-                    "fill_garbage_detection",
-                    "fill_garbage_min_raw_len",
-                    "fill_garbage_max_clean_len",
-                    "fill_space_ratio",
-                    "violation_mute_hours",
-                    "reported_message_threshold",
-                    "report_history_mute_hours",
-                    "report_history_threshold",
-                    "report_history_whitelist",
-                    "exempt_users",
-                    "misjudge_whitelist",
-                    "mild_exempt_whitelist",
-                    "media_unlock_boosts",
-                    "media_unlock_whitelist",
-                    "media_rules_broadcast",
-                    "media_rules_broadcast_interval_minutes",
-                    "autoreply",
-                ):
-                    saved.pop(obsolete_key, None)
-                config["groups"][gid] = saved
+            groups = config["groups"]
+            for gid in list(groups.keys()):
+                try:
+                    _remember_group(int(gid))
+                except Exception:
+                    pass
+            shared = groups.get(SHARED_GROUP_CONFIG_KEY)
+            if not isinstance(shared, dict):
+                shared = {}
+                for _gid, candidate in list(groups.items()):
+                    if isinstance(candidate, dict):
+                        shared = deepcopy(candidate)
+                        break
+            default = _default_group_config()
+            for k, v in default.items():
+                if k not in shared:
+                    shared[k] = v
+            for obsolete_key in (
+                "check_bio_link",
+                "bio_keywords",
+                "check_bio_keywords",
+                "check_display_keywords",
+                "display_keywords",
+                "check_message_keywords",
+                "message_keywords",
+                "check_message_link",
+                "message_keyword_normalize",
+                "short_msg_detection",
+                "short_msg_threshold",
+                "min_consecutive_count",
+                "time_window_seconds",
+                "fill_garbage_detection",
+                "fill_garbage_min_raw_len",
+                "fill_garbage_max_clean_len",
+                "fill_space_ratio",
+                "violation_mute_hours",
+                "reported_message_threshold",
+                "report_history_mute_hours",
+                "report_history_threshold",
+                "report_history_whitelist",
+                "exempt_users",
+                "misjudge_whitelist",
+                "mild_exempt_whitelist",
+                "media_unlock_boosts",
+                "media_unlock_whitelist",
+                "media_rules_broadcast",
+                "media_rules_broadcast_interval_minutes",
+                "autoreply",
+            ):
+                shared.pop(obsolete_key, None)
+            config["groups"] = {SHARED_GROUP_CONFIG_KEY: shared}
         else:
             config = {"groups": {}}
             await save_config()
@@ -925,13 +1076,12 @@ async def load_config():
 async def save_config():
     """保存配置到 CONFIG_FILE，豁免名单/白名单/豁免词等所有名单均在此持久化，重启不丢失"""
     try:
-        if GROUP_IDS:
-            primary_gid = get_primary_group_id()
-            primary_cfg = deepcopy(get_group_config(primary_gid))
-            if "groups" not in config:
-                config["groups"] = {}
-            for gid in GROUP_IDS:
-                config["groups"][str(gid)] = deepcopy(primary_cfg)
+        if "groups" not in config or not isinstance(config["groups"], dict):
+            config["groups"] = {}
+        shared = config["groups"].get(SHARED_GROUP_CONFIG_KEY)
+        if not isinstance(shared, dict):
+            shared = _default_group_config()
+        config["groups"] = {SHARED_GROUP_CONFIG_KEY: shared}
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -1687,15 +1837,23 @@ async def _try_count_media_and_notify(message: Message, group_id: int, user_id: 
 
 
 def get_group_config(group_id: int):
-    gid = str(group_id)
-    if gid not in config["groups"]:
-        config["groups"][gid] = _default_group_config()
-    return config["groups"][gid]
+    _remember_group(group_id)
+    if "groups" not in config or not isinstance(config["groups"], dict):
+        config["groups"] = {}
+    if SHARED_GROUP_CONFIG_KEY not in config["groups"] or not isinstance(config["groups"].get(SHARED_GROUP_CONFIG_KEY), dict):
+        config["groups"][SHARED_GROUP_CONFIG_KEY] = _default_group_config()
+    shared = config["groups"][SHARED_GROUP_CONFIG_KEY]
+    default = _default_group_config()
+    for k, v in default.items():
+        if k not in shared:
+            shared[k] = v
+    return shared
 
 def get_primary_group_id() -> int:
-    if not GROUP_IDS:
-        raise ValueError("GROUP_IDS is empty")
-    return sorted(GROUP_IDS)[0]
+    managed = sorted(_get_managed_group_ids())
+    if not managed:
+        raise ValueError("No managed groups discovered")
+    return managed[0]
 
 
 def fmt_duration(seconds: int) -> str:
@@ -1891,17 +2049,20 @@ def get_media_report_menu_keyboard(group_id: int):
 @router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_panel(message: Message, state: FSMContext):
     """进入全局控制台，配置同步应用到全部受控群组。"""
-    if not GROUP_IDS:
-        await message.reply("当前未配置任何受控群组（GROUP_IDS 为空）。")
+    group_id = _select_admin_group_id(
+        message.chat.id if _is_group_chat_message(message) else None
+    )
+    managed_count = len(_get_managed_group_ids())
+    if group_id is None:
+        await message.reply("当前尚未发现可管理群组。先把 bot 拉进群并授予管理权限，同时保证管理员账号也在群内。")
         return
-    group_id = get_primary_group_id()
     await state.update_data(group_id=group_id)
     cfg = get_group_config(group_id)
     status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
     text = (
         "👮 管理员面板\n\n"
         f"状态: {status}\n"
-        f"受控群组数: {len(GROUP_IDS)}\n"
+        f"受控群组数: {managed_count}\n"
         f"主配置群ID: <code>{group_id}</code>\n\n"
         "所有参数都会同步应用到全部群组。"
     )
@@ -1913,17 +2074,18 @@ async def admin_panel(message: Message, state: FSMContext):
 @router.callback_query(F.data == "choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def choose_group_callback(callback: CallbackQuery, state: FSMContext):
     """兼容旧入口：统一跳到全局控制台。"""
-    if not GROUP_IDS:
-        await callback.answer("未配置受控群组。", show_alert=True)
+    group_id = _select_admin_group_id()
+    managed_count = len(_get_managed_group_ids())
+    if group_id is None:
+        await callback.answer("尚未发现可管理群组。", show_alert=True)
         return
-    group_id = get_primary_group_id()
     await state.update_data(group_id=group_id)
     cfg = get_group_config(group_id)
     status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
     text = (
         "👮 管理员面板\n\n"
         f"状态: {status}\n"
-        f"受控群组数: {len(GROUP_IDS)}\n"
+        f"受控群组数: {managed_count}\n"
         f"主配置群ID: <code>{group_id}</code>\n\n"
         "所有参数都会同步应用到全部群组。"
     )
@@ -1974,7 +2136,7 @@ async def group_menu(callback: CallbackQuery, state: FSMContext):
         text = (
             "👮 管理员面板\n\n"
             f"状态: {status}\n"
-            f"受控群组数: {len(GROUP_IDS)}\n"
+            f"受控群组数: {len(_get_managed_group_ids())}\n"
             f"主配置群ID: <code>{group_id}</code>\n\n"
             "所有参数都会同步应用到全部群组。"
         )
@@ -2957,7 +3119,7 @@ async def export_listen_log(callback: CallbackQuery):
                 "请优先检查：\n"
                 "1) BotFather 隐私模式（/setprivacy）是否关闭\n"
                 "2) 机器人是否是群管理员 & 有读取/删除权限\n"
-                "3) 环境变量 GROUP_IDS 是否包含该群真实 chat.id（常见为 -100…）"
+                "3) 你的管理员账号是否与 bot 同时在该群内"
             )
             await callback.message.reply(text)
             await callback.answer()
@@ -3575,11 +3737,15 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
             pass
 
 @router.message(
-    F.chat.id.in_(GROUP_IDS),
     F.photo | F.video | F.voice | F.video_note | F.document | F.animation | F.audio,
 )
 async def on_media_message(message: Message):
     """媒体消息统一入口：先跑广告匹配，再做媒体权限拦截，最后挂举报按钮。"""
+    if not _is_group_chat_message(message):
+        return
+    active, _reason_guard = await _is_group_eligible(message.chat.id)
+    if not active:
+        return
     if not message.from_user or message.from_user.is_bot:
         return
     cfg = get_group_config(message.chat.id)
@@ -3703,8 +3869,9 @@ def _track_group_reply(message: Message, reply: Message):
     """仅记录在目标群里的引用回复，后续做补偿删除"""
     try:
         chat = message.chat
-        if not chat or chat.id not in GROUP_IDS:
+        if not chat or getattr(chat, "type", None) not in {"group", "supergroup"}:
             return
+        _remember_group(chat.id)
         bot_reply_links[(chat.id, reply.message_id)] = (message.message_id, time.time())
     except Exception:
         pass
@@ -3889,9 +4056,10 @@ async def _check_and_block_fuzzy_image_message(message: Message, *, group_id: in
 
 def _get_only_group_id() -> int | None:
     """仅配置了一个受控群时，返回该群 ID，便于单群模式兜底。"""
-    if len(GROUP_IDS) != 1:
+    managed = _get_managed_group_ids()
+    if len(managed) != 1:
         return None
-    return next(iter(GROUP_IDS))
+    return next(iter(managed))
 
 
 async def _find_recent_user_ids_by_text(group_id: int, text: str, *, limit: int = 3) -> list[int]:
@@ -3972,9 +4140,22 @@ _OTHER_CONTENT = {
 }
 
 
-@router.message(F.chat.id.in_(GROUP_IDS), F.text)
+@router.message(F.text)
 async def detect_and_warn(message: Message):
     """文本消息主流程：AD 语义匹配 -> 权限查询 -> 重复文字处罚 -> 合规计入媒体解锁。"""
+    if not _is_group_chat_message(message):
+        return
+    active, reason_guard = await _is_group_eligible(message.chat.id)
+    if not active:
+        _push_listen_log(
+            group_id=getattr(message.chat, "id", None),
+            user_id=getattr(getattr(message, "from_user", None), "id", None),
+            msg_id=getattr(message, "message_id", None),
+            text=(message.text or ""),
+            verdict="SKIP",
+            details=f"群不满足运行条件: {reason_guard}",
+        )
+        return
     if not message.from_user or message.from_user.is_bot:
         _push_listen_log(
             group_id=getattr(message.chat, "id", None),
@@ -4060,9 +4241,14 @@ async def detect_and_warn(message: Message):
     await _try_count_media_and_notify(message, group_id, user_id, cfg)
 
 
-@router.message(F.chat.id.in_(GROUP_IDS), F.content_type.in_(_OTHER_CONTENT))
+@router.message(F.content_type.in_(_OTHER_CONTENT))
 async def on_other_content_message(message: Message):
     """其他内容类型只挂简介频道延迟执法，不额外做旧风控。"""
+    if not _is_group_chat_message(message):
+        return
+    active, _reason_guard = await _is_group_eligible(message.chat.id)
+    if not active:
+        return
     if not message.from_user or message.from_user.is_bot:
         return
     cfg = get_group_config(message.chat.id)
@@ -4211,7 +4397,8 @@ async def on_forward_learn_ad(message: Message):
             if learned:
                 await message.reply("✅ 已学习该转发消息内容，但当前不是单群模式，且转发里没有原群信息，无法精准回群删除。")
             return
-        if group_id not in GROUP_IDS:
+        managed_group_ids = _get_managed_group_ids()
+        if managed_group_ids and group_id not in managed_group_ids:
             only_gid = _get_only_group_id()
             if only_gid is None:
                 if learned:
@@ -4276,10 +4463,15 @@ async def on_forward_learn_ad(message: Message):
         print("转发学习命令异常:", e)
 
 
-@router.message(F.chat.id.in_(GROUP_IDS), F.left_chat_member)
+@router.message(F.left_chat_member)
 async def on_member_left(message: Message):
     """成员退群：删除其在本群的最近消息和全部警告"""
     try:
+        if not _is_group_chat_message(message):
+            return
+        active, _reason_guard = await _is_group_eligible(message.chat.id)
+        if not active:
+            return
         if not message.left_chat_member or message.left_chat_member.is_bot:
             return
         group_id = message.chat.id
@@ -4948,7 +5140,7 @@ async def _logs_flush_worker() -> None:
 async def main():
     print("🚀 机器人启动")
     await load_config()
-    for gid in GROUP_IDS:
+    for gid in _get_managed_group_ids():
         get_group_config(gid)
     await save_config()
     await load_data()
