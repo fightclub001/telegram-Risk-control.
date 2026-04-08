@@ -10,9 +10,14 @@ import time
 import hashlib
 from copy import deepcopy
 from collections import deque
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import unquote
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
@@ -31,6 +36,7 @@ SHARED_GROUP_CONFIG_KEY = "__shared__"
 GROUP_GUARD_CACHE_TTL_SEC = max(10, int((os.getenv("GROUP_GUARD_CACHE_TTL_SECONDS") or "60").strip()))
 group_guard_cache = {}
 BOT_SELF_ID: int | None = None
+BOT_TIMEZONE = (os.getenv("BOT_TIMEZONE") or os.getenv("TZ") or "Asia/Shanghai").strip()
 
 try:
     for gid in os.getenv("GROUP_IDS", "").strip().split():
@@ -113,6 +119,9 @@ join_review_logs = deque(maxlen=200)
 moderation_logs = deque(maxlen=200)
 join_review_logs_dirty = False
 moderation_logs_dirty = False
+pending_forward_actions = {}  # token -> {"admin_id": int, "text": str, "hinted_user_id": int|None, "created_ts": float}
+forward_action_seq = 0
+FORWARD_ACTION_TTL_SEC = 30 * 60
 # 无权限发媒体警告：同用户删上一条；(group_id, user_id) -> 上一条机器人警告 message_id
 last_media_no_perm_msg = {}
 MEDIA_NO_PERM_DELETE_AFTER_SEC = 60  # 不同用户的警告 1 分钟后自动删除
@@ -278,6 +287,47 @@ def _select_admin_group_id(current_chat_id: int | None = None) -> int | None:
     if not managed:
         return None
     return managed[0]
+
+
+def _format_ts(ts: int | float, fmt: str = "%m-%d %H:%M:%S") -> str:
+    try:
+        timestamp = float(ts)
+    except Exception:
+        timestamp = 0.0
+    try:
+        if ZoneInfo:
+            return datetime.fromtimestamp(timestamp, ZoneInfo(BOT_TIMEZONE)).strftime(fmt)
+    except Exception:
+        pass
+    return time.strftime(fmt, time.localtime(timestamp))
+
+
+def _new_forward_action_token() -> str:
+    global forward_action_seq
+    forward_action_seq += 1
+    return str(int(time.time() * 1000))[-8:] + str(forward_action_seq % 1000).zfill(3)
+
+
+def _prune_forward_actions() -> None:
+    now = time.time()
+    stale = [
+        key
+        for key, value in list(pending_forward_actions.items())
+        if now - float(value.get("created_ts", 0.0) or 0.0) > FORWARD_ACTION_TTL_SEC
+    ]
+    for key in stale:
+        pending_forward_actions.pop(key, None)
+
+
+def _forward_group_picker_keyboard(token: str, group_ids: list[int], source_gid: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    for gid in group_ids[:20]:
+        label = f"群 {gid}"
+        if source_gid is not None and int(gid) == int(source_gid):
+            label += "（来源）"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"forward_do:{token}:{gid}")])
+    rows.append([InlineKeyboardButton(text="取消", callback_data=f"forward_cancel:{token}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 BIO_WATCH_TARGET_CHANNEL_IDS = _parse_env_int_set(os.getenv("BIO_WATCH_CHANNEL_IDS", _BIO_WATCH_DEFAULT_CHANNEL_IDS))
@@ -2510,13 +2560,13 @@ async def view_join_logs(callback: CallbackQuery):
         else:
             lines = []
             for idx, item in enumerate(chunk, start=1 + start):
-                ts = time.strftime("%m-%d %H:%M:%S", time.localtime(int(item.get("ts", 0) or 0)))
+                ts = _format_ts(int(item.get("ts", 0) or 0))
                 lines.append(
                     f"{idx}. [{ts}] {item.get('user_label', '-')}\n"
                     f"   结果: {item.get('decision_label', '-')}\n"
                     f"   原因: {item.get('reason_label', '-')}"
                 )
-            text = "🚪 入群审批记录\n\n" + "\n".join(lines)
+            text = f"🚪 入群审批记录（时区: {BOT_TIMEZONE}）\n\n" + "\n".join(lines)
         kb = _build_log_pager("view_join_logs", group_id, page, len(items), page_size)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -2543,13 +2593,13 @@ async def view_mod_logs(callback: CallbackQuery):
         else:
             lines = []
             for idx, item in enumerate(chunk, start=1 + start):
-                ts = time.strftime("%m-%d %H:%M:%S", time.localtime(int(item.get("ts", 0) or 0)))
+                ts = _format_ts(int(item.get("ts", 0) or 0))
                 lines.append(
                     f"{idx}. [{ts}] {item.get('user_label', '-')}\n"
                     f"   动作: {item.get('action', '-')}\n"
                     f"   原因: {item.get('reason', '-')}"
                 )
-            text = "📝 处理记录\n\n" + "\n".join(lines)
+            text = f"📝 处理记录（时区: {BOT_TIMEZONE}）\n\n" + "\n".join(lines)
         kb = _build_log_pager("view_mod_logs", group_id, page, len(items), page_size)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -2601,6 +2651,15 @@ async def add_semantic_ad_callback(callback: CallbackQuery, state: FSMContext):
 @router.message(StateFilter(AdminStates.EditSemanticAdAdd), F.from_user.id.in_(ADMIN_IDS))
 async def process_semantic_ad_add(message: Message, state: FSMContext):
     try:
+        is_forward = bool(
+            getattr(message, "forward_origin", None)
+            or getattr(message, "forward_from", None)
+            or getattr(message, "forward_from_chat", None)
+        )
+        if is_forward:
+            await state.set_state(AdminStates.GroupMenu)
+            await on_forward_learn_ad(message)
+            return
         if not message.text:
             await message.reply("❌ 请输入文本。发送 /cancel 取消。")
             return
@@ -2623,8 +2682,8 @@ async def process_semantic_ad_add(message: Message, state: FSMContext):
                 skipped += 1
             else:
                 added_ids.append(sample.id)
-        # 只要成功学习到样本，就自动开启该群的 AD 语义检测，避免“只收录不生效”
-        if added_ids and group_id:
+        # 有新增或确认与现有样本高度相似时，都应开启语义检测，避免“库里有样本但开关仍关闭”
+        if (added_ids or skipped) and group_id:
             cfg = get_group_config(group_id)
             if not cfg.get("semantic_ad_enabled", False):
                 cfg["semantic_ad_enabled"] = True
@@ -3126,13 +3185,13 @@ async def export_listen_log(callback: CallbackQuery):
             return
 
         # 最新在后，导出时按“新→旧”
-        lines = [f"{title} 监听日志（近10条，新→旧）", f"导出时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}", ""]
+        lines = [f"{title} 监听日志（近10条，新→旧）", f"导出时间: {_format_ts(time.time(), '%Y-%m-%d %H:%M:%S')} ({BOT_TIMEZONE})", ""]
         for it in reversed(rows):
             gid = it.get("group_id")
             uid = it.get("user_id")
             mid = it.get("msg_id")
             ts = it.get("ts", 0)
-            tstr = time.strftime("%m-%d %H:%M:%S", time.localtime(ts)) if ts else "??"
+            tstr = _format_ts(ts) if ts else "??"
             verdict = it.get("verdict", "")
             txt = it.get("text", "")
             details = it.get("details", "")
@@ -4370,6 +4429,14 @@ async def on_forward_learn_ad(message: Message):
     2) 根据原始群ID和用户ID，删除其最近24小时内的全部消息和警告，并学习这些文本
     """
     try:
+        is_forward = bool(
+            getattr(message, "forward_origin", None)
+            or getattr(message, "forward_from", None)
+            or getattr(message, "forward_from_chat", None)
+        )
+        if not is_forward:
+            return
+
         f_user = getattr(message, "forward_from", None)
         f_chat = getattr(message, "forward_from_chat", None)
         f_origin = getattr(message, "forward_origin", None)
@@ -4380,85 +4447,63 @@ async def on_forward_learn_ad(message: Message):
             if f_chat is None:
                 f_chat = getattr(f_origin, "sender_chat", None)
 
-        text = message.text or message.caption or ""
-        learned = False
-        memory_changed = False
-        if text:
-            try:
-                sample = get_semantic_ad_detector().add_ad_sample(text)
-                learned = sample is not None
-                if not learned:
-                    print(f"转发学习样本已存在或被去重: {text[:80]}")
-            except Exception as e:
-                print(f"转发学习广告样本失败: {e}")
-        # 单群模式兜底：即使 Telegram 转发里不带原群信息，也直接假定唯一受控群
-        group_id = f_chat.id if f_chat else _get_only_group_id()
-        if not group_id:
-            if learned:
-                await message.reply("✅ 已学习该转发消息内容，但当前不是单群模式，且转发里没有原群信息，无法精准回群删除。")
+        text = (message.text or message.caption or "").strip()
+        if not text:
+            await message.reply("⚠️ 这条转发没有可学习文本，无法执行学习/回删。")
             return
-        managed_group_ids = _get_managed_group_ids()
-        if managed_group_ids and group_id not in managed_group_ids:
-            only_gid = _get_only_group_id()
-            if only_gid is None:
-                if learned:
-                    await message.reply("✅ 已学习该转发消息内容，但转发来源群不在受控群列表，未执行回群删除。")
-                return
-            group_id = only_gid
 
-        # 学习成功则自动开启该群的 AD 语义检测
-        if text:
-            await _enable_semantic_detection_for_group(group_id)
-
-        # 1) 优先使用 Telegram 直接给出的 uid
-        user_id = None
-        if f_user:
-            user_id = f_user.id
-        else:
-            user_id = _get_remembered_user_id_by_text(group_id, text)
-        if not user_id:
-            # 2) 无 uid 时，在该群最近消息里按相同文案反查用户
-            matched_user_ids = await _find_recent_user_ids_by_text(group_id, text, limit=3)
-            if len(matched_user_ids) == 1:
-                user_id = matched_user_ids[0]
-            elif len(matched_user_ids) > 1:
-                # 有多个命中时，优先删最近最像的用户，但同时保留后续按文案删消息的兜底
-                user_id = matched_user_ids[0]
-            else:
-                matched_user_ids = []
-
-        deleted_by_user = False
-        if user_id:
-            try:
-                memory_changed = _remember_forward_match(group_id, user_id, text) or memory_changed
-                memory_changed = await _remember_recent_user_texts(group_id, user_id) or memory_changed
-                await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
-                deleted_by_user = True
-            except Exception as e:
-                print(f"转发学习时删除用户消息失败: {e}")
-
-        # 3) 再做一层按同文案删最近消息的兜底，解决 Telegram 不回传 uid/chat 信息的问题
-        deleted_by_text = 0
+        learned = False
         try:
-            deleted_by_text = await _delete_recent_messages_by_text(group_id, text)
+            sample = get_semantic_ad_detector().add_ad_sample(text)
+            learned = sample is not None
+            if not learned:
+                print(f"转发学习样本已存在或被去重: {text[:80]}")
         except Exception as e:
-            print(f"按文案回群删除失败: {e}")
+            print(f"转发学习广告样本失败: {e}")
 
-        if memory_changed:
-            _mark_forward_match_memory_dirty()
+        managed_group_ids = _get_managed_group_ids()
+        candidate_group_ids: list[int] = []
+        source_gid: int | None = None
+        if f_chat:
+            try:
+                source_gid = int(f_chat.id)
+                _remember_group(source_gid)
+                if not managed_group_ids or source_gid in managed_group_ids:
+                    candidate_group_ids = [source_gid]
+            except Exception:
+                pass
+        if not candidate_group_ids:
+            candidate_group_ids = sorted(managed_group_ids)
+            if source_gid is not None and source_gid not in candidate_group_ids:
+                candidate_group_ids = [source_gid] + candidate_group_ids
 
-        if text:
-            if deleted_by_user or deleted_by_text:
-                scope = f"群 {group_id}"
-                if user_id:
-                    learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
-                    await message.reply(f"✅ {learned_text}，并已在 {scope} 清理该用户近期发言；同文案兜底删除 {deleted_by_text} 条。")
-                else:
-                    learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
-                    await message.reply(f"✅ {learned_text}；Telegram 未返回原用户信息，已在 {scope} 按同文案兜底删除 {deleted_by_text} 条。")
-            else:
-                learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
-                await message.reply(f"✅ {learned_text}，但在群 {group_id} 的最近消息缓存里没找到可删除的同文案记录。")
+        if not candidate_group_ids:
+            learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
+            await message.reply(f"✅ {learned_text}，但当前没有可回删的已管理群。")
+            return
+
+        for gid in candidate_group_ids:
+            await _enable_semantic_detection_for_group(gid)
+
+        hinted_user_id = None
+        if f_user:
+            hinted_user_id = f_user.id
+        _prune_forward_actions()
+        token = _new_forward_action_token()
+        pending_forward_actions[token] = {
+            "admin_id": int(message.from_user.id),
+            "text": text,
+            "hinted_user_id": int(hinted_user_id) if hinted_user_id else None,
+            "created_ts": time.time(),
+        }
+        kb = _forward_group_picker_keyboard(token, candidate_group_ids, source_gid=source_gid)
+        learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
+        prompt = (
+            f"✅ {learned_text}。\n"
+            "请选择要执行回删的群组：\n"
+            "我会在该群定位此人并删除其近期全部发言。"
+        )
+        await message.reply(prompt, reply_markup=kb)
     except Exception as e:
         print("转发学习命令异常:", e)
 
@@ -4482,6 +4527,93 @@ async def on_member_left(message: Message):
         print(f"处理退群用户消息清理失败: {e}")
 
 # 外部引用检测已移除，交由其他机器人处理
+
+
+@router.callback_query(F.data.startswith("forward_cancel:"), F.from_user.id.in_(ADMIN_IDS))
+async def forward_cancel(callback: CallbackQuery):
+    try:
+        token = callback.data.split(":", 1)[1]
+        payload = pending_forward_actions.get(token)
+        if not payload or int(payload.get("admin_id", 0) or 0) != int(callback.from_user.id):
+            await callback.answer("该任务已失效。", show_alert=True)
+            return
+        pending_forward_actions.pop(token, None)
+        await callback.message.edit_text("已取消本次回删。")
+        await callback.answer("已取消")
+    except Exception as e:
+        await callback.answer(f"❌ {e}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("forward_do:"), F.from_user.id.in_(ADMIN_IDS))
+async def forward_execute(callback: CallbackQuery):
+    try:
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("参数错误", show_alert=True)
+            return
+        token, group_id_str = parts[1], parts[2]
+        payload = pending_forward_actions.get(token)
+        if not payload or int(payload.get("admin_id", 0) or 0) != int(callback.from_user.id):
+            await callback.answer("该任务已失效。", show_alert=True)
+            return
+        text = str(payload.get("text", "") or "").strip()
+        if not text:
+            pending_forward_actions.pop(token, None)
+            await callback.answer("该任务缺少文本，已取消。", show_alert=True)
+            return
+        group_id = int(group_id_str)
+        _remember_group(group_id)
+        await _enable_semantic_detection_for_group(group_id)
+
+        user_id = payload.get("hinted_user_id")
+        if user_id:
+            user_id = int(user_id)
+        else:
+            user_id = _get_remembered_user_id_by_text(group_id, text)
+            if not user_id:
+                matched_user_ids = await _find_recent_user_ids_by_text(group_id, text, limit=3)
+                if matched_user_ids:
+                    user_id = matched_user_ids[0]
+
+        memory_changed = False
+        deleted_by_user = False
+        if user_id:
+            try:
+                memory_changed = _remember_forward_match(group_id, user_id, text) or memory_changed
+                memory_changed = await _remember_recent_user_texts(group_id, user_id) or memory_changed
+                await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
+                deleted_by_user = True
+            except Exception as e:
+                print(f"forward execute delete by user failed group_id={group_id}: {e}")
+
+        deleted_by_text = 0
+        try:
+            deleted_by_text = await _delete_recent_messages_by_text(group_id, text)
+        except Exception as e:
+            print(f"forward execute delete by text failed group_id={group_id}: {e}")
+
+        if memory_changed:
+            _mark_forward_match_memory_dirty()
+        pending_forward_actions.pop(token, None)
+
+        if deleted_by_user or deleted_by_text:
+            if user_id:
+                await callback.message.edit_text(
+                    f"✅ 已在群 {group_id} 执行回删。\n"
+                    f"按用户清理: {'是' if deleted_by_user else '否'}\n"
+                    f"同文案兜底删除: {deleted_by_text} 条"
+                )
+            else:
+                await callback.message.edit_text(
+                    f"✅ 已在群 {group_id} 执行同文案兜底回删 {deleted_by_text} 条（未拿到原用户ID）。"
+                )
+        else:
+            await callback.message.edit_text(
+                f"✅ 已在群 {group_id} 尝试回删，但最近消息缓存中未找到可删除记录。"
+            )
+        await callback.answer("已执行")
+    except Exception as e:
+        await callback.answer(f"❌ {e}", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_ban:"))
