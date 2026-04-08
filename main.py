@@ -319,15 +319,34 @@ def _prune_forward_actions() -> None:
         pending_forward_actions.pop(key, None)
 
 
-def _forward_group_picker_keyboard(token: str, group_ids: list[int], source_gid: int | None = None) -> InlineKeyboardMarkup:
+def _forward_group_picker_keyboard(
+    token: str,
+    group_ids: list[int],
+    group_titles: dict[int, str],
+    source_gid: int | None = None,
+) -> InlineKeyboardMarkup:
     rows = []
     for gid in group_ids[:20]:
-        label = f"群 {gid}"
+        label = (group_titles.get(int(gid)) or "未命名群").strip()
         if source_gid is not None and int(gid) == int(source_gid):
             label += "（来源）"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"forward_do:{token}:{gid}")])
     rows.append([InlineKeyboardButton(text="取消", callback_data=f"forward_cancel:{token}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _resolve_group_titles(group_ids: list[int]) -> dict[int, str]:
+    titles: dict[int, str] = {}
+    for gid in group_ids:
+        try:
+            chat = await bot.get_chat(int(gid))
+            title = (getattr(chat, "title", None) or "").strip()
+            if not title:
+                title = (getattr(chat, "full_name", None) or "").strip()
+            titles[int(gid)] = title or "未命名群"
+        except Exception:
+            titles[int(gid)] = "未命名群"
+    return titles
 
 
 BIO_WATCH_TARGET_CHANNEL_IDS = _parse_env_int_set(os.getenv("BIO_WATCH_CHANNEL_IDS", _BIO_WATCH_DEFAULT_CHANNEL_IDS))
@@ -4506,7 +4525,8 @@ async def on_forward_learn_ad(message: Message):
             "hinted_user_id": int(hinted_user_id) if hinted_user_id else None,
             "created_ts": time.time(),
         }
-        kb = _forward_group_picker_keyboard(token, candidate_group_ids, source_gid=source_gid)
+        titles = await _resolve_group_titles(candidate_group_ids)
+        kb = _forward_group_picker_keyboard(token, candidate_group_ids, titles, source_gid=source_gid)
         learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
         prompt = (
             f"✅ {learned_text}。\n"
