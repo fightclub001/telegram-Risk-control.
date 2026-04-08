@@ -2148,6 +2148,17 @@ async def choose_group_callback(callback: CallbackQuery, state: FSMContext):
 async def group_menu_single(callback: CallbackQuery, state: FSMContext):
     await choose_group_callback(callback, state)
 
+
+@router.message(
+    StateFilter("*"),
+    F.from_user.id.in_(ADMIN_IDS),
+    F.forward_origin | F.forward_from | F.forward_from_chat,
+)
+async def forward_learn_entry(message: Message):
+    """任意状态下优先处理管理员转发学习。"""
+    await on_forward_learn_ad(message)
+
+
 @router.callback_query(F.data.startswith("select_group:"), F.from_user.id.in_(ADMIN_IDS))
 async def select_group(callback: CallbackQuery, state: FSMContext):
     try:
@@ -4421,7 +4432,6 @@ async def cmd_mark_ad(message: Message):
         await message.reply("❌ 失败", reply_markup=ReplyKeyboardRemove())
 
 
-@router.message(F.from_user.id.in_(ADMIN_IDS))
 async def on_forward_learn_ad(message: Message):
     """
     管理员转发用户消息给机器人：
