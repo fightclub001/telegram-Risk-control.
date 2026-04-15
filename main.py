@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import heapq
 import html
 import io
@@ -82,6 +83,7 @@ reports_dirty = False
 lock = asyncio.Lock()
 repeat_warning_msg_id = {}  # (group_id, user_id) -> msg_id of "2次" repeat warning, delete if orig deleted
 config = {}
+_group_config_default_template: dict[str, Any] | None = None
 forward_match_memory = {}  # normalized_text -> {"group_id": int, "user_id": int, "updated_at": int}
 forward_match_memory_dirty = False
 # 媒体消息举报/点赞（内存即可，按消息维度）
@@ -100,10 +102,14 @@ BIO_WATCH_DELAY_SEC = 2.0
 BIO_WATCH_CACHE_HIT_TTL_SEC = max(300, int((os.getenv("BIO_WATCH_HIT_TTL_SECONDS") or "7200").strip()))
 BIO_WATCH_CACHE_MISS_TTL_SEC = max(60, int((os.getenv("BIO_WATCH_MISS_TTL_SECONDS") or "1800").strip()))
 BIO_WATCH_CACHE_FAIL_TTL_SEC = max(30, int((os.getenv("BIO_WATCH_FAIL_TTL_SECONDS") or "300").strip()))
-BIO_WATCH_CACHE_MAX = max(128, int((os.getenv("BIO_WATCH_CACHE_MAX") or "4096").strip()))
+BIO_WATCH_CACHE_MAX = max(128, int((os.getenv("BIO_WATCH_CACHE_MAX") or "2048").strip()))
 BIO_WATCH_WORKER_IDLE_SEC = 0.5
 _BIO_WATCH_DEFAULT_CHANNEL_IDS = "-1003816108283"
 _BIO_WATCH_DEFAULT_INVITES = "https://t.me/+1byYJLskCfAyMGZk"
+BIO_WATCH_PENDING_MAX = max(0, int((os.getenv("BIO_WATCH_PENDING_MAX") or "1000").strip()))
+BIO_WATCH_PENDING_PER_USER_MAX = max(1, int((os.getenv("BIO_WATCH_PENDING_PER_USER_MAX") or "3").strip()))
+BIO_WATCH_CHECKED_USERS_MAX = max(1000, int((os.getenv("BIO_WATCH_CHECKED_USERS_MAX") or "20000").strip()))
+WORKER_THREAD_MAX = max(1, int((os.getenv("WORKER_THREAD_MAX") or "2").strip()))
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 IMAGE_FUZZY_BLOCK_FILE = os.path.join(DATA_DIR, "image_fuzzy_blocks.json")
 semantic_ad_detector: Any | None = None
@@ -111,7 +117,7 @@ join_approval_avatar_ocr: Any | None = None
 join_approval_risk_matcher: Any | None = None
 image_fuzzy_blocker: Any | None = None
 JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "10800").strip()))
-JOIN_APPROVAL_OCR_CACHE_MAX = max(24, int((os.getenv("OCR_CACHE_MAX") or "64").strip()))
+JOIN_APPROVAL_OCR_CACHE_MAX = max(8, int((os.getenv("OCR_CACHE_MAX") or "24").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
 JOIN_APPROVAL_REQUEST_TIMEOUT = 10
 join_approval_avatar_cache = {}  # file_unique_id -> {ocr_text, normalized_text, is_text_avatar, chinese_char_count, total_char_count, matched_term, timestamp}
@@ -151,8 +157,10 @@ USER_WARNING_COOLDOWN_SEC = 60  # 同用户60秒内只发一条警告
 # 已封禁警告消息列表：group_id -> list of warning_msg_id（用于一次性删除所有已封禁警告）
 banned_warning_messages = {}
 bio_watch_cache = {}  # (group_id, user_id) -> (expires_at, is_match, reason)
+bio_watch_checked_users = {}  # (group_id, user_id) -> last_checked_ts，同一用户在同一群内只查一次 bio
 bio_watch_pending_heap = []  # (due_ts, seq, group_id, user_id, message_id)
 bio_watch_pending_keys = set()  # {(group_id, message_id)}
+bio_watch_pending_user_counts = {}  # (group_id, user_id) -> pending count
 bio_watch_seq = 0
 
 # ==================== 监听决策日志（仅保留最近10条） ====================
@@ -161,6 +169,7 @@ recent_messages_conn: sqlite3.Connection | None = None
 recent_messages_pending_writes = deque()
 recent_messages_lock = asyncio.Lock()
 recent_messages_last_prune_ts = 0.0
+RECENT_MESSAGES_PENDING_MAX = max(1000, int((os.getenv("RECENT_MESSAGES_PENDING_MAX") or "5000").strip()))
 _BIO_URL_SPACE_RE = re.compile(r"[\s\u200b-\u200f\u2060\ufeff]+")
 _BIO_TELEGRAM_HOST_MARKERS = ("t.me/", "telegram.me/", "telegram.dog/", "tg://")
 
@@ -648,6 +657,19 @@ def _prune_bio_watch_cache() -> None:
         bio_watch_cache.pop(user_id, None)
 
 
+def _mark_bio_watch_checked(group_id: int, user_id: int) -> None:
+    key = (int(group_id), int(user_id))
+    bio_watch_checked_users[key] = time.time()
+    if len(bio_watch_checked_users) <= BIO_WATCH_CHECKED_USERS_MAX:
+        return
+    overflow = sorted(
+        bio_watch_checked_users,
+        key=lambda item: float(bio_watch_checked_users.get(item, 0.0)),
+    )[: len(bio_watch_checked_users) - BIO_WATCH_CHECKED_USERS_MAX]
+    for item in overflow:
+        bio_watch_checked_users.pop(item, None)
+
+
 def _get_bio_watch_cached(group_id: int, user_id: int) -> tuple[bool, str] | None:
     cache_key = (int(group_id), int(user_id))
     entry = bio_watch_cache.get(cache_key)
@@ -687,14 +709,33 @@ def _schedule_bio_watch_check(message: Message) -> None:
     if not _is_group_chat_message(message):
         return
     _remember_group(message.chat.id)
+    group_id = int(message.chat.id)
+    user_id = int(message.from_user.id)
+    user_key = (group_id, user_id)
+    if user_key in bio_watch_checked_users:
+        return
+    cached = _get_bio_watch_cached(group_id, user_id)
+    if cached is not None:
+        if not cached[0]:
+            _mark_bio_watch_checked(group_id, user_id)
+        return
+    if bio_watch_pending_user_counts.get(user_key, 0) >= BIO_WATCH_PENDING_PER_USER_MAX:
+        return
+    if BIO_WATCH_PENDING_MAX and len(bio_watch_pending_heap) >= BIO_WATCH_PENDING_MAX:
+        print(
+            "bio_watch pending queue full; skip check "
+            f"group_id={group_id} user_id={user_id} pending={len(bio_watch_pending_heap)}"
+        )
+        return
     key = (int(message.chat.id), int(message.message_id))
     if key in bio_watch_pending_keys:
         return
     bio_watch_pending_keys.add(key)
+    bio_watch_pending_user_counts[user_key] = bio_watch_pending_user_counts.get(user_key, 0) + 1
     bio_watch_seq += 1
     heapq.heappush(
         bio_watch_pending_heap,
-        (time.time() + BIO_WATCH_DELAY_SEC, bio_watch_seq, int(message.chat.id), int(message.from_user.id), int(message.message_id)),
+        (time.time() + BIO_WATCH_DELAY_SEC, bio_watch_seq, group_id, user_id, int(message.message_id)),
     )
 
 
@@ -777,7 +818,21 @@ async def bio_watch_enforcement_worker() -> None:
             continue
         heapq.heappop(bio_watch_pending_heap)
         bio_watch_pending_keys.discard((int(group_id), int(message_id)))
-        await _enforce_bio_watch_message(int(group_id), int(user_id), int(message_id))
+        user_key = (int(group_id), int(user_id))
+        pending_count = bio_watch_pending_user_counts.get(user_key, 0) - 1
+        if pending_count > 0:
+            bio_watch_pending_user_counts[user_key] = pending_count
+        else:
+            bio_watch_pending_user_counts.pop(user_key, None)
+        try:
+            await _enforce_bio_watch_message(int(group_id), int(user_id), int(message_id))
+        except Exception as e:
+            print(
+                "bio watch enforcement failed "
+                f"group_id={group_id} user_id={user_id} message_id={message_id}: {e}"
+            )
+        finally:
+            _mark_bio_watch_checked(int(group_id), int(user_id))
 
 
 def _join_review_reason_text(reason: str) -> str:
@@ -906,6 +961,7 @@ async def _record_moderation_log(
         }
     )
     moderation_logs_dirty = True
+    await save_moderation_logs(force=True)
 
 
 @router.chat_join_request()
@@ -1051,12 +1107,15 @@ async def on_chat_member_update(event: ChatMemberUpdated):
 # ==================== 配置函数 ====================
 def _default_group_config():
     """单群默认配置：仅保留当前生产仍需的核心功能。"""
+    global _group_config_default_template
+    if _group_config_default_template is not None:
+        return deepcopy(_group_config_default_template)
     try:
         from join_approval_risk_terms import DEFAULT_RISK_TERMS
         join_terms = list(DEFAULT_RISK_TERMS)
     except Exception:
         join_terms = []
-    return {
+    _group_config_default_template = {
         "enabled": True,
         "repeat_window_seconds": 2 * 3600,
         "repeat_media_window_seconds": 2 * 3600,
@@ -1074,11 +1133,23 @@ def _default_group_config():
         "image_fuzzy_block_distance": 10,
         "image_fuzzy_ban_on_match": True,
     }
+    return deepcopy(_group_config_default_template)
+
+
+def _ensure_group_config_defaults(group_cfg: dict[str, Any]) -> None:
+    global _group_config_default_template
+    if _group_config_default_template is None:
+        _default_group_config()
+    defaults = _group_config_default_template or {}
+    for key, value in defaults.items():
+        if key not in group_cfg:
+            group_cfg[key] = deepcopy(value)
 
 async def load_config():
-    """从 CONFIG_FILE 加载配置；已保存的豁免名单、白名单、豁免词等全部保留，仅对缺失项补默认值"""
+    """从 CONFIG_FILE 加载配置；每个群组独立保存配置，仅对缺失项补默认值。"""
     global config
     try:
+        default = _default_group_config()
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
@@ -1090,67 +1161,72 @@ async def load_config():
                     _remember_group(int(gid))
                 except Exception:
                     pass
-            shared = groups.get(SHARED_GROUP_CONFIG_KEY)
-            if not isinstance(shared, dict):
-                shared = {}
-                for _gid, candidate in list(groups.items()):
-                    if isinstance(candidate, dict):
-                        shared = deepcopy(candidate)
-                        break
-            default = _default_group_config()
-            for k, v in default.items():
-                if k not in shared:
-                    shared[k] = v
-            for obsolete_key in (
-                "check_bio_link",
-                "bio_keywords",
-                "check_bio_keywords",
-                "check_display_keywords",
-                "display_keywords",
-                "check_message_keywords",
-                "message_keywords",
-                "check_message_link",
-                "message_keyword_normalize",
-                "short_msg_detection",
-                "short_msg_threshold",
-                "min_consecutive_count",
-                "time_window_seconds",
-                "fill_garbage_detection",
-                "fill_garbage_min_raw_len",
-                "fill_garbage_max_clean_len",
-                "fill_space_ratio",
-                "violation_mute_hours",
-                "reported_message_threshold",
-                "report_history_mute_hours",
-                "report_history_threshold",
-                "report_history_whitelist",
-                "exempt_users",
-                "misjudge_whitelist",
-                "mild_exempt_whitelist",
-                "media_unlock_boosts",
-                "media_unlock_whitelist",
-                "media_rules_broadcast",
-                "media_rules_broadcast_interval_minutes",
-                "autoreply",
-            ):
-                shared.pop(obsolete_key, None)
-            config["groups"] = {SHARED_GROUP_CONFIG_KEY: shared}
         else:
             config = {"groups": {}}
-            await save_config()
+
+        groups = config.setdefault("groups", {})
+        shared_template = groups.pop(SHARED_GROUP_CONFIG_KEY, None)
+        if not isinstance(shared_template, dict):
+            shared_template = None
+
+        # 旧版本只有一套 __shared__ 配置；迁移时为当前已知群组各复制一份。
+        if shared_template is not None and not any(isinstance(v, dict) for v in groups.values()):
+            for gid in sorted(_get_managed_group_ids()):
+                groups[str(gid)] = deepcopy(shared_template)
+
+        for gid in sorted(_get_managed_group_ids()):
+            groups.setdefault(str(gid), deepcopy(shared_template) if shared_template is not None else {})
+
+        obsolete_keys = (
+            "check_bio_link",
+            "bio_keywords",
+            "check_bio_keywords",
+            "check_display_keywords",
+            "display_keywords",
+            "check_message_keywords",
+            "message_keywords",
+            "check_message_link",
+            "message_keyword_normalize",
+            "short_msg_detection",
+            "short_msg_threshold",
+            "min_consecutive_count",
+            "time_window_seconds",
+            "fill_garbage_detection",
+            "fill_garbage_min_raw_len",
+            "fill_garbage_max_clean_len",
+            "fill_space_ratio",
+            "violation_mute_hours",
+            "reported_message_threshold",
+            "report_history_mute_hours",
+            "report_history_threshold",
+            "report_history_whitelist",
+            "exempt_users",
+            "misjudge_whitelist",
+            "mild_exempt_whitelist",
+            "media_unlock_boosts",
+            "media_unlock_whitelist",
+            "media_rules_broadcast",
+            "media_rules_broadcast_interval_minutes",
+            "autoreply",
+        )
+        for gid, group_cfg in list(groups.items()):
+            if not isinstance(group_cfg, dict):
+                groups[gid] = deepcopy(default)
+                continue
+            _ensure_group_config_defaults(group_cfg)
+            for obsolete_key in obsolete_keys:
+                group_cfg.pop(obsolete_key, None)
+        await save_config()
     except Exception as e:
         print(f"配置加载失败: {e}")
         config = {"groups": {}}
 
 async def save_config():
-    """保存配置到 CONFIG_FILE，豁免名单/白名单/豁免词等所有名单均在此持久化，重启不丢失"""
+    """保存配置到 CONFIG_FILE，按群组独立持久化。"""
     try:
         if "groups" not in config or not isinstance(config["groups"], dict):
             config["groups"] = {}
-        shared = config["groups"].get(SHARED_GROUP_CONFIG_KEY)
-        if not isinstance(shared, dict):
-            shared = _default_group_config()
-        config["groups"] = {SHARED_GROUP_CONFIG_KEY: shared}
+        config["groups"].pop(SHARED_GROUP_CONFIG_KEY, None)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -1337,12 +1413,16 @@ async def _prune_recent_messages_db(force: bool = False) -> None:
 
 
 def _queue_recent_message_upsert(group_id: int, user_id: int, msg_id: int, ts: float, text: str) -> None:
+    while len(recent_messages_pending_writes) >= RECENT_MESSAGES_PENDING_MAX:
+        recent_messages_pending_writes.popleft()
     recent_messages_pending_writes.append(
         ("upsert", int(group_id), int(user_id), int(msg_id), float(ts), str(text or ""), _normalize_text(text))
     )
 
 
 def _queue_recent_message_delete(group_id: int, original_msg_id: int) -> None:
+    while len(recent_messages_pending_writes) >= RECENT_MESSAGES_PENDING_MAX:
+        recent_messages_pending_writes.popleft()
     recent_messages_pending_writes.append(("delete", int(group_id), int(original_msg_id)))
 
 
@@ -1909,14 +1989,12 @@ def get_group_config(group_id: int):
     _remember_group(group_id)
     if "groups" not in config or not isinstance(config["groups"], dict):
         config["groups"] = {}
-    if SHARED_GROUP_CONFIG_KEY not in config["groups"] or not isinstance(config["groups"].get(SHARED_GROUP_CONFIG_KEY), dict):
-        config["groups"][SHARED_GROUP_CONFIG_KEY] = _default_group_config()
-    shared = config["groups"][SHARED_GROUP_CONFIG_KEY]
-    default = _default_group_config()
-    for k, v in default.items():
-        if k not in shared:
-            shared[k] = v
-    return shared
+    gid = str(int(group_id))
+    if gid not in config["groups"] or not isinstance(config["groups"].get(gid), dict):
+        config["groups"][gid] = _default_group_config()
+    group_cfg = config["groups"][gid]
+    _ensure_group_config_defaults(group_cfg)
+    return group_cfg
 
 def get_primary_group_id() -> int:
     managed = sorted(_get_managed_group_ids())
@@ -1972,10 +2050,20 @@ class AdminStates(StatesGroup):
 
 # ==================== UI 键盘 ====================
 def get_main_menu_keyboard():
-    """保留旧入口，统一跳到全局控制台。"""
+    """保留旧入口，进入群组选择。"""
     buttons = [
-        [InlineKeyboardButton(text="⚙️ 进入全局控制台", callback_data="group_menu_single")],
+        [InlineKeyboardButton(text="👥 选择群组", callback_data="choose_group")],
     ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_group_picker_keyboard(group_ids: list[int], group_titles: dict[int, str]) -> InlineKeyboardMarkup:
+    buttons = []
+    for gid in group_ids[:30]:
+        title = (group_titles.get(gid) or str(gid)).strip()
+        if len(title) > 24:
+            title = title[:24] + "..."
+        buttons.append([InlineKeyboardButton(text=f"{title} ({gid})", callback_data=f"select_group:{gid}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -2117,50 +2205,40 @@ def get_media_report_menu_keyboard(group_id: int):
 # ==================== 管理员命令 ====================
 @router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_panel(message: Message, state: FSMContext):
-    """进入全局控制台，配置同步应用到全部受控群组。"""
-    group_id = _select_admin_group_id(
-        message.chat.id if _is_group_chat_message(message) else None
-    )
-    managed_count = len(_get_managed_group_ids())
-    if group_id is None:
+    """进入管理面板，先选择要单独配置的群组。"""
+    if _is_group_chat_message(message):
+        _remember_group(message.chat.id)
+    group_ids = sorted(_get_managed_group_ids())
+    if not group_ids:
         await message.reply("当前尚未发现可管理群组。先把 bot 拉进群并授予管理权限，同时保证管理员账号也在群内。")
         return
-    await state.update_data(group_id=group_id)
-    cfg = get_group_config(group_id)
-    status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
+    titles = await _resolve_group_titles(group_ids)
     text = (
         "👮 管理员面板\n\n"
-        f"状态: {status}\n"
-        f"受控群组数: {managed_count}\n"
-        f"主配置群ID: <code>{group_id}</code>\n\n"
-        "所有参数都会同步应用到全部群组。"
+        f"可管理群组数: {len(group_ids)}\n"
+        "请选择要配置的群组。每个群组的开关和参数独立保存。"
     )
-    kb = get_group_menu_keyboard(group_id)
+    kb = get_group_picker_keyboard(group_ids, titles)
     await message.reply(text, reply_markup=kb)
-    await state.set_state(AdminStates.GroupMenu)
+    await state.set_state(AdminStates.MainMenu)
 
 # ==================== 回调处理 ====================
 @router.callback_query(F.data == "choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def choose_group_callback(callback: CallbackQuery, state: FSMContext):
-    """兼容旧入口：统一跳到全局控制台。"""
-    group_id = _select_admin_group_id()
-    managed_count = len(_get_managed_group_ids())
-    if group_id is None:
+    """选择要单独配置的群组。"""
+    group_ids = sorted(_get_managed_group_ids())
+    if not group_ids:
         await callback.answer("尚未发现可管理群组。", show_alert=True)
         return
-    await state.update_data(group_id=group_id)
-    cfg = get_group_config(group_id)
-    status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
+    titles = await _resolve_group_titles(group_ids)
     text = (
         "👮 管理员面板\n\n"
-        f"状态: {status}\n"
-        f"受控群组数: {managed_count}\n"
-        f"主配置群ID: <code>{group_id}</code>\n\n"
-        "所有参数都会同步应用到全部群组。"
+        f"可管理群组数: {len(group_ids)}\n"
+        "请选择要配置的群组。每个群组的开关和参数独立保存。"
     )
-    kb = get_group_menu_keyboard(group_id)
+    kb = get_group_picker_keyboard(group_ids, titles)
     await callback.message.edit_text(text, reply_markup=kb)
-    await state.set_state(AdminStates.GroupMenu)
+    await state.set_state(AdminStates.MainMenu)
     await callback.answer()
 
 @router.callback_query(F.data == "group_menu_single", F.from_user.id.in_(ADMIN_IDS))
@@ -2202,7 +2280,7 @@ async def select_group(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back_main", F.from_user.id.in_(ADMIN_IDS))
 @router.callback_query(F.data == "back_choose_group", F.from_user.id.in_(ADMIN_IDS))
 async def back_choose_group(callback: CallbackQuery, state: FSMContext):
-    """单群模式下，返回即回到本群控制台。"""
+    """返回群组选择。"""
     await choose_group_callback(callback, state)
 
 @router.callback_query(F.data.startswith("group_menu:"), F.from_user.id.in_(ADMIN_IDS))
@@ -2215,10 +2293,10 @@ async def group_menu(callback: CallbackQuery, state: FSMContext):
         status = "✅ 运行中" if cfg.get("enabled", True) else "❌ 已停用"
         text = (
             "👮 管理员面板\n\n"
+            f"群组: <code>{group_id}</code>\n"
             f"状态: {status}\n"
-            f"受控群组数: {len(_get_managed_group_ids())}\n"
-            f"主配置群ID: <code>{group_id}</code>\n\n"
-            "所有参数都会同步应用到全部群组。"
+            f"可管理群组数: {len(_get_managed_group_ids())}\n\n"
+            "当前只管理这个群组的配置。"
         )
         kb = get_group_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
@@ -2586,7 +2664,15 @@ async def view_join_logs(callback: CallbackQuery):
         start = page * page_size
         chunk = items[start : start + page_size]
         if not chunk:
-            text = "🚪 入群审批记录\n\n暂无记录。"
+            total_logs = len(join_review_logs)
+            if total_logs:
+                text = (
+                    "🚪 入群审批记录\n\n"
+                    "当前群组暂无记录。\n"
+                    f"系统内共有 {total_logs} 条审批记录，请返回选择对应群组查看。"
+                )
+            else:
+                text = "🚪 入群审批记录\n\n暂无记录。"
         else:
             lines = []
             for idx, item in enumerate(chunk, start=1 + start):
@@ -2619,7 +2705,15 @@ async def view_mod_logs(callback: CallbackQuery):
         start = page * page_size
         chunk = items[start : start + page_size]
         if not chunk:
-            text = "📝 处理记录\n\n暂无记录。"
+            total_logs = len(moderation_logs)
+            if total_logs:
+                text = (
+                    "📝 处理记录\n\n"
+                    "当前群组暂无记录。\n"
+                    f"系统内共有 {total_logs} 条处理记录，请返回选择对应群组查看。"
+                )
+            else:
+                text = "📝 处理记录\n\n暂无记录。"
         else:
             lines = []
             for idx, item in enumerate(chunk, start=1 + start):
@@ -3248,7 +3342,7 @@ async def export_listen_log(callback: CallbackQuery):
 # key: (group_id, user_id, signature_hash) -> deque[timestamp]；避免长文本直接常驻内存
 repeat_message_history = {}
 repeat_message_history_last = {}  # key -> last_activity_time，用于淘汰
-REPEAT_HISTORY_MAX_KEYS = 6000
+REPEAT_HISTORY_MAX_KEYS = max(500, int((os.getenv("REPEAT_HISTORY_MAX_KEYS") or "3000").strip()))
 MEDIA_REPORT_LAST_MAX = 800
 
 
@@ -5301,6 +5395,13 @@ async def _logs_flush_worker() -> None:
 
 async def main():
     print("🚀 机器人启动")
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=WORKER_THREAD_MAX,
+            thread_name_prefix="bot-worker",
+        )
+    )
     await load_config()
     for gid in _get_managed_group_ids():
         get_group_config(gid)

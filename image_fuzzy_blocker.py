@@ -5,7 +5,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from PIL import Image, ImageOps
 
@@ -22,7 +22,7 @@ class ImageHashMatch:
         return self.ahash_distance + self.dhash_distance
 
 
-def _bits_to_int(bits: list[int]) -> int:
+def _bits_to_int(bits: Iterable[int]) -> int:
     value = 0
     for bit in bits:
         value = (value << 1) | (1 if bit else 0)
@@ -43,20 +43,19 @@ def _average_hash(image: Image.Image, size: int = 8) -> int:
     reduced = gray.resize((size, size), Image.Resampling.LANCZOS)
     pixels = list(reduced.getdata())
     avg = sum(int(px) for px in pixels) / max(1, len(pixels))
-    bits = [1 if int(px) >= avg else 0 for px in pixels]
-    return _bits_to_int(bits)
+    return _bits_to_int(1 if int(px) >= avg else 0 for px in pixels)
 
 
 def _difference_hash(image: Image.Image, width: int = 9, height: int = 8) -> int:
     gray = ImageOps.grayscale(image)
     reduced = gray.resize((width, height), Image.Resampling.LANCZOS)
     pixels = list(reduced.getdata())
-    rows: list[int] = []
+    bits = []
     for y in range(height):
         base = y * width
         for x in range(width - 1):
-            rows.append(1 if int(pixels[base + x]) <= int(pixels[base + x + 1]) else 0)
-    return _bits_to_int(rows)
+            bits.append(1 if int(pixels[base + x]) <= int(pixels[base + x + 1]) else 0)
+    return _bits_to_int(bits)
 
 
 def build_image_hashes(image_bytes: bytes) -> tuple[int, int]:

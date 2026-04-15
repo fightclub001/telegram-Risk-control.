@@ -27,7 +27,7 @@ from rapidfuzz import fuzz  # type: ignore
 from simhash import Simhash  # type: ignore
 
 
-@dataclass
+@dataclass(slots=True)
 class AdSample:
     id: int
     text: str
@@ -387,14 +387,14 @@ class SemanticAdDetector:
             ORDER BY text_len DESC, id ASC
             """,
             (norm_len,),
-        ).fetchall()
-        if not hard_rows:
-            return False, 0.0, None
+        )
 
         # 硬规则优先：
         # 1. 完全相同的归一化文案必须命中
         # 2. 新消息完整包含任一广告样本，也必须命中
+        saw_hard_row = False
         for sid, text_old, _text_len in hard_rows:
+            saw_hard_row = True
             sample_text = str(text_old or "")
             if not sample_text:
                 continue
@@ -402,6 +402,8 @@ class SemanticAdDetector:
                 return True, 1.0, int(sid)
             if sample_text in norm:
                 return True, 1.0, int(sid)
+        if not saw_hard_row:
+            return False, 0.0, None
 
         soft_min_len = max(min_len, int(norm_len * 0.55))
         soft_max_len = max(norm_len + 8, int(norm_len * 1.45))
@@ -413,9 +415,7 @@ class SemanticAdDetector:
             ORDER BY text_len ASC, id ASC
             """,
             (soft_min_len, soft_max_len),
-        ).fetchall()
-        if not rows:
-            return False, 0.0, None
+        )
 
         grams_new = _ngrams(norm, 3)
         sh_new = _simhash_from_tokens(grams_new if grams_new else [norm])
