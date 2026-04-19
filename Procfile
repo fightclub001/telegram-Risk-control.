@@ -1,1 +1,1 @@
-worker: python main.py
+worker: python railway_failover_runner.py
