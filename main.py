@@ -14,6 +14,7 @@ from collections import deque
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
+from urllib import error as urllib_error, request as urllib_request
 from urllib.parse import unquote
 try:
     from zoneinfo import ZoneInfo
@@ -63,11 +64,57 @@ router = Router()
 dp.include_router(router)
 
 # ==================== 数据文件 ====================
-# 使用环境变量 DATA_DIR；Railway 需将 Volume 挂载到该路径（如 /data），重新部署后配置与名单才不丢失
+# 使用环境变量 DATA_DIR；兼容旧环境变量 CONFIG_DIR，并在常见挂载目录中自动识别已有持久化数据。
 # 以下数据均持久化，重启不丢失：CONFIG_FILE（核心面板配置）、DATA_FILE（进行中举报记录）、
 # MEDIA_STATS_FILE / REPEAT_LEVEL_FILE（仅用于旧 JSON 迁移）、RECENT_MESSAGES_DB_FILE（最近24小时消息缓存 + 轻量运行时状态）。
-DATA_DIR = os.getenv("DATA_DIR", "/data")
+_RUNTIME_STATE_FILES = (
+    "config.json",
+    "reports.json",
+    "media_stats.json",
+    "repeat_levels.json",
+    "forward_match_memory.json",
+    "recent_messages.json",
+    "recent_messages.db",
+)
+
+
+def _has_runtime_state(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        return any(os.path.exists(os.path.join(path, filename)) for filename in _RUNTIME_STATE_FILES)
+    except Exception:
+        return False
+
+
+def _resolve_data_dir() -> tuple[str, str]:
+    explicit_data_dir = (os.getenv("DATA_DIR") or "").strip()
+    legacy_config_dir = (os.getenv("CONFIG_DIR") or "").strip()
+
+    candidates = []
+    for value in (explicit_data_dir, legacy_config_dir, "/data", "/app/data"):
+        if value and value not in candidates:
+            candidates.append(value)
+
+    for candidate in candidates:
+        if not _has_runtime_state(candidate):
+            continue
+        if explicit_data_dir and candidate == explicit_data_dir:
+            return candidate, "DATA_DIR(existing)"
+        if legacy_config_dir and candidate == legacy_config_dir:
+            return candidate, "CONFIG_DIR(existing)"
+        return candidate, "auto-detected(existing)"
+
+    if explicit_data_dir:
+        return explicit_data_dir, "DATA_DIR"
+    if legacy_config_dir:
+        return legacy_config_dir, "CONFIG_DIR(legacy)"
+    return "/data", "default"
+
+
+DATA_DIR, DATA_DIR_SOURCE = _resolve_data_dir()
 os.makedirs(DATA_DIR, exist_ok=True)
+print(f"[startup] runtime data dir: {DATA_DIR} (source: {DATA_DIR_SOURCE})")
 DATA_FILE = os.path.join(DATA_DIR, "reports.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 MEDIA_STATS_FILE = os.path.join(DATA_DIR, "media_stats.json")
@@ -77,6 +124,19 @@ RECENT_MESSAGES_FILE = os.path.join(DATA_DIR, "recent_messages.json")
 RECENT_MESSAGES_DB_FILE = os.path.join(DATA_DIR, "recent_messages.db")
 JOIN_REVIEW_LOG_FILE = os.path.join(DATA_DIR, "join_review_logs.json")
 MOD_ACTION_LOG_FILE = os.path.join(DATA_DIR, "moderation_logs.json")
+CONFIG_SYNC_URL = (os.getenv("CONFIG_SYNC_URL") or "").strip()
+CONFIG_SYNC_TOKEN = (os.getenv("CONFIG_SYNC_TOKEN") or "").strip()
+CONFIG_SYNC_TIMEOUT_SEC = max(2, int((os.getenv("CONFIG_SYNC_TIMEOUT_SEC") or "5").strip()))
+CONFIG_SYNC_PULL_ON_START = (os.getenv("CONFIG_SYNC_PULL_ON_START") or "true").strip().lower() in {"1", "true", "yes", "on"}
+CONFIG_SYNC_PUSH_ON_SAVE = (os.getenv("CONFIG_SYNC_PUSH_ON_SAVE") or "true").strip().lower() in {"1", "true", "yes", "on"}
+CONFIG_SYNC_ENABLED = bool(CONFIG_SYNC_URL and CONFIG_SYNC_TOKEN)
+IMAGE_FUZZY_SYNC_URL = (os.getenv("IMAGE_FUZZY_SYNC_URL") or "").strip()
+if not IMAGE_FUZZY_SYNC_URL and CONFIG_SYNC_URL:
+    if CONFIG_SYNC_URL.endswith("/config"):
+        IMAGE_FUZZY_SYNC_URL = f"{CONFIG_SYNC_URL[:-7]}/image-fuzzy-blocks"
+    else:
+        IMAGE_FUZZY_SYNC_URL = f"{CONFIG_SYNC_URL.rstrip('/')}/image-fuzzy-blocks"
+IMAGE_FUZZY_SYNC_ENABLED = bool(IMAGE_FUZZY_SYNC_URL and CONFIG_SYNC_TOKEN)
 
 reports = {}  # key: (group_id, message_id)
 reports_dirty = False
@@ -1145,10 +1205,200 @@ def _ensure_group_config_defaults(group_cfg: dict[str, Any]) -> None:
         if key not in group_cfg:
             group_cfg[key] = deepcopy(value)
 
+
+def _collect_group_config_keys(groups: dict[str, Any]) -> list[str]:
+    keys: set[str] = set()
+    for gid in _get_managed_group_ids():
+        try:
+            if int(gid) < 0:
+                keys.add(str(int(gid)))
+        except Exception:
+            continue
+    for raw_key in groups.keys():
+        if raw_key == SHARED_GROUP_CONFIG_KEY:
+            continue
+        try:
+            gid = int(raw_key)
+        except Exception:
+            continue
+        if gid < 0:
+            keys.add(str(gid))
+    return sorted(keys, key=int)
+
+
+def _build_sync_request(url: str, method: str, payload: bytes | None = None) -> urllib_request.Request:
+    request = urllib_request.Request(url, method=method)
+    request.add_header("Accept", "application/json")
+    request.add_header("Authorization", f"Bearer {CONFIG_SYNC_TOKEN}")
+    if payload is not None:
+        request.add_header("Content-Type", "application/json; charset=utf-8")
+        request.add_header("Content-Length", str(len(payload)))
+    return request
+
+
+def _pull_remote_config_once() -> dict[str, Any] | None:
+    if not (CONFIG_SYNC_ENABLED and CONFIG_SYNC_PULL_ON_START):
+        return None
+    try:
+        req = _build_sync_request(CONFIG_SYNC_URL, "GET")
+        with urllib_request.urlopen(req, timeout=CONFIG_SYNC_TIMEOUT_SEC) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        raw = json.loads(body)
+        if isinstance(raw, dict):
+            return raw
+        print("[config-sync] remote payload is not a JSON object; ignored")
+    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        print(f"[config-sync] pull skipped: {e}")
+    except Exception as e:
+        print(f"[config-sync] pull failed: {e}")
+    return None
+
+
+async def _pull_remote_config_if_enabled() -> bool:
+    remote_config = await asyncio.to_thread(_pull_remote_config_once)
+    if not isinstance(remote_config, dict):
+        return False
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        temp_file = f"{CONFIG_FILE}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(remote_config, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, CONFIG_FILE)
+        print("[config-sync] remote config pulled to local snapshot")
+        return True
+    except Exception as e:
+        print(f"[config-sync] failed to persist pulled config: {e}")
+        return False
+
+
+def _push_remote_config_once(snapshot: dict[str, Any]) -> bool:
+    if not (CONFIG_SYNC_ENABLED and CONFIG_SYNC_PUSH_ON_SAVE):
+        return False
+    try:
+        payload = json.dumps(snapshot, ensure_ascii=False).encode("utf-8")
+        req = _build_sync_request(CONFIG_SYNC_URL, "PUT", payload=payload)
+        with urllib_request.urlopen(req, data=payload, timeout=CONFIG_SYNC_TIMEOUT_SEC) as resp:
+            _ = resp.read()
+        return True
+    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError) as e:
+        print(f"[config-sync] push skipped: {e}")
+    except Exception as e:
+        print(f"[config-sync] push failed: {e}")
+    return False
+
+
+async def _push_remote_config_if_enabled(snapshot: dict[str, Any]) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    pushed = await asyncio.to_thread(_push_remote_config_once, snapshot)
+    if pushed:
+        print("[config-sync] config pushed to remote volume")
+
+
+def _pull_remote_image_fuzzy_blocks_once() -> list[dict[str, Any]] | None:
+    if not (IMAGE_FUZZY_SYNC_ENABLED and CONFIG_SYNC_PULL_ON_START):
+        return None
+    try:
+        req = _build_sync_request(IMAGE_FUZZY_SYNC_URL, "GET")
+        with urllib_request.urlopen(req, timeout=CONFIG_SYNC_TIMEOUT_SEC) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        raw = json.loads(body)
+        if not isinstance(raw, list):
+            print("[image-sync] remote payload is not a JSON array; ignored")
+            return None
+        cleaned: list[dict[str, Any]] = []
+        for item in raw:
+            if isinstance(item, dict):
+                cleaned.append(item)
+        return cleaned
+    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        print(f"[image-sync] pull skipped: {e}")
+    except Exception as e:
+        print(f"[image-sync] pull failed: {e}")
+    return None
+
+
+async def _pull_remote_image_fuzzy_blocks_if_enabled() -> bool:
+    remote_items = await asyncio.to_thread(_pull_remote_image_fuzzy_blocks_once)
+    if not isinstance(remote_items, list):
+        return False
+    try:
+        os.makedirs(os.path.dirname(IMAGE_FUZZY_BLOCK_FILE), exist_ok=True)
+        temp_file = f"{IMAGE_FUZZY_BLOCK_FILE}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(remote_items, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, IMAGE_FUZZY_BLOCK_FILE)
+        global image_fuzzy_blocker
+        image_fuzzy_blocker = None
+        print("[image-sync] remote image sample library pulled to local snapshot")
+        return True
+    except Exception as e:
+        print(f"[image-sync] failed to persist pulled samples: {e}")
+        return False
+
+
+def _push_remote_image_fuzzy_blocks_once(snapshot: list[dict[str, Any]]) -> bool:
+    if not (IMAGE_FUZZY_SYNC_ENABLED and CONFIG_SYNC_PUSH_ON_SAVE):
+        return False
+    try:
+        payload = json.dumps(snapshot, ensure_ascii=False).encode("utf-8")
+        req = _build_sync_request(IMAGE_FUZZY_SYNC_URL, "PUT", payload=payload)
+        with urllib_request.urlopen(req, data=payload, timeout=CONFIG_SYNC_TIMEOUT_SEC) as resp:
+            _ = resp.read()
+        return True
+    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError) as e:
+        print(f"[image-sync] push skipped: {e}")
+    except Exception as e:
+        print(f"[image-sync] push failed: {e}")
+    return False
+
+
+async def _push_remote_image_fuzzy_blocks_if_enabled() -> None:
+    if not (IMAGE_FUZZY_SYNC_ENABLED and CONFIG_SYNC_PUSH_ON_SAVE):
+        return
+    try:
+        if os.path.exists(IMAGE_FUZZY_BLOCK_FILE):
+            with open(IMAGE_FUZZY_BLOCK_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, list):
+                raw = []
+        else:
+            raw = []
+        snapshot = [item for item in raw if isinstance(item, dict)]
+        pushed = await asyncio.to_thread(_push_remote_image_fuzzy_blocks_once, snapshot)
+        if pushed:
+            print("[image-sync] image sample library pushed to remote volume")
+    except Exception as e:
+        print(f"[image-sync] local snapshot read failed: {e}")
+
+
+async def _add_image_fuzzy_sample_and_sync(*, group_id: int, label: str, image_bytes: bytes) -> dict[str, Any]:
+    item = await asyncio.to_thread(
+        get_image_fuzzy_blocker().add_sample,
+        group_id=group_id,
+        label=label,
+        image_bytes=image_bytes,
+    )
+    await _push_remote_image_fuzzy_blocks_if_enabled()
+    return item
+
+
+async def _remove_image_fuzzy_samples_and_sync(*, group_id: int, sample_ids: list[int]) -> list[int]:
+    removed = await asyncio.to_thread(
+        get_image_fuzzy_blocker().remove_samples,
+        group_id=group_id,
+        sample_ids=sample_ids,
+    )
+    if removed:
+        await _push_remote_image_fuzzy_blocks_if_enabled()
+    return removed
+
 async def load_config():
     """从 CONFIG_FILE 加载配置；每个群组独立保存配置，仅对缺失项补默认值。"""
     global config
     try:
+        await _pull_remote_config_if_enabled()
+        await _pull_remote_image_fuzzy_blocks_if_enabled()
         default = _default_group_config()
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -1165,16 +1415,22 @@ async def load_config():
             config = {"groups": {}}
 
         groups = config.setdefault("groups", {})
-        shared_template = groups.pop(SHARED_GROUP_CONFIG_KEY, None)
+        shared_template = groups.get(SHARED_GROUP_CONFIG_KEY)
         if not isinstance(shared_template, dict):
             shared_template = None
 
-        # 旧版本只有一套 __shared__ 配置；迁移时为当前已知群组各复制一份。
-        if shared_template is not None and not any(isinstance(v, dict) for v in groups.values()):
-            for gid in sorted(_get_managed_group_ids()):
+        group_keys = _collect_group_config_keys(groups)
+
+        # 旧版本只有一套 __shared__ 配置；当已经知道群组时再迁移，避免空上下文误清空。
+        has_concrete_group_cfg = any(
+            key != SHARED_GROUP_CONFIG_KEY and isinstance(value, dict)
+            for key, value in groups.items()
+        )
+        if shared_template is not None and not has_concrete_group_cfg and group_keys:
+            for gid in group_keys:
                 groups[str(gid)] = deepcopy(shared_template)
 
-        for gid in sorted(_get_managed_group_ids()):
+        for gid in group_keys:
             groups.setdefault(str(gid), deepcopy(shared_template) if shared_template is not None else {})
 
         obsolete_keys = (
@@ -1210,25 +1466,41 @@ async def load_config():
             "autoreply",
         )
         for gid, group_cfg in list(groups.items()):
+            if gid == SHARED_GROUP_CONFIG_KEY:
+                continue
             if not isinstance(group_cfg, dict):
                 groups[gid] = deepcopy(default)
                 continue
             _ensure_group_config_defaults(group_cfg)
             for obsolete_key in obsolete_keys:
                 group_cfg.pop(obsolete_key, None)
-        await save_config()
+        await save_config(sync_remote=False)
     except Exception as e:
         print(f"配置加载失败: {e}")
         config = {"groups": {}}
 
-async def save_config():
+async def save_config(sync_remote: bool = True):
     """保存配置到 CONFIG_FILE，按群组独立持久化。"""
     try:
         if "groups" not in config or not isinstance(config["groups"], dict):
             config["groups"] = {}
-        config["groups"].pop(SHARED_GROUP_CONFIG_KEY, None)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        groups = config["groups"]
+        has_concrete_group_cfg = any(
+            key != SHARED_GROUP_CONFIG_KEY and isinstance(value, dict)
+            for key, value in groups.items()
+        )
+        if has_concrete_group_cfg:
+            groups.pop(SHARED_GROUP_CONFIG_KEY, None)
+        elif not isinstance(groups.get(SHARED_GROUP_CONFIG_KEY), dict):
+            groups.pop(SHARED_GROUP_CONFIG_KEY, None)
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        temp_file = f"{CONFIG_FILE}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, CONFIG_FILE)
+        if sync_remote and CONFIG_SYNC_ENABLED and CONFIG_SYNC_PUSH_ON_SAVE:
+            snapshot = deepcopy(config)
+            asyncio.create_task(_push_remote_config_if_enabled(snapshot))
     except Exception as e:
         print(f"配置保存失败: {e}")
 
@@ -1376,6 +1648,21 @@ def _get_recent_messages_conn() -> sqlite3.Connection:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_repeat_levels_updated_ts "
             "ON repeat_violation_levels(updated_ts DESC)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repeat_first_trigger_state (
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                skipped_once INTEGER NOT NULL DEFAULT 0,
+                updated_ts REAL NOT NULL,
+                PRIMARY KEY (group_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_repeat_first_trigger_updated_ts "
+            "ON repeat_first_trigger_state(updated_ts DESC)"
         )
         recent_messages_conn = conn
     return recent_messages_conn
@@ -1944,6 +2231,39 @@ async def _set_repeat_violation_level(group_id: int, user_id: int, level: int) -
         conn.commit()
 
 
+async def _has_repeat_first_trigger_skipped(group_id: int, user_id: int) -> bool:
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        row = conn.execute(
+            """
+            SELECT skipped_once
+            FROM repeat_first_trigger_state
+            WHERE group_id = ? AND user_id = ?
+            """,
+            (int(group_id), int(user_id)),
+        ).fetchone()
+    if row is None:
+        return False
+    return bool(row["skipped_once"])
+
+
+async def _mark_repeat_first_trigger_skipped(group_id: int, user_id: int) -> None:
+    conn = _get_recent_messages_conn()
+    async with recent_messages_lock:
+        conn.execute(
+            """
+            INSERT INTO repeat_first_trigger_state
+            (group_id, user_id, skipped_once, updated_ts)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(group_id, user_id) DO UPDATE SET
+                skipped_once = 1,
+                updated_ts = excluded.updated_ts
+            """,
+            (int(group_id), int(user_id), time.time()),
+        )
+        conn.commit()
+
+
 def _pack_forward_match_value(group_id: int, user_id: int, updated_at: int) -> list[int]:
     return [int(group_id), int(user_id), int(updated_at)]
 
@@ -1990,8 +2310,12 @@ def get_group_config(group_id: int):
     if "groups" not in config or not isinstance(config["groups"], dict):
         config["groups"] = {}
     gid = str(int(group_id))
+    shared_cfg = config["groups"].get(SHARED_GROUP_CONFIG_KEY)
     if gid not in config["groups"] or not isinstance(config["groups"].get(gid), dict):
-        config["groups"][gid] = _default_group_config()
+        if isinstance(shared_cfg, dict):
+            config["groups"][gid] = deepcopy(shared_cfg)
+        else:
+            config["groups"][gid] = _default_group_config()
     group_cfg = config["groups"][gid]
     _ensure_group_config_defaults(group_cfg)
     return group_cfg
@@ -2546,8 +2870,7 @@ async def process_add_join_image_hash_sample(message: Message, state: FSMContext
             await message.reply("❌ 没检测到图片。请直接发送图片，或回复图片后再发送。发送 /cancel 取消。")
             return
         label_source = target.caption or target.text or message.caption or message.text or f"msg:{target.message_id}"
-        item = await asyncio.to_thread(
-            get_image_fuzzy_blocker().add_sample,
+        item = await _add_image_fuzzy_sample_and_sync(
             group_id=group_id,
             label=_clip_text(label_source, 60),
             image_bytes=image_bytes,
@@ -2576,8 +2899,7 @@ async def process_remove_join_image_hash_sample(message: Message, state: FSMCont
             if not item:
                 continue
             sample_ids.append(int(item))
-        removed = await asyncio.to_thread(
-            get_image_fuzzy_blocker().remove_samples,
+        removed = await _remove_image_fuzzy_samples_and_sync(
             group_id=group_id,
             sample_ids=sample_ids,
         )
@@ -3456,6 +3778,13 @@ async def _handle_repeat_signature(message: Message, signature: str, repeat_labe
     count = len(history)
 
     if count == 2:
+        if not await _has_repeat_first_trigger_skipped(group_id, user_id):
+            await _mark_repeat_first_trigger_skipped(group_id, user_id)
+            print(
+                "[repeat] first trigger skip warning "
+                f"group_id={group_id} user_id={user_id} count=2/{max_count}"
+            )
+            return False
         warn_text = (
             f"⚠️ 检测到你在 {window_sec // 3600} 小时内重复发送{repeat_label}（2/{max_count}），请勿刷屏。"
         )
@@ -4453,8 +4782,7 @@ async def cmd_imgban(message: Message):
             await message.reply("目标消息不是可识别图片。支持照片和 image/* 文档。")
             return
         label = _clip_text(target.caption or target.text or f"msg:{target.message_id}", 60)
-        item = await asyncio.to_thread(
-            get_image_fuzzy_blocker().add_sample,
+        item = await _add_image_fuzzy_sample_and_sync(
             group_id=message.chat.id,
             label=label,
             image_bytes=image_bytes,
@@ -4502,8 +4830,7 @@ async def cmd_imgunban(message: Message):
         if not sample_ids:
             await message.reply("用法：/imgunban 12 15 18")
             return
-        removed = await asyncio.to_thread(
-            get_image_fuzzy_blocker().remove_samples,
+        removed = await _remove_image_fuzzy_samples_and_sync(
             group_id=message.chat.id,
             sample_ids=sample_ids,
         )
