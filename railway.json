@@ -3,7 +3,7 @@
     "builder": "nixpacks"
   },
   "deploy": {
-    "startCommand": "python main.py",
+    "startCommand": "python railway_failover_runner.py",
     "restartPolicyType": "always",
     "restartPolicyMaxRetries": 10
   }
