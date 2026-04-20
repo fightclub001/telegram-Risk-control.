@@ -30,10 +30,11 @@ STATUS_URL = os.getenv(
 ).strip()
 STATUS_TOKEN = os.getenv("HEARTBEAT_STATUS_TOKEN", "").strip()
 PRIMARY_NODE_ID = os.getenv("PRIMARY_NODE_ID", "ubuntu-main").strip()
-MAX_AGE_SEC = _env_int("HEARTBEAT_MAX_AGE_SEC", 90)
-POLL_SEC = _env_int("HEARTBEAT_POLL_SEC", 15)
-RECOVER_CONFIRM_LOOPS = _env_int("HEARTBEAT_RECOVER_CONFIRM_LOOPS", 3)
-REQUEST_TIMEOUT_SEC = _env_int("HEARTBEAT_TIMEOUT_SEC", 5)
+MAX_AGE_SEC = max(1, _env_int("HEARTBEAT_MAX_AGE_SEC", 90))
+POLL_SEC = max(1, _env_int("HEARTBEAT_POLL_SEC", 15))
+RECOVER_CONFIRM_LOOPS = max(1, _env_int("HEARTBEAT_RECOVER_CONFIRM_LOOPS", 1))
+FAIL_CONFIRM_LOOPS = max(1, _env_int("HEARTBEAT_FAIL_CONFIRM_LOOPS", 3))
+REQUEST_TIMEOUT_SEC = max(1, _env_int("HEARTBEAT_TIMEOUT_SEC", 5))
 _RUNTIME_STATE_FILES = (
     "config.json",
     "reports.json",
@@ -289,21 +290,28 @@ def main() -> int:
 
     bot_proc: subprocess.Popen | None = None
     recover_streak = 0
+    fail_streak = 0
     log(
-        f"failover controller active, node={PRIMARY_NODE_ID}, poll={POLL_SEC}s, max_age={MAX_AGE_SEC}s"
+        "failover controller active, "
+        f"node={PRIMARY_NODE_ID}, poll={POLL_SEC}s, max_age={MAX_AGE_SEC}s, "
+        f"fail_confirm={FAIL_CONFIRM_LOOPS}, recover_confirm={RECOVER_CONFIRM_LOOPS}"
     )
 
     while True:
         primary_alive = query_primary_alive()
 
         if primary_alive:
+            fail_streak = 0
             recover_streak += 1
             if bot_proc is not None and recover_streak >= RECOVER_CONFIRM_LOOPS:
                 stop_bot(bot_proc)
                 bot_proc = None
         else:
             recover_streak = 0
-            if bot_proc is None or bot_proc.poll() is not None:
+            fail_streak += 1
+            # Guard against transient network jitter: only fail over after consecutive failures.
+            if fail_streak >= FAIL_CONFIRM_LOOPS and (bot_proc is None or bot_proc.poll() is not None):
+                log(f"primary unhealthy streak={fail_streak}; entering standby")
                 bot_proc = start_bot()
 
         if bot_proc is not None and bot_proc.poll() is not None:
