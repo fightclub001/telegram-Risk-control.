@@ -264,6 +264,31 @@ recent_messages_pending_writes = deque()
 recent_messages_lock = asyncio.Lock()
 recent_messages_last_prune_ts = 0.0
 RECENT_MESSAGES_PENDING_MAX = max(1000, int((os.getenv("RECENT_MESSAGES_PENDING_MAX") or "5000").strip()))
+SQLITE_INT64_MAX = (1 << 63) - 1
+SQLITE_UINT64_MOD = 1 << 64
+
+
+def _encode_sqlite_u64(value: int) -> int:
+    normalized = int(value or 0) % SQLITE_UINT64_MOD
+    if normalized > SQLITE_INT64_MAX:
+        return normalized - SQLITE_UINT64_MOD
+    return normalized
+
+
+def _decode_sqlite_u64(value: int) -> int:
+    normalized = int(value or 0)
+    if normalized < 0:
+        return normalized + SQLITE_UINT64_MOD
+    return normalized
+
+
+def _normalize_image_hashes_for_storage(image_hashes: dict[str, int] | None) -> tuple[int, int, int]:
+    hashes = image_hashes or {}
+    return (
+        _encode_sqlite_u64(hashes.get("ahash", 0)),
+        _encode_sqlite_u64(hashes.get("dhash", 0)),
+        _encode_sqlite_u64(hashes.get("phash", 0)),
+    )
 _BIO_URL_SPACE_RE = re.compile(r"[\s\u200b-\u200f\u2060\ufeff]+")
 _BIO_TELEGRAM_HOST_MARKERS = ("t.me/", "telegram.me/", "telegram.dog/", "tg://")
 
@@ -2158,6 +2183,7 @@ def _queue_recent_message_upsert(
     while len(recent_messages_pending_writes) >= RECENT_MESSAGES_PENDING_MAX:
         recent_messages_pending_writes.popleft()
     has_image = 1 if image_hashes else 0
+    image_ahash, image_dhash, image_phash = _normalize_image_hashes_for_storage(image_hashes)
     recent_messages_pending_writes.append(
         (
             "upsert",
@@ -2168,9 +2194,9 @@ def _queue_recent_message_upsert(
             str(text or ""),
             _normalize_text(text),
             has_image,
-            int((image_hashes or {}).get("ahash", 0) or 0),
-            int((image_hashes or {}).get("dhash", 0) or 0),
-            int((image_hashes or {}).get("phash", 0) or 0),
+            image_ahash,
+            image_dhash,
+            image_phash,
         )
     )
 
@@ -4633,9 +4659,9 @@ async def _find_recent_image_matches(
         sample = {
             "id": int(row["message_id"] or 0),
             "label": str(row["text"] or ""),
-            "ahash": int(row["image_ahash"] or 0),
-            "dhash": int(row["image_dhash"] or 0),
-            "phash": int(row["image_phash"] or 0),
+            "ahash": _decode_sqlite_u64(row["image_ahash"] or 0),
+            "dhash": _decode_sqlite_u64(row["image_dhash"] or 0),
+            "phash": _decode_sqlite_u64(row["image_phash"] or 0),
         }
         match = get_image_fuzzy_blocker().match_candidate_hashes(
             sample,

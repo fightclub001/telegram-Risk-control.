@@ -110,7 +110,7 @@ class SemanticAdDetector:
     # ---------- DB ----------
 
     def _ensure_db(self) -> None:
-        self._conn = sqlite3.connect(self.db_path)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA temp_store=FILE")
