@@ -2887,26 +2887,56 @@ def get_group_picker_keyboard(group_ids: list[int], group_titles: dict[int, str]
 def get_group_menu_keyboard(group_id: int):
     join_terms = _get_join_approval_terms(group_id)
     buttons = [
-        [InlineKeyboardButton(text="🧠 AD机器学习", callback_data=f"submenu_semantic_ad:{group_id}")],
-        [InlineKeyboardButton(text=f"🛂 入群审批 ({len(join_terms)})", callback_data=f"submenu_join_approval:{group_id}")],
-        [InlineKeyboardButton(text="🔁 重复发言", callback_data=f"submenu_repeat:{group_id}")],
-        [InlineKeyboardButton(text="📎 媒体权限", callback_data=f"submenu_media_perm:{group_id}")],
-        [InlineKeyboardButton(text="📣 媒体举报", callback_data=f"submenu_media_report:{group_id}")],
-        [InlineKeyboardButton(text="🚪 入群审批记录", callback_data=f"view_join_logs:{group_id}:0")],
-        [InlineKeyboardButton(text="📝 处理记录", callback_data=f"view_mod_logs:{group_id}:0")],
-        [InlineKeyboardButton(text="🎛️ 基础设置", callback_data=f"submenu_basic:{group_id}")],
+        [
+            InlineKeyboardButton(text="🧠 广告风控", callback_data=f"submenu_semantic_ad:{group_id}"),
+            InlineKeyboardButton(text=f"🛂 入群风控 ({len(join_terms)})", callback_data=f"submenu_join_approval:{group_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🔁 重复发言", callback_data=f"submenu_repeat:{group_id}"),
+            InlineKeyboardButton(text="📎 媒体权限", callback_data=f"submenu_media_perm:{group_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="📣 媒体举报", callback_data=f"submenu_media_report:{group_id}"),
+            InlineKeyboardButton(text="🎛️ 基础设置", callback_data=f"submenu_basic:{group_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🚪 入群记录", callback_data=f"view_join_logs:{group_id}:0"),
+            InlineKeyboardButton(text="📝 处理记录", callback_data=f"view_mod_logs:{group_id}:0"),
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _build_semantic_ad_summary(title: str, group_id: int) -> str:
+    cfg = get_group_config(group_id)
+    enabled = "✅ 已开启" if cfg.get("semantic_ad_enabled", False) else "❌ 已关闭"
+    image_samples = len(get_image_fuzzy_blocker().list_group_samples(group_id))
+    try:
+        detector = get_semantic_ad_detector()
+        text_samples = int(detector.stats().get("sample_count", 0) or 0)
+    except Exception:
+        text_samples = 0
+    return (
+        f"<b>{title}</b> › 广告风控\n\n"
+        f"文本语义识别：{enabled}\n"
+        f"广告文本样本：{text_samples} 条\n"
+        f"广告图片样本：{image_samples} 张\n\n"
+        "说明：广告图片库会同时用于群内发图追溯执法，以及入群头像相似图拦截。"
+    )
 
 
 def get_semantic_ad_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     enabled = "✅" if cfg.get("semantic_ad_enabled", False) else "❌"
+    samples = get_image_fuzzy_blocker().list_group_samples(group_id)
     buttons = [
         [InlineKeyboardButton(text=f"开关 {enabled}", callback_data=f"toggle_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="➕ 增加广告语句", callback_data=f"add_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="➖ 减少广告语句", callback_data=f"remove_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="📂 广告词库展示", callback_data=f"view_semantic_ad:{group_id}")],
+        [InlineKeyboardButton(text=f"🖼️ 广告图片库 ({len(samples)})", callback_data=f"view_semantic_ad_image:{group_id}")],
+        [InlineKeyboardButton(text="➕ 增加广告图片", callback_data=f"add_semantic_ad_image:{group_id}")],
+        [InlineKeyboardButton(text="➖ 删除广告图片", callback_data=f"remove_semantic_ad_image:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -2920,12 +2950,22 @@ def get_join_approval_menu_keyboard(group_id: int):
         [InlineKeyboardButton(text=f"✏️ 编辑敏感文字 ({len(terms)})", callback_data=f"edit_join_terms:{group_id}")],
         [InlineKeyboardButton(text=f"关键图相似拦截 {image_enabled}", callback_data=f"toggle_join_image_hash:{group_id}")],
         [InlineKeyboardButton(text=f"🎯 相似阈值: {_image_hash_max_distance(group_id)}", callback_data=f"edit_join_image_hash_distance:{group_id}")],
-        [InlineKeyboardButton(text=f"➕ 添加关键图 ({len(samples)})", callback_data=f"add_join_image_hash_sample:{group_id}")],
-        [InlineKeyboardButton(text="📂 关键图样本库", callback_data=f"view_join_image_hash_samples:{group_id}")],
-        [InlineKeyboardButton(text="➖ 删除关键图样本", callback_data=f"remove_join_image_hash_sample:{group_id}")],
+        [InlineKeyboardButton(text=f"🖼️ 广告图片库 ({len(samples)})", callback_data=f"submenu_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _image_hash_return_keyboard(group_id: int, return_menu: str):
+    if return_menu.startswith("submenu_semantic_ad:"):
+        return get_semantic_ad_menu_keyboard(group_id)
+    return get_join_approval_menu_keyboard(group_id)
+
+
+def _image_hash_context_title(return_menu: str) -> str:
+    if return_menu.startswith("submenu_semantic_ad:"):
+        return "广告图片库"
+    return "关键图样本"
 
 def get_basic_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
@@ -2962,9 +3002,8 @@ def _build_join_approval_summary(title: str, group_id: int) -> str:
         preview += f"\n… 共 {len(terms)} 条"
     samples = get_image_fuzzy_blocker().list_group_samples(group_id)
     image_status = "✅ 已开启" if _image_hash_enabled(group_id) else "❌ 已关闭"
-    action_text = "命中后封禁" if _image_hash_should_ban(group_id) else "命中后删除"
     return (
-        f"<b>{title}</b> › 入群审批\n\n"
+        f"<b>{title}</b> › 入群风控\n\n"
         "当前规则：\n"
         "1. 关键图相似哈希命中：拒绝\n"
         "2. 没有头像：通过\n"
@@ -2974,8 +3013,8 @@ def _build_join_approval_summary(title: str, group_id: int) -> str:
         f"敏感词数量：{len(terms)}\n"
         f"关键图拦截：{image_status}\n"
         f"关键图阈值：{_image_hash_max_distance(group_id)}\n"
-        f"关键图样本：{len(samples)} 张\n"
-        f"命中动作：{action_text}\n\n"
+        f"广告图片库：{len(samples)} 张（在广告风控菜单维护）\n"
+        "群内发图命中：删除该用户近期消息并关闭全部权限\n\n"
         f"当前敏感词预览：\n{preview}"
     )
 
@@ -3085,7 +3124,7 @@ async def select_group(callback: CallbackQuery, state: FSMContext):
         text = (
             f"👥 <b>{title}</b>\n"
             f"<code>ID: {group_id}</code>  |  状态: {status}\n\n"
-            "选择要管理的功能："
+            "分区：广告风控 / 入群风控 / 消息媒体风控 / 日志与基础设置"
         )
         kb = get_group_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
@@ -3113,7 +3152,8 @@ async def group_menu(callback: CallbackQuery, state: FSMContext):
             f"群组: <code>{group_id}</code>\n"
             f"状态: {status}\n"
             f"可管理群组数: {len(_get_managed_group_ids())}\n\n"
-            "当前只管理这个群组的配置。"
+            "当前只管理这个群组的配置。\n"
+            "分区：广告风控 / 入群风控 / 消息媒体风控 / 日志与基础设置"
         )
         kb = get_group_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
@@ -3128,9 +3168,7 @@ async def semantic_ad_submenu(callback: CallbackQuery):
     try:
         group_id = int(callback.data.split(":", 1)[1])
         title = await get_chat_title_safe(callback.bot, group_id)
-        cfg = get_group_config(group_id)
-        enabled = "✅" if cfg.get("semantic_ad_enabled", False) else "❌"
-        text = f"<b>{title}</b> › AD机器学习\n\n当前状态: {enabled}"
+        text = _build_semantic_ad_summary(title, group_id)
         kb = get_semantic_ad_menu_keyboard(group_id)
         await callback.message.edit_text(text, reply_markup=kb)
         await callback.answer()
@@ -3220,7 +3258,10 @@ async def edit_join_image_hash_distance(callback: CallbackQuery, state: FSMConte
 async def add_join_image_hash_sample(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
-        await state.update_data(group_id=group_id)
+        await state.update_data(
+            group_id=group_id,
+            image_hash_return_menu=f"submenu_join_approval:{group_id}",
+        )
         await callback.message.edit_text(
             "添加关键图样本\n"
             "请直接发送一张图片，或回复一张图片后再发送任意文字。\n"
@@ -3268,7 +3309,10 @@ async def view_join_image_hash_samples(callback: CallbackQuery):
 async def remove_join_image_hash_sample(callback: CallbackQuery, state: FSMContext):
     try:
         group_id = int(callback.data.split(":", 1)[1])
-        await state.update_data(group_id=group_id)
+        await state.update_data(
+            group_id=group_id,
+            image_hash_return_menu=f"submenu_join_approval:{group_id}",
+        )
         items = get_image_fuzzy_blocker().list_group_samples(group_id)
         preview = "\n".join(
             f"{item['id']}. {item.get('label', '-') or '-'}" for item in items[:20]
@@ -3282,6 +3326,87 @@ async def remove_join_image_hash_sample(callback: CallbackQuery, state: FSMConte
             f"当前样本预览：\n{preview}",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_join_approval:{group_id}")]]
+            ),
+        )
+        await state.set_state(AdminStates.RemoveJoinImageHashSample)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("add_semantic_ad_image:"), F.from_user.id.in_(ADMIN_IDS))
+async def add_semantic_ad_image(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        await state.update_data(
+            group_id=group_id,
+            image_hash_return_menu=f"submenu_semantic_ad:{group_id}",
+        )
+        await callback.message.edit_text(
+            "添加广告图片样本\n"
+            "请直接发送一张图片，或回复一张图片后再发送任意文字。\n"
+            "支持照片和 image/* 文档。\n"
+            "上传后会立即学习感知哈希，并用于群内发图执法和入群头像拦截。\n"
+            "发送 /cancel 取消。",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_semantic_ad:{group_id}")]]
+            ),
+        )
+        await state.set_state(AdminStates.AddJoinImageHashSample)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("view_semantic_ad_image:"), F.from_user.id.in_(ADMIN_IDS))
+async def view_semantic_ad_image(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        title = await get_chat_title_safe(callback.bot, group_id)
+        items = get_image_fuzzy_blocker().list_group_samples(group_id)
+        if not items:
+            text = f"<b>{title}</b> › 广告图片库\n\n当前没有样本。"
+        else:
+            lines = []
+            for item in items[:50]:
+                ts = time.strftime("%m-%d %H:%M", time.localtime(int(item.get("created_at", 0) or 0)))
+                lines.append(f"{item['id']}. [{ts}] {item.get('label', '-') or '-'}")
+            if len(items) > 50:
+                lines.append(f"… 共 {len(items)} 条")
+            text = (
+                f"<b>{title}</b> › 广告图片库\n\n"
+                f"当前共 {len(items)} 张：\n" + "\n".join(lines)
+            )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_semantic_ad:{group_id}")]]
+        )
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("remove_semantic_ad_image:"), F.from_user.id.in_(ADMIN_IDS))
+async def remove_semantic_ad_image(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        await state.update_data(
+            group_id=group_id,
+            image_hash_return_menu=f"submenu_semantic_ad:{group_id}",
+        )
+        items = get_image_fuzzy_blocker().list_group_samples(group_id)
+        preview = "\n".join(
+            f"{item['id']}. {item.get('label', '-') or '-'}" for item in items[:20]
+        ) if items else "（空）"
+        if len(items) > 20:
+            preview += f"\n… 共 {len(items)} 条"
+        await callback.message.edit_text(
+            "删除广告图片样本\n"
+            "请输入要删除的样本 ID，支持空格或换行分隔。\n"
+            "发送 /cancel 取消。\n\n"
+            f"当前样本预览：\n{preview}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_semantic_ad:{group_id}")]]
             ),
         )
         await state.set_state(AdminStates.RemoveJoinImageHashSample)
@@ -3353,8 +3478,11 @@ async def process_add_join_image_hash_sample(message: Message, state: FSMContext
     try:
         data = await state.get_data()
         group_id = int(data.get("group_id"))
+        return_menu = str(data.get("image_hash_return_menu") or f"submenu_join_approval:{group_id}")
+        return_kb = _image_hash_return_keyboard(group_id, return_menu)
+        context_title = _image_hash_context_title(return_menu)
         if message.text and message.text.strip() == "/cancel":
-            await message.reply("已取消。", reply_markup=get_join_approval_menu_keyboard(group_id))
+            await message.reply("已取消。", reply_markup=return_kb)
             await state.set_state(AdminStates.GroupMenu)
             return
         target = message.reply_to_message or message
@@ -3369,8 +3497,8 @@ async def process_add_join_image_hash_sample(message: Message, state: FSMContext
             image_bytes=image_bytes,
         )
         await message.reply(
-            f"✅ 已添加关键图样本。\nID: {item['id']}\n标签: {item['label'] or '-'}",
-            reply_markup=get_join_approval_menu_keyboard(group_id),
+            f"✅ 已添加{context_title}。\nID: {item['id']}\n标签: {item['label'] or '-'}",
+            reply_markup=return_kb,
         )
         await state.set_state(AdminStates.GroupMenu)
     except Exception as e:
@@ -3383,8 +3511,11 @@ async def process_remove_join_image_hash_sample(message: Message, state: FSMCont
     try:
         data = await state.get_data()
         group_id = int(data.get("group_id"))
+        return_menu = str(data.get("image_hash_return_menu") or f"submenu_join_approval:{group_id}")
+        return_kb = _image_hash_return_keyboard(group_id, return_menu)
+        context_title = _image_hash_context_title(return_menu)
         if message.text and message.text.strip() == "/cancel":
-            await message.reply("已取消。", reply_markup=get_join_approval_menu_keyboard(group_id))
+            await message.reply("已取消。", reply_markup=return_kb)
             await state.set_state(AdminStates.GroupMenu)
             return
         sample_ids: list[int] = []
@@ -3398,8 +3529,8 @@ async def process_remove_join_image_hash_sample(message: Message, state: FSMCont
         )
         if removed:
             await message.reply(
-                f"✅ 已删除关键图样本: {', '.join(map(str, removed))}",
-                reply_markup=get_join_approval_menu_keyboard(group_id),
+                f"✅ 已删除{context_title}: {', '.join(map(str, removed))}",
+                reply_markup=return_kb,
             )
             await state.set_state(AdminStates.GroupMenu)
             return
