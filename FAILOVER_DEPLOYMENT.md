@@ -237,3 +237,40 @@ STATE_SYNC_BUNDLE_PATH=/state-bundle
 2. Cloudflare Zero Trust 私网入口
 3. Ubuntu 上的本地部署目录和持久化数据目录
 4. Railway 环境变量对齐和实测切换
+
+---
+
+## 发布门禁（强制快照 + 自动回滚）
+
+新增脚本：`deploy/release_guard.py`
+
+用途：
+
+- 发布前自动快照管理员可编辑状态（`config.json`、`image_fuzzy_blocks.json`、`semantic_ads/semantic_ads.db`）
+- 执行发布命令
+- 发布后校验本地状态文件是否仍完整、并校验 Railway 远端 manifest 哈希是否一致
+- 若任一步失败：自动恢复快照，并回推快照状态包到 Railway
+
+### Ubuntu 推荐用法
+
+```bash
+cd /opt/telegram-risk-control/app
+/opt/telegram-risk-control/venv/bin/python deploy/release_guard.py \
+  --data-dir /opt/telegram-risk-control/data \
+  --deploy-cmd "sudo systemctl restart telegram-risk-control.service telegram-risk-health.service" \
+  --rollback-cmd "sudo systemctl restart telegram-risk-control.service telegram-risk-health.service"
+```
+
+说明：
+
+- `STATE_SYNC_MANIFEST_URL` / `STATE_SYNC_BUNDLE_URL` / `CONFIG_SYNC_TOKEN` 可直接走当前环境变量。
+- 如只配了 `CONFIG_SYNC_URL`，脚本会自动推导出 `/state-manifest` 与 `/state-bundle`。
+- 快照默认落到：`<DATA_DIR>/backups/release-guard/`。
+
+### CI/CD 或人工发布约束
+
+- 禁止只做临时直传发布而不 `git push`。
+- 若是 Railway GitHub 自动部署链路，必须先 push 到 `origin/main`，再观察自动部署日志。
+- 发布后必须检查：
+  - Ubuntu `status` 健康
+  - Railway `/state-manifest` 返回非 `404`（正常应是 `200` 或未带 token 时 `401`）
