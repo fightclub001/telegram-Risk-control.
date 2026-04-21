@@ -5163,15 +5163,8 @@ async def _check_and_block_fuzzy_image_message(
         return False
 
     cleanup_stats = await _delete_user_recent_and_warnings(group_id, user_id, message.message_id)
-    banned = False
-    if _image_hash_should_ban(group_id):
-        try:
-            await bot.ban_chat_member(chat_id=group_id, user_id=user_id)
-            banned = True
-        except Exception as e:
-            print(f"image fuzzy block ban failed group_id={group_id} user_id={user_id}: {e}")
-
-    action = "图片相似哈希封禁" if banned else "图片相似哈希删除"
+    restricted = await _restrict_user_all_permissions(group_id, user_id)
+    action = "图片相似哈希禁言" if restricted else "图片相似哈希回删"
     reason = (
         f"命中关键图样本#{match.sample_id}"
         f"（ahash={match.ahash_distance}, dhash={match.dhash_distance}, "
