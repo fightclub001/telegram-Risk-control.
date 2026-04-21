@@ -268,6 +268,25 @@ _BIO_URL_SPACE_RE = re.compile(r"[\s\u200b-\u200f\u2060\ufeff]+")
 _BIO_TELEGRAM_HOST_MARKERS = ("t.me/", "telegram.me/", "telegram.dog/", "tg://")
 
 
+def _ensure_recent_messages_columns(conn: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"]): str(row["type"] or "")
+        for row in conn.execute("PRAGMA table_info(recent_messages)").fetchall()
+    }
+    if "has_image" not in columns:
+        conn.execute("ALTER TABLE recent_messages ADD COLUMN has_image INTEGER NOT NULL DEFAULT 0")
+    if "image_ahash" not in columns:
+        conn.execute("ALTER TABLE recent_messages ADD COLUMN image_ahash INTEGER NOT NULL DEFAULT 0")
+    if "image_dhash" not in columns:
+        conn.execute("ALTER TABLE recent_messages ADD COLUMN image_dhash INTEGER NOT NULL DEFAULT 0")
+    if "image_phash" not in columns:
+        conn.execute("ALTER TABLE recent_messages ADD COLUMN image_phash INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_recent_messages_image_ts "
+        "ON recent_messages(group_id, has_image, ts DESC)"
+    )
+
+
 def _parse_env_int_set(raw: str) -> set[int]:
     values: set[int] = set()
     for item in (raw or "").replace(",", " ").split():
@@ -649,6 +668,10 @@ def _image_hash_enabled(group_id: int) -> bool:
 def _image_hash_max_distance(group_id: int) -> int:
     cfg = get_group_config(group_id)
     return max(0, int(cfg.get("image_fuzzy_block_distance", 10) or 10))
+
+
+def _image_hash_max_single_distance(group_id: int) -> int:
+    return max(8, min(16, _image_hash_max_distance(group_id) + 2))
 
 
 def _image_hash_should_ban(group_id: int) -> bool:
@@ -2030,6 +2053,7 @@ def _get_recent_messages_conn() -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_recent_messages_norm_ts "
             "ON recent_messages(group_id, norm_text, ts DESC)"
         )
+        _ensure_recent_messages_columns(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS media_unlock_stats (
@@ -2123,11 +2147,31 @@ async def _prune_recent_messages_db(force: bool = False) -> None:
     recent_messages_last_prune_ts = now
 
 
-def _queue_recent_message_upsert(group_id: int, user_id: int, msg_id: int, ts: float, text: str) -> None:
+def _queue_recent_message_upsert(
+    group_id: int,
+    user_id: int,
+    msg_id: int,
+    ts: float,
+    text: str,
+    image_hashes: dict[str, int] | None = None,
+) -> None:
     while len(recent_messages_pending_writes) >= RECENT_MESSAGES_PENDING_MAX:
         recent_messages_pending_writes.popleft()
+    has_image = 1 if image_hashes else 0
     recent_messages_pending_writes.append(
-        ("upsert", int(group_id), int(user_id), int(msg_id), float(ts), str(text or ""), _normalize_text(text))
+        (
+            "upsert",
+            int(group_id),
+            int(user_id),
+            int(msg_id),
+            float(ts),
+            str(text or ""),
+            _normalize_text(text),
+            has_image,
+            int((image_hashes or {}).get("ahash", 0) or 0),
+            int((image_hashes or {}).get("dhash", 0) or 0),
+            int((image_hashes or {}).get("phash", 0) or 0),
+        )
     )
 
 
@@ -2151,18 +2195,43 @@ async def _flush_recent_messages_writes(force: bool = False) -> None:
                 for item in pending:
                     op = item[0]
                     if op == "upsert":
-                        _, group_id, user_id, msg_id, ts, text, norm_text = item
+                        if len(item) >= 11:
+                            _, group_id, user_id, msg_id, ts, text, norm_text, has_image, image_ahash, image_dhash, image_phash = item
+                        else:
+                            _, group_id, user_id, msg_id, ts, text, norm_text = item
+                            has_image = 0
+                            image_ahash = 0
+                            image_dhash = 0
+                            image_phash = 0
                         conn.execute(
                             """
-                            INSERT INTO recent_messages (group_id, user_id, message_id, ts, text, norm_text)
-                            VALUES (?, ?, ?, ?, ?, ?)
+                            INSERT INTO recent_messages (
+                                group_id, user_id, message_id, ts, text, norm_text,
+                                has_image, image_ahash, image_dhash, image_phash
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(group_id, message_id) DO UPDATE SET
                                 user_id=excluded.user_id,
                                 ts=excluded.ts,
                                 text=excluded.text,
-                                norm_text=excluded.norm_text
+                                norm_text=excluded.norm_text,
+                                has_image=excluded.has_image,
+                                image_ahash=excluded.image_ahash,
+                                image_dhash=excluded.image_dhash,
+                                image_phash=excluded.image_phash
                             """,
-                            (group_id, user_id, msg_id, ts, text, norm_text),
+                            (
+                                group_id,
+                                user_id,
+                                msg_id,
+                                ts,
+                                text,
+                                norm_text,
+                                has_image,
+                                image_ahash,
+                                image_dhash,
+                                image_phash,
+                            ),
                         )
                     elif op == "delete":
                         _, group_id, msg_id = item
@@ -4385,10 +4454,95 @@ async def _match_fuzzy_blocked_image(group_id: int, image_bytes: bytes) -> Any |
             group_id=group_id,
             image_bytes=image_bytes,
             max_total_distance=_image_hash_max_distance(group_id),
+            max_single_distance=_image_hash_max_single_distance(group_id),
         )
     except Exception as e:
         print(f"image fuzzy block match failed group_id={group_id}: {e}")
         return None
+
+
+async def _build_image_hashes_for_message(image_bytes: bytes) -> dict[str, int] | None:
+    try:
+        return await asyncio.to_thread(get_image_fuzzy_blocker().build_hashes, image_bytes)
+    except Exception as e:
+        print(f"build image hashes failed: {e}")
+        return None
+
+
+async def _find_recent_image_matches(
+    group_id: int,
+    image_bytes: bytes,
+    *,
+    hinted_user_id: int | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    await _flush_recent_messages_writes()
+    candidate_hashes = await _build_image_hashes_for_message(image_bytes)
+    if not candidate_hashes:
+        return []
+    cutoff = time.time() - USER_MSG_24H_SEC
+    conn = _get_recent_messages_conn()
+    query = (
+        """
+        SELECT message_id, user_id, ts, text, image_ahash, image_dhash, image_phash
+        FROM recent_messages
+        WHERE group_id = ? AND ts >= ? AND has_image = 1
+        """
+    )
+    params: list[Any] = [int(group_id), cutoff]
+    if hinted_user_id:
+        query += " AND user_id = ?"
+        params.append(int(hinted_user_id))
+    query += " ORDER BY ts DESC, message_id DESC LIMIT 400"
+    async with recent_messages_lock:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        sample = {
+            "id": int(row["message_id"] or 0),
+            "label": str(row["text"] or ""),
+            "ahash": int(row["image_ahash"] or 0),
+            "dhash": int(row["image_dhash"] or 0),
+            "phash": int(row["image_phash"] or 0),
+        }
+        match = get_image_fuzzy_blocker().match_candidate_hashes(
+            sample,
+            candidate_hashes,
+            max_total_distance=_image_hash_max_distance(group_id),
+            max_single_distance=_image_hash_max_single_distance(group_id),
+        )
+        if match is None:
+            continue
+        matches.append(
+            {
+                "group_id": int(group_id),
+                "user_id": int(row["user_id"] or 0),
+                "message_id": int(row["message_id"] or 0),
+                "ts": float(row["ts"] or 0.0),
+                "text": str(row["text"] or ""),
+                "match": match,
+            }
+        )
+    matches.sort(
+        key=lambda item: (
+            int(item["match"].total_distance),
+            -int(item["match"].matched_hashes),
+            -float(item["ts"]),
+            -int(item["message_id"]),
+        )
+    )
+    deduped: list[dict[str, Any]] = []
+    seen_users: set[int] = set()
+    for item in matches:
+        user_id = int(item["user_id"])
+        if user_id in seen_users:
+            continue
+        seen_users.add(user_id)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 async def handle_repeat_media_message(message: Message) -> bool:
@@ -4640,6 +4794,7 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
     auto_delete_sec > 0 时，公告消息在指定秒数后自动删除。"""
     memory_changed = False
     recent_msgs = await _recent_messages_fetch_by_user(group_id, user_id)
+    deleted_message_ids: set[int] = set()
     for msg_id, _ts, txt in recent_msgs:
         if txt:
             try:
@@ -4648,6 +4803,7 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
             except Exception as e:
                 print(f"删除用户消息时学习样本失败: {e}")
         await _delete_original_and_linked_reply(group_id, msg_id)
+        deleted_message_ids.add(int(msg_id))
     if memory_changed:
         _mark_forward_match_memory_dirty()
     to_remove = []
@@ -4664,6 +4820,7 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
     _mark_reports_dirty()
     if orig_msg_id:
         await _delete_original_and_linked_reply(group_id, orig_msg_id)
+        deleted_message_ids.add(int(orig_msg_id))
     if keep_one_text:
         try:
             sent = await bot.send_message(group_id, keep_one_text)
@@ -4671,6 +4828,11 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
                 _track_bot_message(group_id, sent.message_id, auto_delete_sec)
         except Exception:
             pass
+    return {
+        "deleted_messages": len(deleted_message_ids),
+        "deleted_warnings": len(to_remove),
+        "memory_changed": memory_changed,
+    }
 
 @router.message(
     F.photo | F.video | F.voice | F.video_note | F.document | F.animation | F.audio,
@@ -4690,9 +4852,22 @@ async def on_media_message(message: Message):
     user_id = message.from_user.id
     group_id = message.chat.id
     now = time.time()
-    _track_user_message(group_id, user_id, message.message_id, message.caption or "")
+    image_bytes = await _extract_message_image_bytes(message)
+    image_hashes = await _build_image_hashes_for_message(image_bytes) if image_bytes else None
+    _track_user_message(
+        group_id,
+        user_id,
+        message.message_id,
+        message.caption or "",
+        image_hashes=image_hashes,
+    )
     _schedule_bio_watch_check(message)
-    if await _check_and_block_fuzzy_image_message(message, group_id=group_id, user_id=user_id):
+    if await _check_and_block_fuzzy_image_message(
+        message,
+        group_id=group_id,
+        user_id=user_id,
+        image_bytes=image_bytes,
+    ):
         return
     semantic_text = (message.caption or "").strip()
     if semantic_text:
@@ -4791,9 +4966,23 @@ async def on_media_message(message: Message):
             "updated_ts": time.time(),
         }
 
-def _track_user_message(group_id: int, user_id: int, msg_id: int, text: str = ""):
+def _track_user_message(
+    group_id: int,
+    user_id: int,
+    msg_id: int,
+    text: str = "",
+    *,
+    image_hashes: dict[str, int] | None = None,
+):
     """记录用户消息到 SQLite 队列，用于 24 小时内回溯删除与转发学习。"""
-    _queue_recent_message_upsert(group_id, user_id, msg_id, time.time(), text or "")
+    _queue_recent_message_upsert(
+        group_id,
+        user_id,
+        msg_id,
+        time.time(),
+        text or "",
+        image_hashes=image_hashes,
+    )
 
 
 def _track_bot_message(group_id: int, msg_id: int, auto_delete_sec: int = BOT_MSG_AUTO_DELETE_SEC):
@@ -4956,17 +5145,24 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
     return True
 
 
-async def _check_and_block_fuzzy_image_message(message: Message, *, group_id: int, user_id: int) -> bool:
+async def _check_and_block_fuzzy_image_message(
+    message: Message,
+    *,
+    group_id: int,
+    user_id: int,
+    image_bytes: bytes | None = None,
+) -> bool:
     if user_id in ADMIN_IDS:
         return False
-    image_bytes = await _extract_message_image_bytes(message)
+    if image_bytes is None:
+        image_bytes = await _extract_message_image_bytes(message)
     if not image_bytes:
         return False
     match = await _match_fuzzy_blocked_image(group_id, image_bytes)
     if match is None:
         return False
 
-    await _delete_original_and_linked_reply(group_id, message.message_id)
+    cleanup_stats = await _delete_user_recent_and_warnings(group_id, user_id, message.message_id)
     banned = False
     if _image_hash_should_ban(group_id):
         try:
@@ -4978,14 +5174,19 @@ async def _check_and_block_fuzzy_image_message(message: Message, *, group_id: in
     action = "图片相似哈希封禁" if banned else "图片相似哈希删除"
     reason = (
         f"命中关键图样本#{match.sample_id}"
-        f"（ahash={match.ahash_distance}, dhash={match.dhash_distance}, total={match.total_distance}）"
+        f"（ahash={match.ahash_distance}, dhash={match.dhash_distance}, "
+        f"phash={match.phash_distance if match.phash_distance is not None else '-'}, "
+        f"matched={match.matched_hashes}, total={match.total_distance}）"
     )
     await _record_moderation_log(
         group_id=group_id,
         user_id=user_id,
         user_label=_get_display_name_from_message(message, user_id),
         action=action,
-        reason=reason,
+        reason=(
+            f"{reason}；已清理近期消息 {int(cleanup_stats.get('deleted_messages', 0) or 0)} 条，"
+            f"警告 {int(cleanup_stats.get('deleted_warnings', 0) or 0)} 条"
+        ),
     )
     return True
 
@@ -5296,6 +5497,93 @@ async def cmd_mark_ad(message: Message):
         await message.reply("❌ 失败", reply_markup=ReplyKeyboardRemove())
 
 
+async def _restrict_user_all_permissions(group_id: int, user_id: int) -> bool:
+    try:
+        await bot.restrict_chat_member(
+            chat_id=group_id,
+            user_id=user_id,
+            permissions=ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_pin_messages=False,
+            ),
+        )
+        return True
+    except Exception as e:
+        print(f"restrict all permissions failed group_id={group_id} user_id={user_id}: {e}")
+        return False
+
+
+async def _execute_forward_image_cleanup_for_group(
+    *,
+    group_id: int,
+    image_bytes: bytes,
+    hinted_user_id: int | None = None,
+) -> dict[str, Any]:
+    _remember_group(group_id)
+    result: dict[str, Any] = {
+        "group_id": int(group_id),
+        "title": str(group_id),
+        "matched_users": [],
+        "restricted_users": [],
+        "deleted_messages": 0,
+        "deleted_warnings": 0,
+    }
+    try:
+        title_map = await _resolve_group_titles([group_id])
+        result["title"] = title_map.get(int(group_id)) or str(group_id)
+    except Exception:
+        pass
+
+    matches = await _find_recent_image_matches(
+        group_id,
+        image_bytes,
+        hinted_user_id=hinted_user_id,
+        limit=3,
+    )
+    if not matches:
+        return result
+
+    for item in matches:
+        user_id = int(item["user_id"])
+        cleanup_stats = await _delete_user_recent_and_warnings(
+            group_id,
+            user_id,
+            orig_msg_id=int(item["message_id"]),
+        )
+        restricted = await _restrict_user_all_permissions(group_id, user_id)
+        match = item["match"]
+        await _record_moderation_log(
+            group_id=group_id,
+            user_id=user_id,
+            user_label=f"ID {user_id}",
+            action="图片哈希追溯禁言" if restricted else "图片哈希追溯回删",
+            reason=(
+                f"管理员转发学习图片命中消息#{item['message_id']}"
+                f"（ahash={match.ahash_distance}, dhash={match.dhash_distance}, "
+                f"phash={match.phash_distance if match.phash_distance is not None else '-'}, "
+                f"matched={match.matched_hashes}）"
+            ),
+        )
+        result["matched_users"].append(
+            {
+                "user_id": user_id,
+                "message_id": int(item["message_id"]),
+                "match": match,
+            }
+        )
+        if restricted:
+            result["restricted_users"].append(user_id)
+        result["deleted_messages"] += int(cleanup_stats.get("deleted_messages", 0) or 0)
+        result["deleted_warnings"] += int(cleanup_stats.get("deleted_warnings", 0) or 0)
+    return result
+
+
 async def _execute_forward_cleanup_for_group(*, group_id: int, text: str, hinted_user_id: int | None = None) -> dict[str, Any]:
     _remember_group(group_id)
     result: dict[str, Any] = {
@@ -5376,6 +5664,99 @@ async def on_forward_learn_ad(message: Message):
             if f_chat is None:
                 f_chat = getattr(f_origin, "sender_chat", None)
 
+        source_gid: int | None = None
+        if f_chat:
+            try:
+                source_gid = int(f_chat.id)
+                _remember_group(source_gid)
+            except Exception:
+                pass
+        target_group_ids = set(_get_managed_group_ids())
+        if source_gid is not None and source_gid < 0:
+            target_group_ids.add(source_gid)
+
+        image_bytes = await _extract_message_image_bytes(message)
+        if image_bytes:
+            if not target_group_ids:
+                await message.reply("⚠️ 当前没有可学习图片样本的已管理群。")
+                return
+            label = _clip_text(
+                message.caption or message.text or f"forward-img:{int(time.time())}",
+                60,
+            )
+            learned_samples = 0
+            for gid in sorted(target_group_ids):
+                try:
+                    await _add_image_fuzzy_sample_and_sync(
+                        group_id=gid,
+                        label=label,
+                        image_bytes=image_bytes,
+                    )
+                    learned_samples += 1
+                except Exception as e:
+                    print(f"forward image sample add failed group_id={gid}: {e}")
+
+            hinted_user_id = int(f_user.id) if f_user else None
+            executed_results: list[dict[str, Any]] = []
+            skipped_results: list[tuple[int, str]] = []
+            for gid in sorted(target_group_ids):
+                active, reason_guard = await _is_group_eligible(gid, force_refresh=True)
+                if not active:
+                    skipped_results.append((gid, reason_guard))
+                    continue
+                executed_results.append(
+                    await _execute_forward_image_cleanup_for_group(
+                        group_id=gid,
+                        image_bytes=image_bytes,
+                        hinted_user_id=hinted_user_id,
+                    )
+                )
+
+            matched_groups = 0
+            restricted_groups = 0
+            detail_lines: list[str] = []
+            for result in executed_results:
+                gid = int(result["group_id"])
+                title = str(result.get("title") or gid)
+                matched_users = list(result.get("matched_users") or [])
+                restricted_users = list(result.get("restricted_users") or [])
+                deleted_messages = int(result.get("deleted_messages", 0) or 0)
+                deleted_warnings = int(result.get("deleted_warnings", 0) or 0)
+                if matched_users:
+                    matched_groups += 1
+                    if restricted_users:
+                        restricted_groups += 1
+                    match_preview = ", ".join(
+                        f"{item['user_id']}#msg{item['message_id']}" for item in matched_users[:3]
+                    )
+                    detail_lines.append(
+                        f"- {title} ({gid}): 命中 {len(matched_users)} 人，"
+                        f"禁言 {len(restricted_users)} 人，"
+                        f"清理消息 {deleted_messages} 条，警告 {deleted_warnings} 条；{match_preview}"
+                    )
+                else:
+                    detail_lines.append(f"- {title} ({gid}): 未定位到发图用户")
+
+            skipped_text = ""
+            if skipped_results:
+                skipped_text = "；跳过 " + ", ".join(f"{gid}({reason})" for gid, reason in skipped_results[:5])
+                if len(skipped_results) > 5:
+                    skipped_text += f" 等 {len(skipped_results)} 个群"
+
+            summary = (
+                f"✅ 已学习图片样本到 {learned_samples}/{len(target_group_ids)} 个群。"
+                f"\n已在 {len(executed_results)} 个有权限群执行图片追溯："
+                f"{matched_groups} 个群定位到发图用户，{restricted_groups} 个群已完成禁言"
+                f"{skipped_text}。"
+            )
+            if detail_lines:
+                preview = "\n".join(detail_lines[:12])
+                if len(detail_lines) > 12:
+                    preview += f"\n… 其余 {len(detail_lines) - 12} 个群已省略"
+                summary += f"\n\n{preview}"
+            await message.reply(summary)
+            return
+
         text = (message.text or message.caption or "").strip()
         if not text:
             await message.reply("⚠️ 这条转发没有可学习文本，无法执行学习/回删。")
@@ -5389,17 +5770,6 @@ async def on_forward_learn_ad(message: Message):
                 print(f"转发学习样本已存在或被去重: {text[:80]}")
         except Exception as e:
             print(f"转发学习广告样本失败: {e}")
-
-        source_gid: int | None = None
-        if f_chat:
-            try:
-                source_gid = int(f_chat.id)
-                _remember_group(source_gid)
-            except Exception:
-                pass
-        target_group_ids = set(_get_managed_group_ids())
-        if source_gid is not None and source_gid < 0:
-            target_group_ids.add(source_gid)
 
         if not target_group_ids:
             learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
