@@ -9,6 +9,7 @@ import re
 import sqlite3
 import time
 import hashlib
+import zipfile
 from copy import deepcopy
 from collections import deque
 from datetime import datetime
@@ -75,6 +76,8 @@ _RUNTIME_STATE_FILES = (
     "forward_match_memory.json",
     "recent_messages.json",
     "recent_messages.db",
+    "image_fuzzy_blocks.json",
+    "semantic_ads/semantic_ads.db",
 )
 
 
@@ -92,7 +95,13 @@ def _resolve_data_dir() -> tuple[str, str]:
     legacy_config_dir = (os.getenv("CONFIG_DIR") or "").strip()
 
     candidates = []
-    for value in (explicit_data_dir, legacy_config_dir, "/data", "/app/data"):
+    for value in (
+        explicit_data_dir,
+        legacy_config_dir,
+        "/opt/telegram-risk-control/data",
+        "/data",
+        "/app/data",
+    ):
         if value and value not in candidates:
             candidates.append(value)
 
@@ -109,7 +118,7 @@ def _resolve_data_dir() -> tuple[str, str]:
         return explicit_data_dir, "DATA_DIR"
     if legacy_config_dir:
         return legacy_config_dir, "CONFIG_DIR(legacy)"
-    return "/data", "default"
+    return "/opt/telegram-risk-control/data", "default"
 
 
 DATA_DIR, DATA_DIR_SOURCE = _resolve_data_dir()
@@ -117,6 +126,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 print(f"[startup] runtime data dir: {DATA_DIR} (source: {DATA_DIR_SOURCE})")
 DATA_FILE = os.path.join(DATA_DIR, "reports.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+CONFIG_BACKUP_DIR = os.path.join(DATA_DIR, "backups", "config")
+CONFIG_BACKUP_KEEP = max(10, int((os.getenv("CONFIG_BACKUP_KEEP") or "120").strip()))
+CONFIG_GUARD_ALLOW_EMPTY_REPEAT_EXEMPT = (
+    (os.getenv("CONFIG_GUARD_ALLOW_EMPTY_REPEAT_EXEMPT") or "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 MEDIA_STATS_FILE = os.path.join(DATA_DIR, "media_stats.json")
 REPEAT_LEVEL_FILE = os.path.join(DATA_DIR, "repeat_levels.json")
 FORWARD_MATCH_FILE = os.path.join(DATA_DIR, "forward_match_memory.json")
@@ -137,6 +152,20 @@ if not IMAGE_FUZZY_SYNC_URL and CONFIG_SYNC_URL:
     else:
         IMAGE_FUZZY_SYNC_URL = f"{CONFIG_SYNC_URL.rstrip('/')}/image-fuzzy-blocks"
 IMAGE_FUZZY_SYNC_ENABLED = bool(IMAGE_FUZZY_SYNC_URL and CONFIG_SYNC_TOKEN)
+STATE_SYNC_MANIFEST_URL = (os.getenv("STATE_SYNC_MANIFEST_URL") or "").strip()
+STATE_SYNC_BUNDLE_URL = (os.getenv("STATE_SYNC_BUNDLE_URL") or "").strip()
+if CONFIG_SYNC_URL:
+    if CONFIG_SYNC_URL.endswith("/config"):
+        _state_sync_base_url = CONFIG_SYNC_URL[:-7]
+    else:
+        _state_sync_base_url = CONFIG_SYNC_URL.rstrip("/")
+    if not STATE_SYNC_MANIFEST_URL:
+        STATE_SYNC_MANIFEST_URL = f"{_state_sync_base_url}/state-manifest"
+    if not STATE_SYNC_BUNDLE_URL:
+        STATE_SYNC_BUNDLE_URL = f"{_state_sync_base_url}/state-bundle"
+else:
+    _state_sync_base_url = ""
+STATE_SYNC_ENABLED = bool(STATE_SYNC_MANIFEST_URL and STATE_SYNC_BUNDLE_URL and CONFIG_SYNC_TOKEN)
 
 reports = {}  # key: (group_id, message_id)
 reports_dirty = False
@@ -172,10 +201,18 @@ BIO_WATCH_CHECKED_USERS_MAX = max(1000, int((os.getenv("BIO_WATCH_CHECKED_USERS_
 WORKER_THREAD_MAX = max(1, int((os.getenv("WORKER_THREAD_MAX") or "2").strip()))
 SEMANTIC_AD_DATA_DIR = os.path.join(DATA_DIR, "semantic_ads")
 IMAGE_FUZZY_BLOCK_FILE = os.path.join(DATA_DIR, "image_fuzzy_blocks.json")
+SEMANTIC_AD_DB_FILE = os.path.join(SEMANTIC_AD_DATA_DIR, "semantic_ads.db")
+ADMIN_STATE_FILE_PATHS = {
+    "config.json": CONFIG_FILE,
+    "image_fuzzy_blocks.json": IMAGE_FUZZY_BLOCK_FILE,
+    "semantic_ads/semantic_ads.db": SEMANTIC_AD_DB_FILE,
+}
 semantic_ad_detector: Any | None = None
 join_approval_avatar_ocr: Any | None = None
 join_approval_risk_matcher: Any | None = None
 image_fuzzy_blocker: Any | None = None
+admin_state_sync_task: asyncio.Task | None = None
+admin_state_sync_requested = False
 JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "10800").strip()))
 JOIN_APPROVAL_OCR_CACHE_MAX = max(8, int((os.getenv("OCR_CACHE_MAX") or "24").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -185,9 +222,6 @@ join_review_logs = deque(maxlen=200)
 moderation_logs = deque(maxlen=200)
 join_review_logs_dirty = False
 moderation_logs_dirty = False
-pending_forward_actions = {}  # token -> {"admin_id": int, "text": str, "hinted_user_id": int|None, "created_ts": float}
-forward_action_seq = 0
-FORWARD_ACTION_TTL_SEC = 30 * 60
 # 无权限发媒体警告：同用户删上一条；(group_id, user_id) -> 上一条机器人警告 message_id
 last_media_no_perm_msg = {}
 MEDIA_NO_PERM_DELETE_AFTER_SEC = 60  # 不同用户的警告 1 分钟后自动删除
@@ -371,39 +405,6 @@ def _format_ts(ts: int | float, fmt: str = "%m-%d %H:%M:%S") -> str:
     return time.strftime(fmt, time.localtime(timestamp))
 
 
-def _new_forward_action_token() -> str:
-    global forward_action_seq
-    forward_action_seq += 1
-    return str(int(time.time() * 1000))[-8:] + str(forward_action_seq % 1000).zfill(3)
-
-
-def _prune_forward_actions() -> None:
-    now = time.time()
-    stale = [
-        key
-        for key, value in list(pending_forward_actions.items())
-        if now - float(value.get("created_ts", 0.0) or 0.0) > FORWARD_ACTION_TTL_SEC
-    ]
-    for key in stale:
-        pending_forward_actions.pop(key, None)
-
-
-def _forward_group_picker_keyboard(
-    token: str,
-    group_ids: list[int],
-    group_titles: dict[int, str],
-    source_gid: int | None = None,
-) -> InlineKeyboardMarkup:
-    rows = []
-    for gid in group_ids[:20]:
-        label = (group_titles.get(int(gid)) or "未命名群").strip()
-        if source_gid is not None and int(gid) == int(source_gid):
-            label += "（来源）"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"forward_do:{token}:{gid}")])
-    rows.append([InlineKeyboardButton(text="取消", callback_data=f"forward_cancel:{token}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 async def _resolve_group_titles(group_ids: list[int]) -> dict[int, str]:
     titles: dict[int, str] = {}
     for gid in group_ids:
@@ -575,6 +576,20 @@ def get_semantic_ad_detector() -> Any:
 
         semantic_ad_detector = SemanticAdDetector(SEMANTIC_AD_DATA_DIR)
     return semantic_ad_detector
+
+
+def _add_semantic_ad_sample(raw_text: str) -> Any:
+    sample = get_semantic_ad_detector().add_ad_sample(raw_text)
+    if sample is not None:
+        _schedule_admin_state_sync("semantic-ad-add")
+    return sample
+
+
+def _remove_semantic_ad_sample(sample_id: int) -> bool:
+    removed = bool(get_semantic_ad_detector().remove_sample(sample_id))
+    if removed:
+        _schedule_admin_state_sync("semantic-ad-remove")
+    return removed
 
 
 def get_join_approval_avatar_ocr() -> Any:
@@ -1226,14 +1241,430 @@ def _collect_group_config_keys(groups: dict[str, Any]) -> list[str]:
     return sorted(keys, key=int)
 
 
-def _build_sync_request(url: str, method: str, payload: bytes | None = None) -> urllib_request.Request:
+def _safe_load_json_dict(path: str) -> dict[str, Any] | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            return loaded
+    except Exception:
+        return None
+    return None
+
+
+def _write_json_atomic(path: str, payload: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_file = f"{path}.tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temp_file, path)
+
+
+def _write_bytes_atomic(path: str, payload: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_file = f"{path}.tmp"
+    with open(temp_file, "wb") as f:
+        f.write(payload)
+    os.replace(temp_file, path)
+
+
+def _flush_admin_state_for_sync() -> None:
+    detector = semantic_ad_detector
+    if detector is not None:
+        try:
+            detector.checkpoint()
+        except Exception as e:
+            print(f"[state-sync] semantic ad checkpoint failed: {e}")
+
+    blocker = image_fuzzy_blocker
+    if blocker is not None:
+        try:
+            blocker.save()
+        except Exception as e:
+            print(f"[state-sync] image sample save failed: {e}")
+
+
+def _build_admin_state_manifest(*, flush: bool = True) -> dict[str, Any]:
+    if flush:
+        _flush_admin_state_for_sync()
+
+    files: dict[str, Any] = {}
+    for rel_path, abs_path in ADMIN_STATE_FILE_PATHS.items():
+        if not os.path.exists(abs_path):
+            continue
+        try:
+            stat = os.stat(abs_path)
+            digest = hashlib.sha256()
+            with open(abs_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            files[rel_path] = {
+                "size": int(stat.st_size),
+                "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+                "sha256": digest.hexdigest(),
+            }
+        except Exception as e:
+            print(f"[state-sync] manifest skip {rel_path}: {e}")
+    return {
+        "schema": 1,
+        "generated_at_ns": time.time_ns(),
+        "files": files,
+    }
+
+
+def _extract_manifest_files(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    files = raw.get("files")
+    if not isinstance(files, dict):
+        return {}
+    cleaned: dict[str, dict[str, Any]] = {}
+    for rel_path, meta in files.items():
+        if rel_path not in ADMIN_STATE_FILE_PATHS or not isinstance(meta, dict):
+            continue
+        cleaned[rel_path] = {
+            "size": int(meta.get("size", 0) or 0),
+            "mtime_ns": int(meta.get("mtime_ns", 0) or 0),
+            "sha256": str(meta.get("sha256", "") or ""),
+        }
+    return cleaned
+
+
+def _compare_admin_state_manifests(local_manifest: dict[str, Any], remote_manifest: dict[str, Any]) -> tuple[set[str], set[str]]:
+    local_files = _extract_manifest_files(local_manifest)
+    remote_files = _extract_manifest_files(remote_manifest)
+    local_newer: set[str] = set()
+    remote_newer: set[str] = set()
+
+    for rel_path in set(local_files) | set(remote_files):
+        local_meta = local_files.get(rel_path)
+        remote_meta = remote_files.get(rel_path)
+        if local_meta and not remote_meta:
+            local_newer.add(rel_path)
+            continue
+        if remote_meta and not local_meta:
+            remote_newer.add(rel_path)
+            continue
+        if not local_meta or not remote_meta:
+            continue
+        if local_meta.get("sha256") == remote_meta.get("sha256"):
+            continue
+        local_mtime = int(local_meta.get("mtime_ns", 0) or 0)
+        remote_mtime = int(remote_meta.get("mtime_ns", 0) or 0)
+        if local_mtime > remote_mtime:
+            local_newer.add(rel_path)
+        elif remote_mtime > local_mtime:
+            remote_newer.add(rel_path)
+        else:
+            # 相同时间戳但内容不同时，优先保留当前节点内容，避免启动时被旧远端反向覆盖。
+            local_newer.add(rel_path)
+            print(f"[state-sync] same-mtime conflict on {rel_path}; prefer local")
+    return local_newer, remote_newer
+
+
+def _build_admin_state_bundle_bytes() -> bytes:
+    manifest = _build_admin_state_manifest(flush=True)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        for rel_path in sorted(_extract_manifest_files(manifest).keys()):
+            abs_path = ADMIN_STATE_FILE_PATHS[rel_path]
+            if os.path.exists(abs_path):
+                zf.write(abs_path, arcname=rel_path)
+    return buffer.getvalue()
+
+
+def _apply_admin_state_bundle_bytes(bundle: bytes, *, only_paths: set[str] | None = None) -> list[str]:
+    if not bundle:
+        return []
+    applied: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(bundle), "r") as zf:
+        try:
+            manifest_raw = json.loads(zf.read("_manifest.json").decode("utf-8"))
+        except Exception as e:
+            raise ValueError(f"invalid_state_bundle_manifest:{e}") from e
+        manifest_files = _extract_manifest_files(manifest_raw)
+        allowed_paths = set(manifest_files.keys()) if only_paths is None else {path for path in only_paths if path in manifest_files}
+        for rel_path in sorted(allowed_paths):
+            if rel_path not in zf.namelist():
+                continue
+            target_path = ADMIN_STATE_FILE_PATHS[rel_path]
+            raw = zf.read(rel_path)
+            _write_bytes_atomic(target_path, raw)
+            mtime_ns = int(manifest_files[rel_path].get("mtime_ns", 0) or 0)
+            if mtime_ns > 0:
+                try:
+                    os.utime(target_path, ns=(mtime_ns, mtime_ns))
+                except Exception:
+                    pass
+            applied.append(rel_path)
+
+    if "image_fuzzy_blocks.json" in applied:
+        global image_fuzzy_blocker
+        image_fuzzy_blocker = None
+
+    if "semantic_ads/semantic_ads.db" in applied:
+        global semantic_ad_detector
+        detector = semantic_ad_detector
+        if detector is not None:
+            try:
+                detector.close()
+            except Exception:
+                pass
+        semantic_ad_detector = None
+
+    return applied
+
+
+def _list_config_backup_files(limit: int = 50) -> list[str]:
+    try:
+        if not os.path.isdir(CONFIG_BACKUP_DIR):
+            return []
+        files = [
+            os.path.join(CONFIG_BACKUP_DIR, name)
+            for name in os.listdir(CONFIG_BACKUP_DIR)
+            if name.startswith("config-") and name.endswith(".json")
+        ]
+        files.sort(reverse=True)
+        return files[: max(1, int(limit))]
+    except Exception:
+        return []
+
+
+def _create_config_backup(snapshot: dict[str, Any], reason: str) -> None:
+    try:
+        os.makedirs(CONFIG_BACKUP_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_reason = re.sub(r"[^a-zA-Z0-9_-]+", "-", (reason or "snapshot")).strip("-") or "snapshot"
+        backup_path = os.path.join(CONFIG_BACKUP_DIR, f"config-{ts}-{safe_reason}.json")
+        _write_json_atomic(backup_path, snapshot)
+        files = _list_config_backup_files(limit=CONFIG_BACKUP_KEEP + 20)
+        for stale_path in files[CONFIG_BACKUP_KEEP:]:
+            try:
+                os.remove(stale_path)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[config-backup] create failed: {e}")
+
+
+def _load_config_with_backup_fallback() -> dict[str, Any]:
+    primary = _safe_load_json_dict(CONFIG_FILE)
+    if isinstance(primary, dict):
+        return primary
+    for backup_path in _list_config_backup_files(limit=50):
+        restored = _safe_load_json_dict(backup_path)
+        if not isinstance(restored, dict):
+            continue
+        try:
+            _write_json_atomic(CONFIG_FILE, restored)
+            print(f"[config-backup] restored config from backup: {backup_path}")
+        except Exception as e:
+            print(f"[config-backup] restore write failed: {e}")
+        return restored
+    return {"groups": {}}
+
+
+def _restore_empty_repeat_exempt_from_previous(snapshot: dict[str, Any]) -> None:
+    if CONFIG_GUARD_ALLOW_EMPTY_REPEAT_EXEMPT:
+        return
+    current_groups = snapshot.setdefault("groups", {})
+    if not isinstance(current_groups, dict):
+        snapshot["groups"] = {}
+        current_groups = snapshot["groups"]
+    previous = _safe_load_json_dict(CONFIG_FILE) or {}
+    previous_groups = previous.get("groups", {}) if isinstance(previous, dict) else {}
+    if not isinstance(previous_groups, dict):
+        return
+    restored = 0
+    for gid, prev_cfg in previous_groups.items():
+        if gid == SHARED_GROUP_CONFIG_KEY or not isinstance(prev_cfg, dict):
+            continue
+        prev_kw = prev_cfg.get("repeat_exempt_keywords") or []
+        if not isinstance(prev_kw, list) or not prev_kw:
+            continue
+        cur_cfg = current_groups.get(gid)
+        if not isinstance(cur_cfg, dict):
+            continue
+        cur_kw = cur_cfg.get("repeat_exempt_keywords") or []
+        if isinstance(cur_kw, list) and cur_kw:
+            continue
+        cur_cfg["repeat_exempt_keywords"] = deepcopy(prev_kw)
+        restored += 1
+    if restored:
+        print(f"[config-guard] restored repeat_exempt_keywords from previous snapshot for {restored} group(s)")
+
+
+def _restore_empty_repeat_exempt_from_backups(snapshot: dict[str, Any]) -> None:
+    if CONFIG_GUARD_ALLOW_EMPTY_REPEAT_EXEMPT:
+        return
+    groups = snapshot.get("groups", {}) if isinstance(snapshot, dict) else {}
+    if not isinstance(groups, dict):
+        return
+    targets = [
+        gid
+        for gid, cfg in groups.items()
+        if gid != SHARED_GROUP_CONFIG_KEY
+        and isinstance(cfg, dict)
+        and not (isinstance(cfg.get("repeat_exempt_keywords"), list) and cfg.get("repeat_exempt_keywords"))
+    ]
+    if not targets:
+        return
+    restored = 0
+    pending = set(targets)
+    for backup_path in _list_config_backup_files(limit=80):
+        backup_cfg = _safe_load_json_dict(backup_path)
+        if not isinstance(backup_cfg, dict):
+            continue
+        backup_groups = backup_cfg.get("groups", {})
+        if not isinstance(backup_groups, dict):
+            continue
+        hit_this_file = 0
+        for gid in list(pending):
+            bcfg = backup_groups.get(gid)
+            if not isinstance(bcfg, dict):
+                continue
+            bkw = bcfg.get("repeat_exempt_keywords") or []
+            if not isinstance(bkw, list) or not bkw:
+                continue
+            groups[gid]["repeat_exempt_keywords"] = deepcopy(bkw)
+            pending.remove(gid)
+            restored += 1
+            hit_this_file += 1
+        if hit_this_file and not pending:
+            break
+    if restored:
+        print(f"[config-guard] restored repeat_exempt_keywords from backups for {restored} group(s)")
+
+
+def _build_sync_request(
+    url: str,
+    method: str,
+    payload: bytes | None = None,
+    *,
+    accept: str = "application/json",
+    content_type: str = "application/json; charset=utf-8",
+) -> urllib_request.Request:
     request = urllib_request.Request(url, method=method)
-    request.add_header("Accept", "application/json")
+    request.add_header("Accept", accept)
     request.add_header("Authorization", f"Bearer {CONFIG_SYNC_TOKEN}")
     if payload is not None:
-        request.add_header("Content-Type", "application/json; charset=utf-8")
+        request.add_header("Content-Type", content_type)
         request.add_header("Content-Length", str(len(payload)))
     return request
+
+
+def _pull_remote_state_manifest_once() -> dict[str, Any] | None:
+    if not (STATE_SYNC_ENABLED and CONFIG_SYNC_PULL_ON_START):
+        return None
+    try:
+        req = _build_sync_request(STATE_SYNC_MANIFEST_URL, "GET")
+        with urllib_request.urlopen(req, timeout=CONFIG_SYNC_TIMEOUT_SEC) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        raw = json.loads(body)
+        if isinstance(raw, dict):
+            return raw
+        print("[state-sync] remote manifest is not a JSON object; ignored")
+    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        print(f"[state-sync] manifest pull skipped: {e}")
+    except Exception as e:
+        print(f"[state-sync] manifest pull failed: {e}")
+    return None
+
+
+def _pull_remote_state_bundle_once() -> bytes | None:
+    if not (STATE_SYNC_ENABLED and CONFIG_SYNC_PULL_ON_START):
+        return None
+    try:
+        req = _build_sync_request(STATE_SYNC_BUNDLE_URL, "GET", accept="application/zip")
+        with urllib_request.urlopen(req, timeout=max(CONFIG_SYNC_TIMEOUT_SEC, 15)) as resp:
+            return resp.read()
+    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError) as e:
+        print(f"[state-sync] bundle pull skipped: {e}")
+    except Exception as e:
+        print(f"[state-sync] bundle pull failed: {e}")
+    return None
+
+
+def _push_remote_state_bundle_once(bundle: bytes) -> bool:
+    if not (STATE_SYNC_ENABLED and CONFIG_SYNC_PUSH_ON_SAVE):
+        return False
+    if not bundle:
+        return False
+    try:
+        req = _build_sync_request(
+            STATE_SYNC_BUNDLE_URL,
+            "PUT",
+            payload=bundle,
+            accept="application/json",
+            content_type="application/zip",
+        )
+        with urllib_request.urlopen(req, data=bundle, timeout=max(CONFIG_SYNC_TIMEOUT_SEC, 15)) as resp:
+            _ = resp.read()
+        return True
+    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError) as e:
+        print(f"[state-sync] bundle push skipped: {e}")
+    except Exception as e:
+        print(f"[state-sync] bundle push failed: {e}")
+    return False
+
+
+async def _push_admin_state_bundle_if_enabled(reason: str = "") -> bool:
+    if not (STATE_SYNC_ENABLED and CONFIG_SYNC_PUSH_ON_SAVE):
+        return False
+    bundle = await asyncio.to_thread(_build_admin_state_bundle_bytes)
+    pushed = await asyncio.to_thread(_push_remote_state_bundle_once, bundle)
+    if pushed:
+        label = f" ({reason})" if reason else ""
+        print(f"[state-sync] admin state bundle pushed{label}")
+    return pushed
+
+
+async def _run_admin_state_sync_loop() -> None:
+    global admin_state_sync_requested
+    while admin_state_sync_requested:
+        admin_state_sync_requested = False
+        await asyncio.sleep(0.2)
+        await _push_admin_state_bundle_if_enabled(reason="debounced")
+
+
+def _schedule_admin_state_sync(reason: str = "") -> None:
+    global admin_state_sync_task, admin_state_sync_requested
+    if not (STATE_SYNC_ENABLED and CONFIG_SYNC_PUSH_ON_SAVE):
+        return
+    admin_state_sync_requested = True
+    if admin_state_sync_task is None or admin_state_sync_task.done():
+        admin_state_sync_task = asyncio.create_task(_run_admin_state_sync_loop())
+    if reason:
+        print(f"[state-sync] sync scheduled: {reason}")
+
+
+async def _reconcile_admin_state_with_remote() -> None:
+    if not STATE_SYNC_ENABLED:
+        return
+
+    local_manifest = await asyncio.to_thread(_build_admin_state_manifest, flush=True)
+    remote_manifest = await asyncio.to_thread(_pull_remote_state_manifest_once)
+
+    if not isinstance(remote_manifest, dict):
+        if _extract_manifest_files(local_manifest):
+            await _push_admin_state_bundle_if_enabled(reason="startup-bootstrap")
+        return
+
+    local_newer, remote_newer = _compare_admin_state_manifests(local_manifest, remote_manifest)
+    if remote_newer:
+        bundle = await asyncio.to_thread(_pull_remote_state_bundle_once)
+        if bundle:
+            applied = await asyncio.to_thread(_apply_admin_state_bundle_bytes, bundle, only_paths=remote_newer)
+            if applied:
+                print(f"[state-sync] pulled newer remote files: {', '.join(applied)}")
+                local_manifest = await asyncio.to_thread(_build_admin_state_manifest, flush=False)
+
+    post_local_newer, _post_remote_newer = _compare_admin_state_manifests(local_manifest, remote_manifest)
+    if post_local_newer:
+        await _push_admin_state_bundle_if_enabled(reason="startup-merge")
 
 
 def _pull_remote_config_once() -> dict[str, Any] | None:
@@ -1259,11 +1690,10 @@ async def _pull_remote_config_if_enabled() -> bool:
     if not isinstance(remote_config, dict):
         return False
     try:
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        temp_file = f"{CONFIG_FILE}.tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(remote_config, f, ensure_ascii=False, indent=2)
-        os.replace(temp_file, CONFIG_FILE)
+        current_local = _safe_load_json_dict(CONFIG_FILE)
+        if isinstance(current_local, dict):
+            _create_config_backup(current_local, "before-remote-pull")
+        _write_json_atomic(CONFIG_FILE, remote_config)
         print("[config-sync] remote config pulled to local snapshot")
         return True
     except Exception as e:
@@ -1379,7 +1809,7 @@ async def _add_image_fuzzy_sample_and_sync(*, group_id: int, label: str, image_b
         label=label,
         image_bytes=image_bytes,
     )
-    await _push_remote_image_fuzzy_blocks_if_enabled()
+    _schedule_admin_state_sync("image-sample-add")
     return item
 
 
@@ -1390,29 +1820,24 @@ async def _remove_image_fuzzy_samples_and_sync(*, group_id: int, sample_ids: lis
         sample_ids=sample_ids,
     )
     if removed:
-        await _push_remote_image_fuzzy_blocks_if_enabled()
+        _schedule_admin_state_sync("image-sample-remove")
     return removed
 
 async def load_config():
     """从 CONFIG_FILE 加载配置；每个群组独立保存配置，仅对缺失项补默认值。"""
     global config
     try:
-        await _pull_remote_config_if_enabled()
-        await _pull_remote_image_fuzzy_blocks_if_enabled()
+        await _reconcile_admin_state_with_remote()
         default = _default_group_config()
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            if "groups" not in config or not isinstance(config["groups"], dict):
-                config["groups"] = {}
-            groups = config["groups"]
-            for gid in list(groups.keys()):
-                try:
-                    _remember_group(int(gid))
-                except Exception:
-                    pass
-        else:
-            config = {"groups": {}}
+        config = _load_config_with_backup_fallback()
+        if "groups" not in config or not isinstance(config["groups"], dict):
+            config["groups"] = {}
+        groups = config["groups"]
+        for gid in list(groups.keys()):
+            try:
+                _remember_group(int(gid))
+            except Exception:
+                pass
 
         groups = config.setdefault("groups", {})
         shared_template = groups.get(SHARED_GROUP_CONFIG_KEY)
@@ -1474,6 +1899,7 @@ async def load_config():
             _ensure_group_config_defaults(group_cfg)
             for obsolete_key in obsolete_keys:
                 group_cfg.pop(obsolete_key, None)
+        _restore_empty_repeat_exempt_from_backups(config)
         await save_config(sync_remote=False)
     except Exception as e:
         print(f"配置加载失败: {e}")
@@ -1493,14 +1919,12 @@ async def save_config(sync_remote: bool = True):
             groups.pop(SHARED_GROUP_CONFIG_KEY, None)
         elif not isinstance(groups.get(SHARED_GROUP_CONFIG_KEY), dict):
             groups.pop(SHARED_GROUP_CONFIG_KEY, None)
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        temp_file = f"{CONFIG_FILE}.tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        os.replace(temp_file, CONFIG_FILE)
-        if sync_remote and CONFIG_SYNC_ENABLED and CONFIG_SYNC_PUSH_ON_SAVE:
-            snapshot = deepcopy(config)
-            asyncio.create_task(_push_remote_config_if_enabled(snapshot))
+        _restore_empty_repeat_exempt_from_previous(config)
+        snapshot = deepcopy(config)
+        _write_json_atomic(CONFIG_FILE, snapshot)
+        _create_config_backup(snapshot, "save")
+        if sync_remote and CONFIG_SYNC_PUSH_ON_SAVE:
+            _schedule_admin_state_sync("config-save")
     except Exception as e:
         print(f"配置保存失败: {e}")
 
@@ -3123,7 +3547,7 @@ async def process_semantic_ad_add(message: Message, state: FSMContext):
         added_ids = []
         skipped = 0
         for ln in lines:
-            sample = get_semantic_ad_detector().add_ad_sample(ln)
+            sample = _add_semantic_ad_sample(ln)
             if sample is None:
                 skipped += 1
             else:
@@ -3241,7 +3665,7 @@ async def process_semantic_ad_remove(message: Message, state: FSMContext):
             except ValueError:
                 invalid += 1
                 continue
-            ok = get_semantic_ad_detector().remove_sample(sid)
+            ok = _remove_semantic_ad_sample(sid)
             if ok:
                 removed.append(sid)
             else:
@@ -4219,7 +4643,7 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
     for msg_id, _ts, txt in recent_msgs:
         if txt:
             try:
-                get_semantic_ad_detector().add_ad_sample(txt)
+                _add_semantic_ad_sample(txt)
                 memory_changed = _remember_forward_match(group_id, user_id, txt) or memory_changed
             except Exception as e:
                 print(f"删除用户消息时学习样本失败: {e}")
@@ -4483,7 +4907,7 @@ async def _enable_semantic_detection_for_group(group_id: int) -> bool:
 async def _record_semantic_ad_deletion(group_id: int, user_id: int, message_id: int, text: str, score: float) -> bool:
     learned = False
     try:
-        sample = get_semantic_ad_detector().add_ad_sample(text)
+        sample = _add_semantic_ad_sample(text)
         learned = sample is not None
     except Exception as e:
         print(f"learn ad sample on delete failed: {e}")
@@ -4856,7 +5280,7 @@ async def cmd_mark_ad(message: Message):
         text = target.text or target.caption or ""
         if text:
             try:
-                sample = get_semantic_ad_detector().add_ad_sample(text)
+                sample = _add_semantic_ad_sample(text)
                 await _enable_semantic_detection_for_group(group_id)
                 if sample is None:
                     print(f"/ad 样本已存在或被去重: {text[:80]}")
@@ -4870,6 +5294,61 @@ async def cmd_mark_ad(message: Message):
     except Exception as e:
         print("/ad 命令异常:", e)
         await message.reply("❌ 失败", reply_markup=ReplyKeyboardRemove())
+
+
+async def _execute_forward_cleanup_for_group(*, group_id: int, text: str, hinted_user_id: int | None = None) -> dict[str, Any]:
+    _remember_group(group_id)
+    result: dict[str, Any] = {
+        "group_id": int(group_id),
+        "title": "",
+        "matched_user_id": None,
+        "deleted_by_user": False,
+        "deleted_by_text": 0,
+        "memory_changed": False,
+    }
+
+    try:
+        title_map = await _resolve_group_titles([group_id])
+        result["title"] = title_map.get(int(group_id)) or str(group_id)
+    except Exception:
+        result["title"] = str(group_id)
+
+    user_id = int(hinted_user_id) if hinted_user_id else None
+    if not user_id:
+        user_id = _get_remembered_user_id_by_text(group_id, text)
+        if not user_id:
+            matched_user_ids = await _find_recent_user_ids_by_text(group_id, text, limit=3)
+            if matched_user_ids:
+                user_id = matched_user_ids[0]
+
+    memory_changed = False
+    if user_id:
+        try:
+            result["matched_user_id"] = int(user_id)
+            recent_msgs = await _recent_messages_fetch_by_user(group_id, user_id)
+            async with lock:
+                has_warning_records = any(
+                    gid == group_id and data.get("suspect_id") == user_id
+                    for (gid, _mid), data in reports.items()
+                )
+            if recent_msgs or has_warning_records:
+                memory_changed = _remember_forward_match(group_id, user_id, text) or memory_changed
+                memory_changed = await _remember_recent_user_texts(group_id, user_id) or memory_changed
+                await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
+                result["deleted_by_user"] = True
+        except Exception as e:
+            print(f"forward cleanup delete by user failed group_id={group_id}: {e}")
+
+    try:
+        deleted_by_text = await _delete_recent_messages_by_text(group_id, text)
+        result["deleted_by_text"] = int(deleted_by_text)
+    except Exception as e:
+        print(f"forward cleanup delete by text failed group_id={group_id}: {e}")
+
+    if memory_changed:
+        _mark_forward_match_memory_dirty()
+    result["memory_changed"] = memory_changed
+    return result
 
 
 async def on_forward_learn_ad(message: Message):
@@ -4904,57 +5383,103 @@ async def on_forward_learn_ad(message: Message):
 
         learned = False
         try:
-            sample = get_semantic_ad_detector().add_ad_sample(text)
+            sample = _add_semantic_ad_sample(text)
             learned = sample is not None
             if not learned:
                 print(f"转发学习样本已存在或被去重: {text[:80]}")
         except Exception as e:
             print(f"转发学习广告样本失败: {e}")
 
-        managed_group_ids = _get_managed_group_ids()
-        candidate_group_ids: list[int] = []
         source_gid: int | None = None
         if f_chat:
             try:
                 source_gid = int(f_chat.id)
                 _remember_group(source_gid)
-                if not managed_group_ids or source_gid in managed_group_ids:
-                    candidate_group_ids = [source_gid]
             except Exception:
                 pass
-        if not candidate_group_ids:
-            candidate_group_ids = sorted(managed_group_ids)
-            if source_gid is not None and source_gid not in candidate_group_ids:
-                candidate_group_ids = [source_gid] + candidate_group_ids
+        target_group_ids = set(_get_managed_group_ids())
+        if source_gid is not None and source_gid < 0:
+            target_group_ids.add(source_gid)
 
-        if not candidate_group_ids:
+        if not target_group_ids:
             learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
             await message.reply(f"✅ {learned_text}，但当前没有可回删的已管理群。")
             return
 
-        for gid in candidate_group_ids:
-            await _enable_semantic_detection_for_group(gid)
+        hinted_user_id = int(f_user.id) if f_user else None
+        executed_results: list[dict[str, Any]] = []
+        skipped_results: list[tuple[int, str]] = []
 
-        hinted_user_id = None
-        if f_user:
-            hinted_user_id = f_user.id
-        _prune_forward_actions()
-        token = _new_forward_action_token()
-        pending_forward_actions[token] = {
-            "admin_id": int(message.from_user.id),
-            "text": text,
-            "hinted_user_id": int(hinted_user_id) if hinted_user_id else None,
-            "created_ts": time.time(),
-        }
-        titles = await _resolve_group_titles(candidate_group_ids)
-        kb = _forward_group_picker_keyboard(token, candidate_group_ids, titles, source_gid=source_gid)
+        for gid in sorted(target_group_ids):
+            active, reason_guard = await _is_group_eligible(gid, force_refresh=True)
+            if not active:
+                skipped_results.append((gid, reason_guard))
+                continue
+            await _enable_semantic_detection_for_group(gid)
+            executed_results.append(
+                await _execute_forward_cleanup_for_group(
+                    group_id=gid,
+                    text=text,
+                    hinted_user_id=hinted_user_id,
+                )
+            )
+
         learned_text = "已新增学习广告内容" if learned else "该广告内容已在库中"
-        prompt = (
+        if not executed_results:
+            if skipped_results:
+                skipped_preview = "\n".join(f"- {gid}: {reason}" for gid, reason in skipped_results[:10])
+                if len(skipped_results) > 10:
+                    skipped_preview += f"\n… 共 {len(skipped_results)} 个群不可执行"
+                await message.reply(
+                    f"✅ {learned_text}，但当前没有可执行回删的群。\n\n不可执行群：\n{skipped_preview}"
+                )
+            else:
+                await message.reply(f"✅ {learned_text}，但当前没有可执行回删的群。")
+            return
+
+        success_count = 0
+        partial_count = 0
+        miss_count = 0
+        detail_lines: list[str] = []
+        for result in executed_results:
+            gid = int(result["group_id"])
+            title = str(result.get("title") or gid)
+            matched_user = result.get("matched_user_id")
+            deleted_by_user = bool(result.get("deleted_by_user"))
+            deleted_by_text = int(result.get("deleted_by_text", 0) or 0)
+            if deleted_by_user or deleted_by_text:
+                if deleted_by_user:
+                    success_count += 1
+                    detail = f"- {title} ({gid}): 已按用户回删"
+                else:
+                    partial_count += 1
+                    detail = f"- {title} ({gid}): 未定位到用户，按文案回删 {deleted_by_text} 条"
+            else:
+                miss_count += 1
+                detail = f"- {title} ({gid}): 未找到可回删消息"
+            if matched_user:
+                detail += f"；user_id={matched_user}"
+            detail_lines.append(detail)
+
+        if skipped_results:
+            skipped_text = "；跳过 " + ", ".join(f"{gid}({reason})" for gid, reason in skipped_results[:5])
+            if len(skipped_results) > 5:
+                skipped_text += f" 等 {len(skipped_results)} 个群"
+        else:
+            skipped_text = ""
+
+        summary = (
             f"✅ {learned_text}。\n"
-            "请选择要执行回删的群组：\n"
-            "我会在该群定位此人并删除其近期全部发言。"
+            f"已在 {len(executed_results)} 个有权限群执行批量回删："
+            f"{success_count} 个按用户命中，{partial_count} 个按文案兜底，{miss_count} 个未命中"
+            f"{skipped_text}。"
         )
-        await message.reply(prompt, reply_markup=kb)
+        if detail_lines:
+            preview = "\n".join(detail_lines[:12])
+            if len(detail_lines) > 12:
+                preview += f"\n… 其余 {len(detail_lines) - 12} 个群已省略"
+            summary += f"\n\n{preview}"
+        await message.reply(summary)
     except Exception as e:
         print("转发学习命令异常:", e)
 
@@ -4978,93 +5503,6 @@ async def on_member_left(message: Message):
         print(f"处理退群用户消息清理失败: {e}")
 
 # 外部引用检测已移除，交由其他机器人处理
-
-
-@router.callback_query(F.data.startswith("forward_cancel:"), F.from_user.id.in_(ADMIN_IDS))
-async def forward_cancel(callback: CallbackQuery):
-    try:
-        token = callback.data.split(":", 1)[1]
-        payload = pending_forward_actions.get(token)
-        if not payload or int(payload.get("admin_id", 0) or 0) != int(callback.from_user.id):
-            await callback.answer("该任务已失效。", show_alert=True)
-            return
-        pending_forward_actions.pop(token, None)
-        await callback.message.edit_text("已取消本次回删。")
-        await callback.answer("已取消")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("forward_do:"), F.from_user.id.in_(ADMIN_IDS))
-async def forward_execute(callback: CallbackQuery):
-    try:
-        parts = callback.data.split(":", 2)
-        if len(parts) != 3:
-            await callback.answer("参数错误", show_alert=True)
-            return
-        token, group_id_str = parts[1], parts[2]
-        payload = pending_forward_actions.get(token)
-        if not payload or int(payload.get("admin_id", 0) or 0) != int(callback.from_user.id):
-            await callback.answer("该任务已失效。", show_alert=True)
-            return
-        text = str(payload.get("text", "") or "").strip()
-        if not text:
-            pending_forward_actions.pop(token, None)
-            await callback.answer("该任务缺少文本，已取消。", show_alert=True)
-            return
-        group_id = int(group_id_str)
-        _remember_group(group_id)
-        await _enable_semantic_detection_for_group(group_id)
-
-        user_id = payload.get("hinted_user_id")
-        if user_id:
-            user_id = int(user_id)
-        else:
-            user_id = _get_remembered_user_id_by_text(group_id, text)
-            if not user_id:
-                matched_user_ids = await _find_recent_user_ids_by_text(group_id, text, limit=3)
-                if matched_user_ids:
-                    user_id = matched_user_ids[0]
-
-        memory_changed = False
-        deleted_by_user = False
-        if user_id:
-            try:
-                memory_changed = _remember_forward_match(group_id, user_id, text) or memory_changed
-                memory_changed = await _remember_recent_user_texts(group_id, user_id) or memory_changed
-                await _delete_user_recent_and_warnings(group_id, user_id, orig_msg_id=None)
-                deleted_by_user = True
-            except Exception as e:
-                print(f"forward execute delete by user failed group_id={group_id}: {e}")
-
-        deleted_by_text = 0
-        try:
-            deleted_by_text = await _delete_recent_messages_by_text(group_id, text)
-        except Exception as e:
-            print(f"forward execute delete by text failed group_id={group_id}: {e}")
-
-        if memory_changed:
-            _mark_forward_match_memory_dirty()
-        pending_forward_actions.pop(token, None)
-
-        if deleted_by_user or deleted_by_text:
-            if user_id:
-                await callback.message.edit_text(
-                    f"✅ 已在群 {group_id} 执行回删。\n"
-                    f"按用户清理: {'是' if deleted_by_user else '否'}\n"
-                    f"同文案兜底删除: {deleted_by_text} 条"
-                )
-            else:
-                await callback.message.edit_text(
-                    f"✅ 已在群 {group_id} 执行同文案兜底回删 {deleted_by_text} 条（未拿到原用户ID）。"
-                )
-        else:
-            await callback.message.edit_text(
-                f"✅ 已在群 {group_id} 尝试回删，但最近消息缓存中未找到可删除记录。"
-            )
-        await callback.answer("已执行")
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_ban:"))
@@ -5389,7 +5827,7 @@ async def handle_mark_ad(callback: CallbackQuery):
         # 学习广告样本（仅使用当前触发的原始文本）
         if orig_text:
             try:
-                get_semantic_ad_detector().add_ad_sample(orig_text)
+                _add_semantic_ad_sample(orig_text)
                 await _enable_semantic_detection_for_group(group_id)
             except Exception as e:
                 print(f"学习广告样本失败: {e}")

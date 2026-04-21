@@ -161,6 +161,22 @@ class SemanticAdDetector:
         assert self._conn is not None
         return self._conn
 
+    def checkpoint(self) -> None:
+        """在同步/备份前将 WAL 内容刷回主库，避免只复制到旧的 .db 快照。"""
+        conn = self._get_conn()
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.commit()
+
+    def close(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            self.checkpoint()
+        finally:
+            self._conn.close()
+            self._conn = None
+
     def _dedupe_existing_samples(self) -> int:
         """清理历史重复样本：相同 text 或相同 simhash 仅保留最早一条。"""
         conn = self._conn

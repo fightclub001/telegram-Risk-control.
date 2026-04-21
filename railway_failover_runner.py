@@ -5,6 +5,10 @@ import subprocess
 import sys
 import threading
 import time
+import io
+import hashlib
+import zipfile
+import queue
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +39,10 @@ POLL_SEC = max(1, _env_int("HEARTBEAT_POLL_SEC", 15))
 RECOVER_CONFIRM_LOOPS = max(1, _env_int("HEARTBEAT_RECOVER_CONFIRM_LOOPS", 1))
 FAIL_CONFIRM_LOOPS = max(1, _env_int("HEARTBEAT_FAIL_CONFIRM_LOOPS", 3))
 REQUEST_TIMEOUT_SEC = max(1, _env_int("HEARTBEAT_TIMEOUT_SEC", 5))
+STANDBY_CONFLICT_COOLDOWN_SEC = max(
+    POLL_SEC * 2,
+    _env_int("STANDBY_CONFLICT_COOLDOWN_SEC", 300),
+)
 _RUNTIME_STATE_FILES = (
     "config.json",
     "reports.json",
@@ -44,6 +52,7 @@ _RUNTIME_STATE_FILES = (
     "recent_messages.json",
     "recent_messages.db",
     "image_fuzzy_blocks.json",
+    "semantic_ads/semantic_ads.db",
 )
 
 
@@ -61,7 +70,13 @@ def _resolve_data_dir() -> tuple[str, str]:
     legacy_config_dir = (os.getenv("CONFIG_DIR") or "").strip()
 
     candidates = []
-    for value in (explicit_data_dir, legacy_config_dir, "/data", "/app/data"):
+    for value in (
+        explicit_data_dir,
+        legacy_config_dir,
+        "/opt/telegram-risk-control/data",
+        "/data",
+        "/app/data",
+    ):
         if value and value not in candidates:
             candidates.append(value)
 
@@ -78,22 +93,119 @@ def _resolve_data_dir() -> tuple[str, str]:
         return explicit_data_dir, "DATA_DIR"
     if legacy_config_dir:
         return legacy_config_dir, "CONFIG_DIR(legacy)"
-    return "/data", "default"
+    return "/opt/telegram-risk-control/data", "default"
 
 
 DATA_DIR, DATA_DIR_SOURCE = _resolve_data_dir()
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 IMAGE_FUZZY_BLOCK_FILE = os.path.join(DATA_DIR, "image_fuzzy_blocks.json")
+SEMANTIC_AD_DB_FILE = os.path.join(DATA_DIR, "semantic_ads", "semantic_ads.db")
+ADMIN_STATE_FILE_PATHS = {
+    "config.json": CONFIG_FILE,
+    "image_fuzzy_blocks.json": IMAGE_FUZZY_BLOCK_FILE,
+    "semantic_ads/semantic_ads.db": SEMANTIC_AD_DB_FILE,
+}
 CONFIG_SYNC_TOKEN = (os.getenv("CONFIG_SYNC_TOKEN") or "").strip()
 CONFIG_SYNC_PORT = _env_int("CONFIG_SYNC_PORT", _env_int("PORT", 8080))
 CONFIG_SYNC_HOST = (os.getenv("CONFIG_SYNC_HOST") or "0.0.0.0").strip() or "0.0.0.0"
 CONFIG_SYNC_PATH = (os.getenv("CONFIG_SYNC_PATH") or "/config").strip() or "/config"
 IMAGE_FUZZY_SYNC_PATH = (os.getenv("IMAGE_FUZZY_SYNC_PATH") or "/image-fuzzy-blocks").strip() or "/image-fuzzy-blocks"
+STATE_SYNC_MANIFEST_PATH = (os.getenv("STATE_SYNC_MANIFEST_PATH") or "/state-manifest").strip() or "/state-manifest"
+STATE_SYNC_BUNDLE_PATH = (os.getenv("STATE_SYNC_BUNDLE_PATH") or "/state-bundle").strip() or "/state-bundle"
 CONFIG_SYNC_BODY_LIMIT = max(1024, _env_int("CONFIG_SYNC_BODY_LIMIT", 1024 * 1024))
+STATE_SYNC_BODY_LIMIT = max(1024 * 1024, _env_int("STATE_SYNC_BODY_LIMIT", _env_int("CONFIG_SYNC_BODY_LIMIT", 16 * 1024 * 1024)))
 
 
 def log(msg: str) -> None:
     print(f"[failover] {msg}", flush=True)
+
+
+def _write_bytes_atomic(path: str, payload: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_file = f"{path}.tmp"
+    with open(temp_file, "wb") as f:
+        f.write(payload)
+    os.replace(temp_file, path)
+
+
+def _build_admin_state_manifest() -> dict:
+    files: dict[str, dict] = {}
+    for rel_path, abs_path in ADMIN_STATE_FILE_PATHS.items():
+        if not os.path.exists(abs_path):
+            continue
+        try:
+            stat = os.stat(abs_path)
+            digest = hashlib.sha256()
+            with open(abs_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            files[rel_path] = {
+                "size": int(stat.st_size),
+                "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+                "sha256": digest.hexdigest(),
+            }
+        except Exception as exc:
+            log(f"state manifest skip {rel_path}: {exc}")
+    return {
+        "schema": 1,
+        "generated_at_ns": time.time_ns(),
+        "files": files,
+    }
+
+
+def _extract_manifest_files(raw: dict | None) -> dict[str, dict]:
+    if not isinstance(raw, dict):
+        return {}
+    files = raw.get("files")
+    if not isinstance(files, dict):
+        return {}
+    cleaned: dict[str, dict] = {}
+    for rel_path, meta in files.items():
+        if rel_path not in ADMIN_STATE_FILE_PATHS or not isinstance(meta, dict):
+            continue
+        cleaned[rel_path] = {
+            "size": int(meta.get("size", 0) or 0),
+            "mtime_ns": int(meta.get("mtime_ns", 0) or 0),
+            "sha256": str(meta.get("sha256", "") or ""),
+        }
+    return cleaned
+
+
+def _build_admin_state_bundle() -> bytes:
+    manifest = _build_admin_state_manifest()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        for rel_path in sorted(_extract_manifest_files(manifest).keys()):
+            abs_path = ADMIN_STATE_FILE_PATHS[rel_path]
+            if os.path.exists(abs_path):
+                zf.write(abs_path, arcname=rel_path)
+    return buffer.getvalue()
+
+
+def _apply_admin_state_bundle(bundle: bytes) -> list[str]:
+    applied: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(bundle), "r") as zf:
+        try:
+            manifest_raw = json.loads(zf.read("_manifest.json").decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"invalid_state_bundle_manifest:{exc}") from exc
+        manifest_files = _extract_manifest_files(manifest_raw)
+        for rel_path in sorted(manifest_files.keys()):
+            if rel_path not in zf.namelist():
+                continue
+            target_path = ADMIN_STATE_FILE_PATHS[rel_path]
+            _write_bytes_atomic(target_path, zf.read(rel_path))
+            mtime_ns = int(manifest_files[rel_path].get("mtime_ns", 0) or 0)
+            if mtime_ns > 0:
+                try:
+                    os.utime(target_path, ns=(mtime_ns, mtime_ns))
+                except Exception:
+                    pass
+            applied.append(rel_path)
+    return applied
 
 
 class _ConfigSyncHandler(BaseHTTPRequestHandler):
@@ -107,6 +219,13 @@ class _ConfigSyncHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _write_bytes(self, status: int, payload: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _authorized(self) -> bool:
         if not CONFIG_SYNC_TOKEN:
@@ -130,6 +249,21 @@ class _ConfigSyncHandler(BaseHTTPRequestHandler):
             return payload, None
         except json.JSONDecodeError:
             return None, {"ok": False, "error": "invalid_json"}
+        except Exception as exc:
+            return None, {"ok": False, "error": f"read_failed:{exc}"}
+
+    def _read_binary_payload(self) -> tuple[bytes | None, dict | None]:
+        raw_len = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_len)
+        except ValueError:
+            return None, {"ok": False, "error": "invalid_content_length"}
+
+        if length <= 0 or length > STATE_SYNC_BODY_LIMIT:
+            return None, {"ok": False, "error": "payload_too_large"}
+
+        try:
+            return self.rfile.read(length), None
         except Exception as exc:
             return None, {"ok": False, "error": f"read_failed:{exc}"}
 
@@ -161,12 +295,23 @@ class _ConfigSyncHandler(BaseHTTPRequestHandler):
             self._write_json(200, {"ok": True})
             return
 
-        if self.path not in {CONFIG_SYNC_PATH, IMAGE_FUZZY_SYNC_PATH}:
+        if self.path not in {CONFIG_SYNC_PATH, IMAGE_FUZZY_SYNC_PATH, STATE_SYNC_MANIFEST_PATH, STATE_SYNC_BUNDLE_PATH}:
             self._write_json(404, {"ok": False, "error": "not_found"})
             return
 
         if not self._authorized():
             self._write_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        if self.path == STATE_SYNC_MANIFEST_PATH:
+            self._write_json(200, _build_admin_state_manifest())
+            return
+
+        if self.path == STATE_SYNC_BUNDLE_PATH:
+            try:
+                self._write_bytes(200, _build_admin_state_bundle(), "application/zip")
+            except Exception as exc:
+                self._write_json(500, {"ok": False, "error": f"bundle_build_failed:{exc}"})
             return
 
         if self.path == CONFIG_SYNC_PATH:
@@ -188,12 +333,25 @@ class _ConfigSyncHandler(BaseHTTPRequestHandler):
         self._write_json(status, payload)
 
     def do_PUT(self) -> None:
-        if self.path not in {CONFIG_SYNC_PATH, IMAGE_FUZZY_SYNC_PATH}:
+        if self.path not in {CONFIG_SYNC_PATH, IMAGE_FUZZY_SYNC_PATH, STATE_SYNC_BUNDLE_PATH}:
             self._write_json(404, {"ok": False, "error": "not_found"})
             return
 
         if not self._authorized():
             self._write_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        if self.path == STATE_SYNC_BUNDLE_PATH:
+            payload, err = self._read_binary_payload()
+            if err is not None:
+                status = 413 if err.get("error") == "payload_too_large" else 400
+                self._write_json(status, err)
+                return
+            try:
+                applied = _apply_admin_state_bundle(payload or b"")
+                self._write_json(200, {"ok": True, "saved": True, "applied": applied})
+            except Exception as exc:
+                self._write_json(400, {"ok": False, "error": f"invalid_bundle:{exc}"})
             return
 
         payload, err = self._read_payload()
@@ -234,7 +392,8 @@ def start_config_sync_server_if_enabled() -> None:
     log(
         "config sync server listening on "
         f"{CONFIG_SYNC_HOST}:{CONFIG_SYNC_PORT}"
-        f"{CONFIG_SYNC_PATH} and {IMAGE_FUZZY_SYNC_PATH}"
+        f"{CONFIG_SYNC_PATH}, {IMAGE_FUZZY_SYNC_PATH}, "
+        f"{STATE_SYNC_MANIFEST_PATH}, {STATE_SYNC_BUNDLE_PATH}"
     )
 
 
@@ -262,7 +421,13 @@ def query_primary_alive() -> bool:
 
 def start_bot() -> subprocess.Popen:
     log("starting standby bot process")
-    return subprocess.Popen(MAIN_CMD)
+    return subprocess.Popen(
+        MAIN_CMD,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
 
 
 def stop_bot(proc: subprocess.Popen) -> None:
@@ -282,6 +447,40 @@ def run_plain_main() -> int:
     return subprocess.call(MAIN_CMD)
 
 
+def _bot_log_reader(proc: subprocess.Popen, lines: "queue.Queue[str]") -> None:
+    stream = proc.stdout
+    if stream is None:
+        return
+    try:
+        for line in iter(stream.readline, ""):
+            lines.put(line.rstrip("\r\n"))
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _drain_bot_log_lines(
+    lines: "queue.Queue[str]",
+    *,
+    conflict_seen: bool = False,
+) -> bool:
+    while True:
+        try:
+            line = lines.get_nowait()
+        except queue.Empty:
+            break
+        if line:
+            print(line, flush=True)
+            if (
+                "TelegramConflictError" in line
+                or "Conflict: terminated by other getUpdates request" in line
+            ):
+                conflict_seen = True
+    return conflict_seen
+
+
 def main() -> int:
     start_config_sync_server_if_enabled()
 
@@ -289,15 +488,35 @@ def main() -> int:
         return run_plain_main()
 
     bot_proc: subprocess.Popen | None = None
+    bot_log_lines: "queue.Queue[str]" = queue.Queue()
+    bot_log_thread: threading.Thread | None = None
+    standby_conflict_seen = False
+    standby_conflict_cooldown_until = 0.0
     recover_streak = 0
     fail_streak = 0
     log(
         "failover controller active, "
         f"node={PRIMARY_NODE_ID}, poll={POLL_SEC}s, max_age={MAX_AGE_SEC}s, "
-        f"fail_confirm={FAIL_CONFIRM_LOOPS}, recover_confirm={RECOVER_CONFIRM_LOOPS}"
+        f"fail_confirm={FAIL_CONFIRM_LOOPS}, recover_confirm={RECOVER_CONFIRM_LOOPS}, "
+        f"conflict_cooldown={STANDBY_CONFLICT_COOLDOWN_SEC}s"
     )
 
     while True:
+        standby_conflict_seen = _drain_bot_log_lines(
+            bot_log_lines,
+            conflict_seen=standby_conflict_seen,
+        )
+
+        if bot_proc is not None and standby_conflict_seen:
+            standby_conflict_cooldown_until = time.time() + STANDBY_CONFLICT_COOLDOWN_SEC
+            log(
+                "standby detected Telegram conflict; "
+                f"yielding to primary for {STANDBY_CONFLICT_COOLDOWN_SEC}s"
+            )
+            stop_bot(bot_proc)
+            bot_proc = None
+            standby_conflict_seen = False
+
         primary_alive = query_primary_alive()
 
         if primary_alive:
@@ -309,15 +528,39 @@ def main() -> int:
         else:
             recover_streak = 0
             fail_streak += 1
+            cooldown_remaining = standby_conflict_cooldown_until - time.time()
+            if cooldown_remaining > 0:
+                log(
+                    "primary probe unhealthy but standby conflict cooldown is active; "
+                    f"skip takeover for {int(cooldown_remaining)}s"
+                )
             # Guard against transient network jitter: only fail over after consecutive failures.
-            if fail_streak >= FAIL_CONFIRM_LOOPS and (bot_proc is None or bot_proc.poll() is not None):
+            if (
+                cooldown_remaining <= 0
+                and fail_streak >= FAIL_CONFIRM_LOOPS
+                and (bot_proc is None or bot_proc.poll() is not None)
+            ):
                 log(f"primary unhealthy streak={fail_streak}; entering standby")
                 bot_proc = start_bot()
+                bot_log_lines = queue.Queue()
+                bot_log_thread = threading.Thread(
+                    target=_bot_log_reader,
+                    args=(bot_proc, bot_log_lines),
+                    name="standby-bot-log-reader",
+                    daemon=True,
+                )
+                bot_log_thread.start()
+                standby_conflict_seen = False
 
         if bot_proc is not None and bot_proc.poll() is not None:
+            standby_conflict_seen = _drain_bot_log_lines(
+                bot_log_lines,
+                conflict_seen=standby_conflict_seen,
+            )
             code = bot_proc.returncode
             log(f"standby bot exited with code={code}; waiting for next loop")
             bot_proc = None
+            bot_log_thread = None
 
         time.sleep(POLL_SEC)
 
