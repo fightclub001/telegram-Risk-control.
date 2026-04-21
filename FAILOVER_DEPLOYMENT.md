@@ -274,3 +274,40 @@ cd /opt/telegram-risk-control/app
 - 发布后必须检查：
   - Ubuntu `status` 健康
   - Railway `/state-manifest` 返回非 `404`（正常应是 `200` 或未带 token 时 `401`）
+
+## 强制双端代码同步
+
+新增脚本：`deploy/publish_everywhere.py`
+
+用途：
+
+- 先 `git push origin main`
+- 再自动通过 SSH 把运行文件同步到 Ubuntu `/opt/telegram-risk-control/app`
+- 自动执行远端 `py_compile`
+- 自动重启 `telegram-risk-control.service`
+- 最后逐文件比对本地与 Ubuntu 的 `sha256`
+
+这样以后不再允许出现“GitHub/Railway 已更新，但 Ubuntu 运行目录还是旧文件”的分叉。
+
+### 推荐用法
+
+Windows PowerShell：
+
+```powershell
+$env:UBUNTU_SUDO_PASSWORD="你的Ubuntu sudo密码"
+python deploy/publish_everywhere.py --branch main
+```
+
+默认同步这些运行文件：
+
+- `main.py`
+- `image_fuzzy_blocker.py`
+- `semantic_ads.py`
+- `railway_failover_runner.py`
+- `deploy/release_guard.py`
+
+说明：
+
+- 若只想同步单个文件，可重复传 `--file`。
+- 若某次只想同步 Ubuntu、不再 push GitHub，可加 `--skip-push`。
+- 任何一步失败，脚本会直接退出；只有全部完成且哈希一致，才算同步成功。
