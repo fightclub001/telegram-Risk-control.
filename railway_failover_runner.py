@@ -120,6 +120,14 @@ def log(msg: str) -> None:
     print(f"[failover] {msg}", flush=True)
 
 
+def _is_primary_probe_healthy(data: dict) -> bool:
+    return bool(data.get("healthy", False))
+
+
+def _is_failover_allowed(data: dict) -> bool:
+    return bool(data.get("failover_allowed", False))
+
+
 def _write_bytes_atomic(path: str, payload: bytes) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temp_file = f"{path}.tmp"
@@ -410,10 +418,15 @@ def query_primary_alive() -> bool:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SEC) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
             data = json.loads(body)
-            healthy = bool(data.get("healthy", False))
-            if not healthy:
-                log(f"primary reported unhealthy: {body}")
-            return healthy
+            healthy = _is_primary_probe_healthy(data)
+            failover_allowed = _is_failover_allowed(data)
+            if healthy:
+                return True
+            if failover_allowed:
+                log(f"primary reported unhealthy and takeover allowed: {body}")
+                return False
+            log(f"primary reachable but sticky-primary mode blocks takeover: {body}")
+            return True
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
         log(f"primary probe failed: {exc}")
         return False
