@@ -131,6 +131,14 @@ HEARTBEAT_FAIL_CONFIRM_LOOPS=3
 HEARTBEAT_RECOVER_CONFIRM_LOOPS=1
 ```
 
+补充一个更稳的控制项：
+
+```bash
+# Ubuntu 健康接口还活着时，先保留 Ubuntu 主导 5 分钟
+# 只有持续失健康超过这个窗口，Railway 才允许接管
+HEALTH_FAILOVER_GRACE_SEC=300
+```
+
 ### 配置强一致（推荐开启）
 
 为避免“本地是 2、Railway 还是 50”这类漂移，现在支持把 Railway volume 当作同步中心：
@@ -183,6 +191,7 @@ STATE_SYNC_BUNDLE_PATH=/state-bundle
 
 - Ubuntu 持续发心跳。
 - Railway 只做轮询，不运行 bot。
+- 现在只要 Ubuntu 健康接口还能正常返回，且未超过 `HEALTH_FAILOVER_GRACE_SEC`，Railway 不会抢主。
 
 ### 主节点失联
 
@@ -194,6 +203,12 @@ STATE_SYNC_BUNDLE_PATH=/state-bundle
 - 家庭网络波动超过 `HEARTBEAT_MAX_AGE_SEC`
 
 此时 Railway 自动拉起 bot。
+
+### Ubuntu 可通信但短暂失健康
+
+- 例如你在 Ubuntu 上短暂停 bot、重启服务、调试别的项目导致网络探针瞬时失败。
+- 健康接口会返回 `healthy=false`，但在 `HEALTH_FAILOVER_GRACE_SEC` 时间窗内同时返回 `failover_allowed=false`。
+- Railway 收到这种响应时会继续让 Ubuntu 保持主导，不会进入 standby。
 
 ### 主节点恢复
 
@@ -281,10 +296,14 @@ cd /opt/telegram-risk-control/app
 
 用途：
 
+- 可只提交并推送本次指定运行文件，避免把工作区其它脏改动一起带上
 - 先 `git push origin main`
 - 再自动通过 SSH 把运行文件同步到 Ubuntu `/opt/telegram-risk-control/app`
+- 自动在 Ubuntu 端先备份旧代码；若安装/重启/健康检查失败，自动回滚
 - 自动执行远端 `py_compile`
-- 自动重启 `telegram-risk-control.service`
+- 优先自动重启 `telegram-risk-control.service` + `telegram-risk-health.service`
+- 若没有 sudo 但服务进程归 `fightclub` 用户所有，可退化为进程轮换重启并等待 systemd 自恢复
+- 自动等待 Ubuntu `/status` 健康
 - 最后逐文件比对本地与 Ubuntu 的 `sha256`
 
 这样以后不再允许出现“GitHub/Railway 已更新，但 Ubuntu 运行目录还是旧文件”的分叉。
@@ -295,7 +314,7 @@ Windows PowerShell：
 
 ```powershell
 $env:UBUNTU_SUDO_PASSWORD="你的Ubuntu sudo密码"
-python deploy/publish_everywhere.py --branch main
+python deploy/publish_everywhere.py --branch main --auto-commit --commit-message "你的本次发布说明"
 ```
 
 默认同步这些运行文件：
@@ -308,6 +327,8 @@ python deploy/publish_everywhere.py --branch main
 
 说明：
 
+- 若所选运行文件和 `HEAD` 不一致、但你又没传 `--auto-commit`，脚本会直接拒绝执行，避免 GitHub/Railway 与 Ubuntu 分叉。
 - 若只想同步单个文件，可重复传 `--file`。
 - 若某次只想同步 Ubuntu、不再 push GitHub，可加 `--skip-push`。
-- 任何一步失败，脚本会直接退出；只有全部完成且哈希一致，才算同步成功。
+- 任何一步失败，脚本会自动尝试恢复 Ubuntu 端备份，再退出。
+- 只有 push、Ubuntu 健康检查、以及远端文件哈希校验都通过，才算同步成功。
