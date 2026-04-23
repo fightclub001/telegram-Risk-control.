@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Risk Control Health Endpoint
+After=network-online.target telegram-risk-control.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fightclub
+WorkingDirectory=/opt/telegram-risk-control/app
+EnvironmentFile=/opt/telegram-risk-control/.env
+ExecStart=/opt/telegram-risk-control/venv/bin/python /opt/telegram-risk-control/app/deploy/ubuntu/telegram_risk_health.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

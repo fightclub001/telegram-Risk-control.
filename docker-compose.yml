@@ -10,7 +10,7 @@ services:
       - GROUP_IDS=${GROUP_IDS}
       - ADMIN_IDS=${ADMIN_IDS}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CONFIG_DIR=/app/data
+      - DATA_DIR=/app/data
     volumes:
       - ./data:/app/data
     networks:

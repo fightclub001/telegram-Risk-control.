@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram Risk Control Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fightclub
+WorkingDirectory=/opt/telegram-risk-control/app
+Environment=DATA_DIR=/opt/telegram-risk-control/data
+EnvironmentFile=/opt/telegram-risk-control/.env
+ExecStart=/opt/telegram-risk-control/venv/bin/python /opt/telegram-risk-control/app/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

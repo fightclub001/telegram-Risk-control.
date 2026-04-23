@@ -177,9 +177,16 @@
 
 ## 📁 数据文件
 
-数据会自动保存在 `/data` 目录：
+数据目录优先读取环境变量 `DATA_DIR`（兼容旧变量 `CONFIG_DIR`）。
+
+- Docker 默认：`/app/data`
+- Ubuntu 本地 systemd 推荐：`/opt/telegram-risk-control/data`
+- 未设置时会回落到默认数据目录
+
+数据文件示例：
 - `config.json`: 所有群组配置
 - `reports.json`: 举报记录
+- `backups/config/config-*.json`: 配置自动备份快照（默认保留 120 份）
 
 ## 🔒 权限要求
 
@@ -199,6 +206,9 @@
 | `BOT_TOKEN` | Telegram Bot Token | `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` |
 | `ADMIN_IDS` | 管理员用户ID（空格分隔） | `123456789 987654321` |
 | `GROUP_IDS` | 监控群组ID（空格分隔） | `-1001234567890 -1009876543210` |
+| `DATA_DIR` | 运行时数据目录（强烈建议显式设置） | `/opt/telegram-risk-control/data` |
+| `CONFIG_BACKUP_KEEP` | 配置快照保留数量 | `120` |
+| `CONFIG_GUARD_ALLOW_EMPTY_REPEAT_EXEMPT` | 是否允许将重复发言白名单清空（默认不允许） | `false` |
 
 **获取群组ID的方法：**
 1. 在群组中发送任何消息

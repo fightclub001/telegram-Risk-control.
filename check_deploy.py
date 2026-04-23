@@ -148,7 +148,7 @@ def check_files():
 def check_data_directory():
     """检查数据目录"""
     print("检查数据目录...", end=" ")
-    data_dir = os.getenv("CONFIG_DIR", "/data")
+    data_dir = os.getenv("DATA_DIR", os.getenv("CONFIG_DIR", "/data"))
     
     if not os.path.exists(data_dir):
         try:
@@ -165,7 +165,7 @@ def check_data_directory():
 def check_file_permissions():
     """检查文件权限"""
     print("检查文件权限...", end=" ")
-    data_dir = os.getenv("CONFIG_DIR", "/data")
+    data_dir = os.getenv("DATA_DIR", os.getenv("CONFIG_DIR", "/data"))
     
     try:
         # 测试写入权限

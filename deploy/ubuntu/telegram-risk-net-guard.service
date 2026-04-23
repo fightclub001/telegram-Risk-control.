@@ -1,0 +1,9 @@
+[Unit]
+Description=Telegram Risk Control Egress Guard
+After=network-online.target warp-svc.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/telegram-risk-net-guard.sh

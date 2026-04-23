@@ -1,0 +1,14 @@
+[Unit]
+Description=Connect Cloudflare WARP on boot
+After=network-online.target warp-svc.service
+Wants=network-online.target warp-svc.service
+ConditionPathExists=/usr/bin/warp-cli
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/bin/sh -lc '/usr/bin/warp-cli --accept-tos connect >/dev/null 2>&1 || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
