@@ -191,6 +191,8 @@
 
 ### Mini App 入口
 - `MEDIA_JOIN_GATE_MINIAPP_URL`：备用群组加入页地址。机器人会把当前主群的必备群组数据编码进 URL 查询参数，Mini App 页面据此渲染「一键加入」入口
+- 默认公开地址：`https://telegarmpromax.com/join-gate.html`
+- 如果未显式设置环境变量，机器人会优先回落到这个 Cloudflare Pages 地址
 
 ## 🔒 权限要求
 

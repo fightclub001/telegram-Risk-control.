@@ -27,7 +27,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove, BufferedInputFile, ChatJoinRequest, ChatMemberUpdated
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove, BufferedInputFile, ChatJoinRequest, ChatMemberUpdated, WebAppInfo
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -48,6 +48,7 @@ FAILOVER_ALERT_AFTER_SEC = max(60, int((os.getenv("FAILOVER_ALERT_AFTER_SEC") or
 FAILOVER_ALERT_RETRY_SEC = max(60, int((os.getenv("FAILOVER_ALERT_RETRY_SEC") or "300").strip()))
 FAILOVER_ALERT_POLL_SEC = max(30, int((os.getenv("FAILOVER_ALERT_POLL_SEC") or "60").strip()))
 MEDIA_JOIN_GATE_REMINDER_TEXT = "发图请先加入备用群组！"
+MEDIA_JOIN_GATE_DEFAULT_PUBLIC_URL = "https://telegarmpromax.com/join-gate.html"
 
 
 def _default_join_gate_demo_url() -> str:
@@ -57,7 +58,11 @@ def _default_join_gate_demo_url() -> str:
         return ""
 
 
-MEDIA_JOIN_GATE_MINIAPP_URL = (os.getenv("MEDIA_JOIN_GATE_MINIAPP_URL") or _default_join_gate_demo_url()).strip()
+MEDIA_JOIN_GATE_MINIAPP_URL = (
+    os.getenv("MEDIA_JOIN_GATE_MINIAPP_URL")
+    or MEDIA_JOIN_GATE_DEFAULT_PUBLIC_URL
+    or _default_join_gate_demo_url()
+).strip()
 
 try:
     for gid in os.getenv("GROUP_IDS", "").strip().split():
@@ -2824,7 +2829,7 @@ async def _build_media_join_gate_keyboard(group_id: int, user_id: int) -> Inline
         return None
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="一键加入", url=url)],
+            [InlineKeyboardButton(text="一键加入", web_app=WebAppInfo(url=url))],
         ]
     )
 
@@ -4717,7 +4722,7 @@ async def preview_media_join_gate(callback: CallbackQuery):
             "下面这个按钮就是成员在提醒消息里会看到的入口。",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="一键加入", url=url)],
+                    [InlineKeyboardButton(text="一键加入", web_app=WebAppInfo(url=url))],
                     [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_media_perm:{group_id}")],
                 ]
             ),
