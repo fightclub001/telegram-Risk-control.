@@ -2641,6 +2641,59 @@ async def _get_media_progress(group_id: int, user_id: int) -> tuple[int, bool]:
     return int(row["message_count"] or 0), bool(row["unlocked"])
 
 
+async def _reset_user_media_unlock_progress(group_id: int, user_id: int) -> None:
+    """收回用户媒体权限，恢复为未解锁状态。"""
+    conn = _get_recent_messages_conn()
+    now = time.time()
+    async with recent_messages_lock:
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """
+                INSERT INTO media_unlock_stats
+                (group_id, user_id, message_count, unlocked, updated_ts)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(group_id, user_id) DO UPDATE SET
+                    message_count = excluded.message_count,
+                    unlocked = excluded.unlocked,
+                    updated_ts = excluded.updated_ts
+                """,
+                (int(group_id), int(user_id), 0, 0, now),
+            )
+            conn.execute(
+                "DELETE FROM media_unlock_text_counts WHERE group_id = ? AND user_id = ?",
+                (int(group_id), int(user_id)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+async def _restrict_user_media_only(group_id: int, user_id: int) -> bool:
+    """尽量只关闭媒体发送能力，保留普通文字发言能力。"""
+    try:
+        await bot.restrict_chat_member(
+            chat_id=group_id,
+            user_id=user_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=False,
+                can_send_polls=True,
+                can_send_other_messages=False,
+                can_add_web_page_previews=True,
+                can_change_info=False,
+                can_invite_users=True,
+                can_pin_messages=False,
+            ),
+            until_date=None,
+        )
+        return True
+    except Exception as e:
+        print(f"restrict media only failed group_id={group_id} user_id={user_id}: {e}")
+        return False
+
+
 async def _can_send_media(group_id: int, user_id: int, username: str | None = None) -> bool:
     """是否已解锁发媒体：仅看合规文本累计是否达到阈值。"""
     cfg = get_group_config(group_id)
@@ -5040,6 +5093,8 @@ async def _finalize_media_group(chat_id: int, media_group_id: str) -> None:
             "media_msg_ids": message_ids,
             "media_group_id": media_group_id,
             "reply_msg_id": reply.message_id,
+            "suspect_id": first_user_id,
+            "suspect_name": first_display_name,
             "reporters": set(),
             "garbage_reporters": set(),
             "deleted": False,
@@ -5099,6 +5154,55 @@ async def _delete_user_recent_and_warnings(group_id: int, user_id: int, orig_msg
         "deleted_warnings": len(to_remove),
         "memory_changed": memory_changed,
     }
+
+
+async def _apply_media_report_sender_penalty(
+    *,
+    group_id: int,
+    media_msg_id: int,
+    data: dict[str, Any],
+    report_label: str,
+    trigger_count: int,
+    threshold: int,
+) -> None:
+    suspect_id = int(data.get("suspect_id", 0) or 0)
+    suspect_label = str(data.get("suspect_name") or (f"ID {suspect_id}" if suspect_id else "该用户"))
+    media_msg_ids = list(data.get("media_msg_ids", [media_msg_id]))
+
+    cleanup_stats = {"deleted_messages": 0, "deleted_warnings": 0, "memory_changed": False}
+    media_perm_restricted = False
+    if suspect_id > 0:
+        cleanup_stats = await _delete_user_recent_and_warnings(group_id, suspect_id, orig_msg_id=None)
+        await _reset_user_media_unlock_progress(group_id, suspect_id)
+        media_perm_restricted = await _restrict_user_media_only(group_id, suspect_id)
+
+    for original_mid in media_msg_ids:
+        await _delete_original_and_linked_reply(group_id, original_mid)
+
+    penalty_text = (
+        f"⚠️ {report_label}达到阈值（{trigger_count}/{threshold}），已处罚 {suspect_label}。\n"
+        f"已删除其近期消息 {int(cleanup_stats.get('deleted_messages', 0) or 0)} 条"
+        f"、警告 {int(cleanup_stats.get('deleted_warnings', 0) or 0)} 条，"
+        f"并关闭其媒体权限。"
+    )
+    try:
+        await bot.send_message(group_id, penalty_text)
+    except Exception:
+        pass
+
+    if suspect_id > 0:
+        await _record_moderation_log(
+            group_id=group_id,
+            user_id=suspect_id,
+            user_label=suspect_label,
+            action="媒体举报处罚",
+            reason=(
+                f"{report_label}达到阈值 {trigger_count}/{threshold}；"
+                f"已清理近期消息 {int(cleanup_stats.get('deleted_messages', 0) or 0)} 条，"
+                f"警告 {int(cleanup_stats.get('deleted_warnings', 0) or 0)} 条，"
+                f"{'Telegram 已同步限制媒体发送' if media_perm_restricted else '已重置本地媒体权限状态'}"
+            ),
+        )
 
 @router.message(
     F.photo | F.video | F.voice | F.video_note | F.document | F.animation | F.audio,
@@ -5226,6 +5330,8 @@ async def on_media_message(message: Message):
             "media_msg_id": message.message_id,
             "media_msg_ids": [message.message_id],
             "reply_msg_id": reply.message_id,
+            "suspect_id": user_id,
+            "suspect_name": _get_display_name_from_message(message, user_id),
             "reporters": set(),
             "garbage_reporters": set(),
             "deleted": False,
@@ -6540,8 +6646,9 @@ async def handle_media_report(callback: CallbackQuery):
             report_count = len(data["reporters"])
             garbage_count = len(data.get("garbage_reporters", set()))
             reply_id = data["reply_msg_id"]
-            media_msg_ids = list(data.get("media_msg_ids", [media_msg_id]))
             data["updated_ts"] = time.time()
+            should_penalize = report_count >= delete_threshold
+            penalty_data = dict(data) if should_penalize else None
 
         try:
             await bot.edit_message_reply_markup(
@@ -6553,18 +6660,15 @@ async def handle_media_report(callback: CallbackQuery):
             pass
         await callback.answer()
 
-        if report_count >= delete_threshold:
-            for original_mid in media_msg_ids:
-                await _delete_original_and_linked_reply(chat_id, original_mid)
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=reply_id,
-                    text=f"⚠️ 多人举报，已删除该媒体消息（共 {len(media_msg_ids)} 条）。",
-                    reply_markup=None
-                )
-            except Exception:
-                pass
+        if should_penalize and penalty_data is not None:
+            await _apply_media_report_sender_penalty(
+                group_id=chat_id,
+                media_msg_id=media_msg_id,
+                data=penalty_data,
+                report_label="儿童色情举报",
+                trigger_count=report_count,
+                threshold=delete_threshold,
+            )
             async with media_reports_lock:
                 if key in media_reports:
                     media_reports[key]["deleted"] = True
@@ -6608,8 +6712,9 @@ async def handle_media_garbage_report(callback: CallbackQuery):
             garbage_count = len(garbage_reporters)
             reply_id = data["reply_msg_id"]
             report_count = len(data["reporters"])
-            media_msg_ids = list(data.get("media_msg_ids", [media_msg_id]))
             data["updated_ts"] = time.time()
+            should_penalize = garbage_count >= delete_threshold
+            penalty_data = dict(data) if should_penalize else None
         try:
             await bot.edit_message_reply_markup(
                 chat_id=chat_id,
@@ -6619,18 +6724,15 @@ async def handle_media_garbage_report(callback: CallbackQuery):
         except Exception:
             pass
         await callback.answer()
-        if garbage_count >= delete_threshold:
-            for original_mid in media_msg_ids:
-                await _delete_original_and_linked_reply(chat_id, original_mid)
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=reply_id,
-                    text=f"⚠️ 多人举报，已删除该媒体消息（共 {len(media_msg_ids)} 条）。",
-                    reply_markup=None
-                )
-            except Exception:
-                pass
+        if should_penalize and penalty_data is not None:
+            await _apply_media_report_sender_penalty(
+                group_id=chat_id,
+                media_msg_id=media_msg_id,
+                data=penalty_data,
+                report_label="垃圾信息举报",
+                trigger_count=garbage_count,
+                threshold=delete_threshold,
+            )
             async with media_reports_lock:
                 if key in media_reports:
                     media_reports[key]["deleted"] = True
