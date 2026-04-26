@@ -27,7 +27,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove, BufferedInputFile, ChatJoinRequest, ChatMemberUpdated, WebAppInfo
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ReplyKeyboardRemove, BufferedInputFile, ChatJoinRequest, ChatMemberUpdated
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -2829,7 +2829,7 @@ async def _build_media_join_gate_keyboard(group_id: int, user_id: int) -> Inline
         return None
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="一键加入", web_app=WebAppInfo(url=url))],
+            [InlineKeyboardButton(text="一键加入", url=url)],
         ]
     )
 
@@ -4722,7 +4722,7 @@ async def preview_media_join_gate(callback: CallbackQuery):
             "下面这个按钮就是成员在提醒消息里会看到的入口。",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="一键加入", web_app=WebAppInfo(url=url))],
+                    [InlineKeyboardButton(text="一键加入", url=url)],
                     [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_media_perm:{group_id}")],
                 ]
             ),

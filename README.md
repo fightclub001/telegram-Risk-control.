@@ -189,10 +189,11 @@
 - `reports.json`: 举报记录
 - `backups/config/config-*.json`: 配置自动备份快照（默认保留 120 份）
 
-### Mini App 入口
-- `MEDIA_JOIN_GATE_MINIAPP_URL`：备用群组加入页地址。机器人会把当前主群的必备群组数据编码进 URL 查询参数，Mini App 页面据此渲染「一键加入」入口
+### 一键加入页入口
+- `MEDIA_JOIN_GATE_MINIAPP_URL`：备用群组加入页地址。机器人会把当前主群的必备群组数据编码进 URL 查询参数，页面据此渲染「一键加入」入口
 - 默认公开地址：`https://telegarmpromax.com/join-gate.html`
 - 如果未显式设置环境变量，机器人会优先回落到这个 Cloudflare Pages 地址
+- 群内提醒按钮使用普通 URL 按钮打开该页面，避免 Telegram Web App 按钮在群聊场景不可用
 
 ## 🔒 权限要求
 
