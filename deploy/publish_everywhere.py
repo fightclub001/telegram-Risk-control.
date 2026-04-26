@@ -374,12 +374,17 @@ for proc_dir in Path("/proc").iterdir():
         raw = (proc_dir / "cmdline").read_bytes()
     except OSError:
         continue
+    try:
+        exe_path = os.readlink(proc_dir / "exe")
+    except OSError:
+        continue
     if not raw:
         continue
     cmdline = raw.replace(b"\\x00", b" ").decode("utf-8", errors="ignore")
     if not cmdline:
         continue
-    if not ("/opt/telegram-risk-control/venv/bin/python" in cmdline or "python" in cmdline):
+    exe_name = os.path.basename(exe_path)
+    if not (exe_name.startswith("python") or exe_path == "/opt/telegram-risk-control/venv/bin/python"):
         continue
     if any(pattern in cmdline for pattern in patterns):
         try:
