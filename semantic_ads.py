@@ -38,7 +38,7 @@ class AdSample:
 
 _RE_KEEP = re.compile(r"[0-9a-z\u4e00-\u9fff]")
 _RE_REPEAT = re.compile(r"(.)\1+")
-DEFAULT_MATCH_THRESHOLD = float(os.getenv("SEMANTIC_AD_SCORE_THRESHOLD", "0.78"))
+DEFAULT_MATCH_THRESHOLD = float(os.getenv("SEMANTIC_AD_SCORE_THRESHOLD", "0.75"))
 MAINTENANCE_INTERVAL_SEC = max(
     600, int((os.getenv("SEMANTIC_AD_MAINTENANCE_INTERVAL_SECONDS") or "21600").strip())
 )
