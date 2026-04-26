@@ -40,6 +40,10 @@ GROUP_GUARD_CACHE_TTL_SEC = max(10, int((os.getenv("GROUP_GUARD_CACHE_TTL_SECOND
 group_guard_cache = {}
 BOT_SELF_ID: int | None = None
 BOT_TIMEZONE = (os.getenv("BOT_TIMEZONE") or os.getenv("TZ") or "Asia/Shanghai").strip()
+FAILOVER_ALERT_CHAT_ID = int((os.getenv("FAILOVER_ALERT_CHAT_ID") or "827803411").strip() or "0")
+FAILOVER_ALERT_AFTER_SEC = max(60, int((os.getenv("FAILOVER_ALERT_AFTER_SEC") or "600").strip()))
+FAILOVER_ALERT_RETRY_SEC = max(60, int((os.getenv("FAILOVER_ALERT_RETRY_SEC") or "300").strip()))
+FAILOVER_ALERT_POLL_SEC = max(30, int((os.getenv("FAILOVER_ALERT_POLL_SEC") or "60").strip()))
 
 try:
     for gid in os.getenv("GROUP_IDS", "").strip().split():
@@ -213,6 +217,7 @@ join_approval_risk_matcher: Any | None = None
 image_fuzzy_blocker: Any | None = None
 admin_state_sync_task: asyncio.Task | None = None
 admin_state_sync_requested = False
+railway_watch_task: asyncio.Task | None = None
 JOIN_APPROVAL_OCR_CACHE_TTL_SECONDS = max(60, int((os.getenv("OCR_CACHE_TTL_SECONDS") or "10800").strip()))
 JOIN_APPROVAL_OCR_CACHE_MAX = max(8, int((os.getenv("OCR_CACHE_MAX") or "24").strip()))
 JOIN_APPROVAL_DECLINE_AND_BAN = (os.getenv("DECLINE_AND_BAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -1625,6 +1630,23 @@ def _pull_remote_state_manifest_once() -> dict[str, Any] | None:
     return None
 
 
+def _probe_railway_manifest_once() -> tuple[bool, str]:
+    if not (STATE_SYNC_MANIFEST_URL and CONFIG_SYNC_TOKEN):
+        return False, "STATE_SYNC_MANIFEST_URL or CONFIG_SYNC_TOKEN missing"
+    try:
+        req = _build_sync_request(STATE_SYNC_MANIFEST_URL, "GET")
+        with urllib_request.urlopen(req, timeout=CONFIG_SYNC_TIMEOUT_SEC) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        raw = json.loads(body)
+        if not isinstance(raw, dict):
+            return False, "manifest response is not JSON object"
+        return True, "ok"
+    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
+
 def _pull_remote_state_bundle_once() -> bytes | None:
     if not (STATE_SYNC_ENABLED and CONFIG_SYNC_PULL_ON_START):
         return None
@@ -1679,6 +1701,47 @@ async def _run_admin_state_sync_loop() -> None:
         admin_state_sync_requested = False
         await asyncio.sleep(0.2)
         await _push_admin_state_bundle_if_enabled(reason="debounced")
+
+
+async def railway_failover_watch_worker() -> None:
+    if not (STATE_SYNC_MANIFEST_URL and CONFIG_SYNC_TOKEN):
+        print("[failover-alert] railway watch skipped: missing STATE_SYNC_MANIFEST_URL or CONFIG_SYNC_TOKEN")
+        return
+    unhealthy_since_ts = 0.0
+    alert_sent = False
+    last_alert_attempt_ts = 0.0
+    while True:
+        await asyncio.sleep(FAILOVER_ALERT_POLL_SEC)
+        ok, detail = await asyncio.to_thread(_probe_railway_manifest_once)
+        now = time.time()
+        if ok:
+            unhealthy_since_ts = 0.0
+            alert_sent = False
+            last_alert_attempt_ts = 0.0
+            continue
+        if unhealthy_since_ts <= 0:
+            unhealthy_since_ts = now
+        abnormal_for_sec = now - unhealthy_since_ts
+        if (
+            abnormal_for_sec >= FAILOVER_ALERT_AFTER_SEC
+            and not alert_sent
+            and (now - last_alert_attempt_ts) >= FAILOVER_ALERT_RETRY_SEC
+        ):
+            last_alert_attempt_ts = now
+            sent = await _send_failover_alert(
+                _build_failover_alert_text(
+                    detector="Ubuntu 主节点",
+                    target="Railway 兜底节点",
+                    abnormal_for_sec=abnormal_for_sec,
+                    details=[
+                        f"探测接口：{STATE_SYNC_MANIFEST_URL}",
+                        f"最近错误：{detail}",
+                        "影响说明：Railway 兜底链路当前不可用，若 Ubuntu 随后失效则无法自动接管。",
+                    ],
+                )
+            )
+            if sent:
+                alert_sent = True
 
 
 def _schedule_admin_state_sync(reason: str = "") -> None:
@@ -3113,6 +3176,50 @@ def _toggle_icon(enabled: bool) -> str:
 
 def _toggle_status(enabled: bool) -> str:
     return "✅ 已开启" if enabled else "❌ 已关闭"
+
+
+def _format_failover_alert_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}小时{minutes}分钟{secs}秒"
+    if minutes > 0:
+        return f"{minutes}分钟{secs}秒"
+    return f"{secs}秒"
+
+
+def _build_failover_alert_text(*, detector: str, target: str, abnormal_for_sec: float, details: list[str]) -> str:
+    lines = [
+        "🚨 <b>Telegram Risk Control 节点异常告警</b>",
+        "",
+        f"• 检测来源：<b>{detector}</b>",
+        f"• 异常节点：<b>{target}</b>",
+        f"• 持续时间：<b>{_format_failover_alert_duration(abnormal_for_sec)}</b>",
+        f"• 告警阈值：<b>{_format_failover_alert_duration(FAILOVER_ALERT_AFTER_SEC)}</b>",
+        f"• 发生时间：<code>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}</code>",
+        "",
+        "• 当前情况：",
+    ]
+    lines.extend(f"  - {item}" for item in details if item)
+    return "\n".join(lines)
+
+
+async def _send_failover_alert(text: str) -> bool:
+    if FAILOVER_ALERT_CHAT_ID <= 0:
+        print("[failover-alert] skipped: invalid FAILOVER_ALERT_CHAT_ID")
+        return False
+    try:
+        await bot.send_message(
+            FAILOVER_ALERT_CHAT_ID,
+            text,
+            disable_web_page_preview=True,
+        )
+        print(f"[failover-alert] sent to chat_id={FAILOVER_ALERT_CHAT_ID}")
+        return True
+    except Exception as e:
+        print(f"[failover-alert] send failed: {e}")
+        return False
 
 
 def _build_repeat_summary(title: str, group_id: int) -> str:
@@ -6932,6 +7039,7 @@ async def main():
     asyncio.create_task(cleanup_orphan_replies())
     asyncio.create_task(cleanup_media_runtime_state())
     asyncio.create_task(bio_watch_enforcement_worker())
+    asyncio.create_task(railway_failover_watch_worker())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":

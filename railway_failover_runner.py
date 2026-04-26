@@ -39,6 +39,11 @@ POLL_SEC = max(1, _env_int("HEARTBEAT_POLL_SEC", 15))
 RECOVER_CONFIRM_LOOPS = max(1, _env_int("HEARTBEAT_RECOVER_CONFIRM_LOOPS", 1))
 FAIL_CONFIRM_LOOPS = max(1, _env_int("HEARTBEAT_FAIL_CONFIRM_LOOPS", 3))
 REQUEST_TIMEOUT_SEC = max(1, _env_int("HEARTBEAT_TIMEOUT_SEC", 5))
+ALERT_CHAT_ID = int((os.getenv("FAILOVER_ALERT_CHAT_ID") or "827803411").strip() or "0")
+ALERT_AFTER_SEC = max(60, _env_int("FAILOVER_ALERT_AFTER_SEC", 600))
+ALERT_RETRY_SEC = max(60, _env_int("FAILOVER_ALERT_RETRY_SEC", 300))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TELEGRAM_API_BASE = os.getenv("TELEGRAM_BOT_API_BASE", "https://api.telegram.org").strip().rstrip("/")
 STANDBY_CONFLICT_COOLDOWN_SEC = max(
     POLL_SEC * 2,
     _env_int("STANDBY_CONFLICT_COOLDOWN_SEC", 300),
@@ -118,6 +123,62 @@ STATE_SYNC_BODY_LIMIT = max(1024 * 1024, _env_int("STATE_SYNC_BODY_LIMIT", _env_
 
 def log(msg: str) -> None:
     print(f"[failover] {msg}", flush=True)
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}小时{minutes}分钟{secs}秒"
+    if minutes > 0:
+        return f"{minutes}分钟{secs}秒"
+    return f"{secs}秒"
+
+
+def _format_alert_message(*, detector: str, target: str, abnormal_for_sec: float, details: list[str]) -> str:
+    lines = [
+        "🚨 <b>Telegram Risk Control 节点异常告警</b>",
+        "",
+        f"• 检测来源：<b>{detector}</b>",
+        f"• 异常节点：<b>{target}</b>",
+        f"• 持续时间：<b>{_format_duration(abnormal_for_sec)}</b>",
+        f"• 告警阈值：<b>{_format_duration(ALERT_AFTER_SEC)}</b>",
+        f"• 发生时间：<code>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}</code>",
+        "",
+        "• 当前情况：",
+    ]
+    lines.extend(f"  - {item}" for item in details if item)
+    return "\n".join(lines)
+
+
+def _send_alert_message(text: str) -> bool:
+    if ALERT_CHAT_ID <= 0 or not BOT_TOKEN:
+        log("skip alert: missing FAILOVER_ALERT_CHAT_ID or BOT_TOKEN")
+        return False
+    payload = json.dumps(
+        {
+            "chat_id": ALERT_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendMessage",
+        data=payload,
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=max(REQUEST_TIMEOUT_SEC, 10)) as resp:
+            _ = resp.read()
+        log(f"alert sent to chat_id={ALERT_CHAT_ID}")
+        return True
+    except Exception as exc:
+        log(f"alert send failed: {exc}")
+        return False
 
 
 def _is_primary_probe_healthy(data: dict) -> bool:
@@ -507,10 +568,14 @@ def main() -> int:
     standby_conflict_cooldown_until = 0.0
     recover_streak = 0
     fail_streak = 0
+    primary_down_since_ts = 0.0
+    primary_down_alert_sent = False
+    primary_down_last_alert_attempt_ts = 0.0
     log(
         "failover controller active, "
         f"node={PRIMARY_NODE_ID}, poll={POLL_SEC}s, max_age={MAX_AGE_SEC}s, "
         f"fail_confirm={FAIL_CONFIRM_LOOPS}, recover_confirm={RECOVER_CONFIRM_LOOPS}, "
+        f"alert_after={ALERT_AFTER_SEC}s, "
         f"conflict_cooldown={STANDBY_CONFLICT_COOLDOWN_SEC}s"
     )
 
@@ -535,12 +600,18 @@ def main() -> int:
         if primary_alive:
             fail_streak = 0
             recover_streak += 1
+            primary_down_since_ts = 0.0
+            primary_down_alert_sent = False
+            primary_down_last_alert_attempt_ts = 0.0
             if bot_proc is not None and recover_streak >= RECOVER_CONFIRM_LOOPS:
                 stop_bot(bot_proc)
                 bot_proc = None
         else:
             recover_streak = 0
             fail_streak += 1
+            now = time.time()
+            if primary_down_since_ts <= 0:
+                primary_down_since_ts = now
             cooldown_remaining = standby_conflict_cooldown_until - time.time()
             if cooldown_remaining > 0:
                 log(
@@ -564,6 +635,27 @@ def main() -> int:
                 )
                 bot_log_thread.start()
                 standby_conflict_seen = False
+            abnormal_for_sec = now - primary_down_since_ts
+            if (
+                abnormal_for_sec >= ALERT_AFTER_SEC
+                and not primary_down_alert_sent
+                and (now - primary_down_last_alert_attempt_ts) >= ALERT_RETRY_SEC
+            ):
+                primary_down_last_alert_attempt_ts = now
+                if _send_alert_message(
+                    _format_alert_message(
+                        detector="Railway 兜底节点",
+                        target="Ubuntu 主节点",
+                        abnormal_for_sec=abnormal_for_sec,
+                        details=[
+                            f"健康探测地址：{STATUS_URL}",
+                            f"连续失败次数：{fail_streak}",
+                            f"Railway 待机 bot：{'已启动' if bot_proc is not None and bot_proc.poll() is None else '未启动'}",
+                            f"主节点 ID：{PRIMARY_NODE_ID}",
+                        ],
+                    )
+                ):
+                    primary_down_alert_sent = True
 
         if bot_proc is not None and bot_proc.poll() is not None:
             standby_conflict_seen = _drain_bot_log_lines(
