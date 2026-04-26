@@ -38,7 +38,7 @@ class AdSample:
 
 _RE_KEEP = re.compile(r"[0-9a-z\u4e00-\u9fff]")
 _RE_REPEAT = re.compile(r"(.)\1+")
-DEFAULT_MATCH_THRESHOLD = float(os.getenv("SEMANTIC_AD_SCORE_THRESHOLD", "0.80"))
+DEFAULT_MATCH_THRESHOLD = float(os.getenv("SEMANTIC_AD_SCORE_THRESHOLD", "0.78"))
 MAINTENANCE_INTERVAL_SEC = max(
     600, int((os.getenv("SEMANTIC_AD_MAINTENANCE_INTERVAL_SECONDS") or "21600").strip())
 )
@@ -84,6 +84,16 @@ def _jaccard(a: List[str], b: List[str]) -> float:
     if union == 0:
         return 0.0
     return inter / union
+
+
+def _containment_ratio(needle: List[str], haystack: List[str]) -> float:
+    """Return how much of the smaller n-gram set is covered by the larger one."""
+    if not needle or not haystack:
+        return 0.0
+    sn, sh = set(needle), set(haystack)
+    if not sn:
+        return 0.0
+    return len(sn & sh) / len(sn)
 
 
 def _simhash_from_tokens(tokens: List[str]) -> int:
@@ -399,18 +409,17 @@ class SemanticAdDetector:
             """
             SELECT id, text, text_len
             FROM ads
-            WHERE text_len <= ?
-            ORDER BY text_len DESC, id ASC
+            WHERE text_len BETWEEN ? AND ?
+            ORDER BY ABS(text_len - ?) ASC, text_len DESC, id ASC
             """,
-            (norm_len,),
+            (min_len, max(norm_len + 24, int(norm_len * 2.5)), norm_len),
         )
 
         # 硬规则优先：
         # 1. 完全相同的归一化文案必须命中
         # 2. 新消息完整包含任一广告样本，也必须命中
-        saw_hard_row = False
-        for sid, text_old, _text_len in hard_rows:
-            saw_hard_row = True
+        # 3. 已学习的长广告样本完整包含当前短变体时，也按高置信命中
+        for sid, text_old, text_len in hard_rows:
             sample_text = str(text_old or "")
             if not sample_text:
                 continue
@@ -418,11 +427,15 @@ class SemanticAdDetector:
                 return True, 1.0, int(sid)
             if sample_text in norm:
                 return True, 1.0, int(sid)
-        if not saw_hard_row:
-            return False, 0.0, None
+            sample_len = int(text_len or len(sample_text))
+            if (
+                norm in sample_text
+                and norm_len >= max(min_len + 2, int(sample_len * 0.45))
+            ):
+                return True, 0.96, int(sid)
 
-        soft_min_len = max(min_len, int(norm_len * 0.55))
-        soft_max_len = max(norm_len + 8, int(norm_len * 1.45))
+        soft_min_len = max(min_len, int(norm_len * 0.35))
+        soft_max_len = max(norm_len + 24, int(norm_len * 2.5))
         rows = conn.execute(
             """
             SELECT id, text, simhash, fingerprint
@@ -446,10 +459,21 @@ class SemanticAdDetector:
             grams_old = fp_str.split("|") if fp_str else _ngrams(text_old, 3)
 
             ngram_sim = _jaccard(grams_new, grams_old)
+            containment = max(
+                _containment_ratio(grams_new, grams_old),
+                _containment_ratio(grams_old, grams_new),
+            )
             d = _hamming(sh_new, sh_old)
             simhash_similarity = 1.0 - d / 64.0
 
-            if simhash_similarity <= 0.8 and ngram_sim <= 0.75:
+            partial_similarity = fuzz.partial_ratio(norm, text_old) / 100.0
+
+            if (
+                simhash_similarity <= 0.78
+                and ngram_sim <= 0.60
+                and containment <= 0.68
+                and partial_similarity <= 0.88
+            ):
                 continue
 
             text_similarity = fuzz.ratio(norm, text_old) / 100.0
@@ -470,12 +494,33 @@ class SemanticAdDetector:
             if keyword_score > 1.0:
                 keyword_score = 1.0
 
-            score = (
+            balanced_score = (
                 0.35 * simhash_similarity
                 + 0.30 * text_similarity
                 + 0.20 * ngram_sim
                 + 0.15 * keyword_score
             )
+            containment_score = (
+                0.38 * partial_similarity
+                + 0.27 * containment
+                + 0.20 * ngram_sim
+                + 0.15 * keyword_score
+            )
+            score = max(balanced_score, containment_score)
+
+            # Learned ad text should catch minor rewrites and sliced variants.
+            if (
+                partial_similarity >= 0.92
+                and containment >= 0.72
+                and max(norm_len, len(text_old)) >= 8
+            ):
+                score = max(score, 0.90)
+            elif (
+                partial_similarity >= 0.88
+                and containment >= 0.62
+                and keyword_score >= 0.2
+            ):
+                score = max(score, 0.84)
 
             if score > best_score:
                 best_score = score
