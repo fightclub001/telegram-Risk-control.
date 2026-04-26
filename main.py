@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import concurrent.futures
 import heapq
 import html
@@ -13,10 +14,11 @@ import zipfile
 from copy import deepcopy
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from urllib import error as urllib_error, request as urllib_request
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -45,6 +47,17 @@ FAILOVER_ALERT_CHAT_ID = int((os.getenv("FAILOVER_ALERT_CHAT_ID") or "827803411"
 FAILOVER_ALERT_AFTER_SEC = max(60, int((os.getenv("FAILOVER_ALERT_AFTER_SEC") or "600").strip()))
 FAILOVER_ALERT_RETRY_SEC = max(60, int((os.getenv("FAILOVER_ALERT_RETRY_SEC") or "300").strip()))
 FAILOVER_ALERT_POLL_SEC = max(30, int((os.getenv("FAILOVER_ALERT_POLL_SEC") or "60").strip()))
+MEDIA_JOIN_GATE_REMINDER_TEXT = "发图请先加入备用群组！"
+
+
+def _default_join_gate_demo_url() -> str:
+    try:
+        return (Path(__file__).resolve().parent / "demo" / "join-gate-miniapp-demo.html").as_uri()
+    except Exception:
+        return ""
+
+
+MEDIA_JOIN_GATE_MINIAPP_URL = (os.getenv("MEDIA_JOIN_GATE_MINIAPP_URL") or _default_join_gate_demo_url()).strip()
 
 try:
     for gid in os.getenv("GROUP_IDS", "").strip().split():
@@ -1272,6 +1285,9 @@ def _default_group_config():
         "repeat_exempt_keywords": [],  # 含任一词的消息不触发重复发言检测（白名单词）
         "media_permission_enabled": True,
         "media_unlock_msg_count": 50,
+        "media_join_gate_enabled": False,
+        "media_join_gate_required_groups": [],
+        "media_join_gate_invite_links": {},
         "media_report_enabled": True,
         "media_report_cooldown_sec": 20 * 60,
         "media_report_max_per_day": 3,
@@ -2220,21 +2236,7 @@ def _get_recent_messages_conn() -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_repeat_levels_updated_ts "
             "ON repeat_violation_levels(updated_ts DESC)"
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS repeat_first_trigger_state (
-                group_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                skipped_once INTEGER NOT NULL DEFAULT 0,
-                updated_ts REAL NOT NULL,
-                PRIMARY KEY (group_id, user_id)
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_repeat_first_trigger_updated_ts "
-            "ON repeat_first_trigger_state(updated_ts DESC)"
-        )
+        conn.execute("DROP TABLE IF EXISTS repeat_first_trigger_state")
         recent_messages_conn = conn
     return recent_messages_conn
 
@@ -2736,6 +2738,97 @@ async def _get_media_progress(group_id: int, user_id: int) -> tuple[int, bool]:
     return int(row["message_count"] or 0), bool(row["unlocked"])
 
 
+async def _resolve_media_join_gate_invite_link(group_id: int, required_group_id: int) -> str:
+    cache = _get_media_join_gate_invite_link_cache(group_id)
+    cache_key = str(int(required_group_id))
+    cached = str(cache.get(cache_key) or "").strip()
+    if cached:
+        return cached
+
+    link = ""
+    try:
+        chat = await bot.get_chat(required_group_id)
+        username = str(getattr(chat, "username", "") or "").strip()
+        if username:
+            link = f"https://t.me/{username}"
+        else:
+            invite = await bot.create_chat_invite_link(
+                chat_id=required_group_id,
+                name=f"media-join-gate-{group_id}",
+            )
+            link = str(getattr(invite, "invite_link", "") or "").strip()
+    except Exception as e:
+        print(
+            "resolve media join gate invite link failed "
+            f"group_id={group_id} required_group_id={required_group_id}: {e}"
+        )
+        link = ""
+
+    if link:
+        cache[cache_key] = link
+        await save_config(sync_remote=False)
+    return link
+
+
+async def _build_media_join_gate_payload(group_id: int, user_id: int | None = None) -> dict[str, Any]:
+    required_group_ids = _get_media_join_gate_required_groups(group_id)
+    titles = await _resolve_group_titles([group_id] + required_group_ids)
+    items = []
+    for required_group_id in required_group_ids:
+        link = await _resolve_media_join_gate_invite_link(group_id, required_group_id)
+        items.append(
+            {
+                "group_id": required_group_id,
+                "title": titles.get(required_group_id) or str(required_group_id),
+                "hint": "必备群组",
+                "join_url": link,
+            }
+        )
+    return {
+        "mode": "media_join_gate",
+        "group_id": int(group_id),
+        "group_title": titles.get(group_id) or str(group_id),
+        "user_id": int(user_id or 0),
+        "button_text": "一键加入",
+        "groups": items,
+    }
+
+
+async def _get_media_join_gate_missing_groups(group_id: int, user_id: int) -> list[int]:
+    cfg = get_group_config(group_id)
+    if not bool(cfg.get("media_join_gate_enabled", False)):
+        return []
+    required_group_ids = _get_media_join_gate_required_groups(group_id)
+    if not required_group_ids:
+        return []
+
+    missing_group_ids: list[int] = []
+    for required_group_id in required_group_ids:
+        try:
+            member = await bot.get_chat_member(required_group_id, user_id)
+            if not _is_member_present(getattr(member, "status", None)):
+                missing_group_ids.append(required_group_id)
+        except Exception as e:
+            print(
+                "media join gate membership check failed "
+                f"group_id={group_id} required_group_id={required_group_id} user_id={user_id}: {e}"
+            )
+            missing_group_ids.append(required_group_id)
+    return missing_group_ids
+
+
+async def _build_media_join_gate_keyboard(group_id: int, user_id: int) -> InlineKeyboardMarkup | None:
+    payload = await _build_media_join_gate_payload(group_id, user_id)
+    url = _build_media_join_gate_url(payload)
+    if not url:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="一键加入", url=url)],
+        ]
+    )
+
+
 async def _reset_user_media_unlock_progress(group_id: int, user_id: int) -> None:
     """收回用户媒体权限，恢复为未解锁状态。"""
     conn = _get_recent_messages_conn()
@@ -2796,6 +2889,53 @@ async def _can_send_media(group_id: int, user_id: int, username: str | None = No
         return True
     _count, unlocked = await _get_media_progress(group_id, user_id)
     return unlocked
+
+
+async def _send_media_join_gate_reminder(
+    message: Message,
+    *,
+    group_id: int,
+    user_id: int,
+    missing_group_ids: list[int],
+    now_ts: float,
+) -> None:
+    titles = await _resolve_group_titles(missing_group_ids)
+    missing_names = [titles.get(gid) or str(gid) for gid in missing_group_ids]
+    name = _get_display_name_from_message(message, user_id)
+    keyboard = await _build_media_join_gate_keyboard(group_id, user_id)
+    sk = (group_id, user_id)
+    strike_count, last_ts = media_no_perm_strikes.get(sk, (0, 0))
+    if now_ts - last_ts > MEDIA_NO_PERM_STRIKE_RESET_SEC:
+        strike_count = 0
+    strike_count += 1
+    media_no_perm_strikes[sk] = (strike_count, now_ts)
+
+    if strike_count >= 2:
+        prev_msg_id = last_media_no_perm_msg.pop(sk, None)
+        if prev_msg_id is not None:
+            try:
+                await bot.delete_message(group_id, prev_msg_id)
+            except Exception:
+                pass
+        return
+
+    prev_msg_id = last_media_no_perm_msg.get(sk)
+    if prev_msg_id is not None:
+        try:
+            await bot.delete_message(group_id, prev_msg_id)
+        except Exception:
+            pass
+        finally:
+            bot_sent_messages.pop((group_id, prev_msg_id), None)
+
+    text = (
+        f"⚠️ {name} {MEDIA_JOIN_GATE_REMINDER_TEXT}\n"
+        f"当前缺少：{', '.join(missing_names)}\n"
+        "加入后即可恢复发图权限。"
+    )
+    sent = await bot.send_message(group_id, text, reply_markup=keyboard)
+    last_media_no_perm_msg[sk] = sent.message_id
+    _track_bot_message(group_id, sent.message_id, MEDIA_NO_PERM_DELETE_AFTER_SEC)
 
 
 async def _increment_media_count(group_id: int, user_id: int, normalized_text: str) -> bool:
@@ -2906,38 +3046,6 @@ async def _set_repeat_violation_level(group_id: int, user_id: int, level: int) -
         conn.commit()
 
 
-async def _has_repeat_first_trigger_skipped(group_id: int, user_id: int) -> bool:
-    conn = _get_recent_messages_conn()
-    async with recent_messages_lock:
-        row = conn.execute(
-            """
-            SELECT skipped_once
-            FROM repeat_first_trigger_state
-            WHERE group_id = ? AND user_id = ?
-            """,
-            (int(group_id), int(user_id)),
-        ).fetchone()
-    if row is None:
-        return False
-    return bool(row["skipped_once"])
-
-
-async def _mark_repeat_first_trigger_skipped(group_id: int, user_id: int) -> None:
-    conn = _get_recent_messages_conn()
-    async with recent_messages_lock:
-        conn.execute(
-            """
-            INSERT INTO repeat_first_trigger_state
-            (group_id, user_id, skipped_once, updated_ts)
-            VALUES (?, ?, 1, ?)
-            ON CONFLICT(group_id, user_id) DO UPDATE SET
-                skipped_once = 1,
-                updated_ts = excluded.updated_ts
-            """,
-            (int(group_id), int(user_id), time.time()),
-        )
-        conn.commit()
-
 
 def _pack_forward_match_value(group_id: int, user_id: int, updated_at: int) -> list[int]:
     return [int(group_id), int(user_id), int(updated_at)]
@@ -2998,6 +3106,74 @@ def get_primary_group_id() -> int:
     if not managed:
         raise ValueError("No managed groups discovered")
     return managed[0]
+
+
+def _get_media_join_gate_required_groups(group_id: int) -> list[int]:
+    cfg = get_group_config(group_id)
+    raw_values = cfg.get("media_join_gate_required_groups") or []
+    values: list[int] = []
+    for raw_value in raw_values:
+        try:
+            gid = int(raw_value)
+        except Exception:
+            continue
+        if gid >= 0 or gid == int(group_id) or gid in values:
+            continue
+        values.append(gid)
+    cfg["media_join_gate_required_groups"] = values
+    return list(values)
+
+
+def _toggle_media_join_gate_required_group(group_id: int, required_group_id: int) -> bool:
+    current = _get_media_join_gate_required_groups(group_id)
+    try:
+        required_group_id = int(required_group_id)
+    except Exception:
+        return False
+    if required_group_id in current:
+        current = [gid for gid in current if gid != required_group_id]
+        enabled = False
+    else:
+        current.append(required_group_id)
+        current = sorted({int(gid) for gid in current if int(gid) < 0 and int(gid) != int(group_id)})
+        enabled = True
+    cfg = get_group_config(group_id)
+    cfg["media_join_gate_required_groups"] = current
+    return enabled
+
+
+def _get_media_join_gate_invite_link_cache(group_id: int) -> dict[str, str]:
+    cfg = get_group_config(group_id)
+    cache = cfg.get("media_join_gate_invite_links")
+    if not isinstance(cache, dict):
+        cache = {}
+        cfg["media_join_gate_invite_links"] = cache
+    normalized: dict[str, str] = {}
+    for key, value in cache.items():
+        try:
+            gid = str(int(key))
+        except Exception:
+            continue
+        link = str(value or "").strip()
+        if link:
+            normalized[gid] = link
+    if normalized != cache:
+        cfg["media_join_gate_invite_links"] = normalized
+    return cfg["media_join_gate_invite_links"]
+
+
+def _encode_media_join_gate_payload(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _build_media_join_gate_url(payload: dict[str, Any]) -> str:
+    base_url = MEDIA_JOIN_GATE_MINIAPP_URL
+    if not base_url:
+        return ""
+    encoded = quote(_encode_media_join_gate_payload(payload))
+    separator = "&" if "?" in base_url else "?"
+    return f"{base_url}{separator}data={encoded}"
 
 
 def fmt_duration(seconds: int) -> str:
@@ -3279,10 +3455,14 @@ def _build_media_perm_summary(title: str, group_id: int) -> str:
     cfg = get_group_config(group_id)
     enabled = _toggle_status(bool(cfg.get("media_permission_enabled", True)))
     msg = cfg.get("media_unlock_msg_count", 50)
+    join_gate_enabled = _toggle_status(bool(cfg.get("media_join_gate_enabled", False)))
+    required_count = len(_get_media_join_gate_required_groups(group_id))
     return (
         f"<b>{title}</b> › 媒体权限\n\n"
         f"状态: {enabled}\n"
-        f"解锁所需合规消息: {msg}"
+        f"解锁所需合规消息: {msg}\n"
+        f"备用群组校验: {join_gate_enabled}\n"
+        f"必备群组: {required_count} 个"
     )
 
 
@@ -3337,11 +3517,40 @@ def get_media_perm_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     enabled = _toggle_icon(bool(cfg.get("media_permission_enabled", True)))
     msg = cfg.get("media_unlock_msg_count", 50)
+    join_gate_enabled = _toggle_icon(bool(cfg.get("media_join_gate_enabled", False)))
+    required_count = len(_get_media_join_gate_required_groups(group_id))
     buttons = [
         [InlineKeyboardButton(text=f"开关 {enabled}", callback_data=f"toggle_media_perm:{group_id}")],
         [InlineKeyboardButton(text=f"解锁所需消息数: {msg}", callback_data=f"edit_media_msg:{group_id}")],
+        [InlineKeyboardButton(text=f"备用群组校验 {join_gate_enabled}", callback_data=f"toggle_media_join_gate:{group_id}")],
+        [InlineKeyboardButton(text=f"必备群组 ({required_count})", callback_data=f"edit_media_join_gate_groups:{group_id}")],
+        [InlineKeyboardButton(text="预览一键加入页", callback_data=f"preview_media_join_gate:{group_id}")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"group_menu:{group_id}")],
     ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_media_join_gate_group_picker_keyboard(
+    main_group_id: int,
+    candidate_group_ids: list[int],
+    group_titles: dict[int, str],
+) -> InlineKeyboardMarkup:
+    selected = set(_get_media_join_gate_required_groups(main_group_id))
+    buttons = []
+    for candidate_group_id in candidate_group_ids:
+        title = (group_titles.get(candidate_group_id) or str(candidate_group_id)).strip()
+        if len(title) > 24:
+            title = title[:24] + "..."
+        icon = "✅" if candidate_group_id in selected else "⬜"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{icon} {title} ({candidate_group_id})",
+                    callback_data=f"toggle_media_join_gate_group:{main_group_id}:{candidate_group_id}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_media_perm:{main_group_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_media_report_menu_keyboard(group_id: int):
@@ -4432,6 +4641,92 @@ async def toggle_media_perm(callback: CallbackQuery):
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
+
+@router.callback_query(F.data.startswith("toggle_media_join_gate:"), F.from_user.id.in_(ADMIN_IDS))
+async def toggle_media_join_gate(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        cfg = get_group_config(group_id)
+        cfg["media_join_gate_enabled"] = not bool(cfg.get("media_join_gate_enabled", False))
+        await save_config()
+        title = await get_chat_title_safe(callback.bot, group_id)
+        await callback.message.edit_text(
+            _build_media_perm_summary(title, group_id),
+            reply_markup=get_media_perm_menu_keyboard(group_id),
+        )
+        await callback.answer(f"备用群组校验已{'开启' if cfg['media_join_gate_enabled'] else '关闭'}")
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("edit_media_join_gate_groups:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_media_join_gate_groups(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        candidate_group_ids = sorted(gid for gid in _get_managed_group_ids() if gid != group_id)
+        if not candidate_group_ids:
+            await callback.answer("当前没有可作为备用群组的候选群。", show_alert=True)
+            return
+        titles = await _resolve_group_titles(candidate_group_ids)
+        selected_count = len(_get_media_join_gate_required_groups(group_id))
+        await callback.message.edit_text(
+            "选择这个主群的必备备用群组。\n"
+            "成员只有加入这些群后，才能在当前群发送媒体。\n\n"
+            f"当前已选: {selected_count} 个",
+            reply_markup=get_media_join_gate_group_picker_keyboard(group_id, candidate_group_ids, titles),
+        )
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("toggle_media_join_gate_group:"), F.from_user.id.in_(ADMIN_IDS))
+async def toggle_media_join_gate_group(callback: CallbackQuery):
+    try:
+        _prefix, main_group_raw, candidate_group_raw = callback.data.split(":", 2)
+        main_group_id = int(main_group_raw)
+        candidate_group_id = int(candidate_group_raw)
+        enabled = _toggle_media_join_gate_required_group(main_group_id, candidate_group_id)
+        await save_config(sync_remote=False)
+        candidate_group_ids = sorted(gid for gid in _get_managed_group_ids() if gid != main_group_id)
+        titles = await _resolve_group_titles(candidate_group_ids)
+        selected_count = len(_get_media_join_gate_required_groups(main_group_id))
+        await callback.message.edit_text(
+            "选择这个主群的必备备用群组。\n"
+            "成员只有加入这些群后，才能在当前群发送媒体。\n\n"
+            f"当前已选: {selected_count} 个",
+            reply_markup=get_media_join_gate_group_picker_keyboard(main_group_id, candidate_group_ids, titles),
+        )
+        await callback.answer(f"{'已加入' if enabled else '已移除'}必备群组")
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("preview_media_join_gate:"), F.from_user.id.in_(ADMIN_IDS))
+async def preview_media_join_gate(callback: CallbackQuery):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        payload = await _build_media_join_gate_payload(group_id, callback.from_user.id)
+        url = _build_media_join_gate_url(payload)
+        if not url:
+            await callback.answer("尚未配置 Mini App 地址。请先设置 MEDIA_JOIN_GATE_MINIAPP_URL。", show_alert=True)
+            return
+        title = await get_chat_title_safe(callback.bot, group_id)
+        await callback.message.edit_text(
+            f"<b>{title}</b> › 媒体权限 › 一键加入预览\n\n"
+            "下面这个按钮就是成员在提醒消息里会看到的入口。",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="一键加入", url=url)],
+                    [InlineKeyboardButton(text="⬅️ 返回", callback_data=f"submenu_media_perm:{group_id}")],
+                ]
+            ),
+        )
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("edit_media_msg:"), F.from_user.id.in_(ADMIN_IDS))
 async def edit_media_msg(callback: CallbackQuery, state: FSMContext):
     try:
@@ -4766,16 +5061,18 @@ async def _handle_repeat_signature(message: Message, signature: str, repeat_labe
     history.append(now)
     count = len(history)
 
+    warning_count = max_count - 1 if max_count >= 3 else 0
+
     if count == 2:
-        if not await _has_repeat_first_trigger_skipped(group_id, user_id):
-            await _mark_repeat_first_trigger_skipped(group_id, user_id)
-            print(
-                "[repeat] first trigger skip warning "
-                f"group_id={group_id} user_id={user_id} count=2/{max_count}"
-            )
-            return False
+        print(
+            "[repeat] second hit silent "
+            f"group_id={group_id} user_id={user_id} count=2/{max_count}"
+        )
+        return False
+
+    if warning_count and count == warning_count and count < max_count:
         warn_text = (
-            f"⚠️ 检测到你在 {window_sec // 3600} 小时内重复发送{repeat_label}（2/{max_count}），请勿刷屏。"
+            f"⚠️ 检测到你在 {window_sec // 3600} 小时内重复发送{repeat_label}（{count}/{max_count}），请勿刷屏。"
         )
         try:
             w = await _send_delayed_reply_if_original_exists(message, warn_text)
@@ -5429,6 +5726,17 @@ async def on_media_message(message: Message):
     if semantic_text:
         if await _check_and_delete_semantic_ad_message(message, semantic_text, group_id=group_id, user_id=user_id):
             return
+    missing_gate_group_ids = await _get_media_join_gate_missing_groups(group_id, user_id)
+    if missing_gate_group_ids:
+        await _delete_original_and_linked_reply(group_id, message.message_id)
+        await _send_media_join_gate_reminder(
+            message,
+            group_id=group_id,
+            user_id=user_id,
+            missing_group_ids=missing_gate_group_ids,
+            now_ts=now,
+        )
+        return
     if not await _can_send_media(group_id, user_id):
         await _delete_original_and_linked_reply(group_id, message.message_id)
         need_msg = cfg.get("media_unlock_msg_count", 50)
@@ -5899,6 +6207,17 @@ async def detect_and_warn(message: Message):
 
     # 「权限」查询发媒体进度
     if message.text and message.text.strip() == "权限":
+        missing_gate_group_ids = await _get_media_join_gate_missing_groups(group_id, user_id)
+        if missing_gate_group_ids:
+            titles = await _resolve_group_titles(missing_gate_group_ids)
+            missing_names = [titles.get(gid) or str(gid) for gid in missing_gate_group_ids]
+            await message.reply(
+                f"⚠️ {MEDIA_JOIN_GATE_REMINDER_TEXT}\n"
+                f"当前缺少：{', '.join(missing_names)}\n"
+                "加入后即可恢复发图权限。",
+                reply_markup=await _build_media_join_gate_keyboard(group_id, user_id),
+            )
+            return
         if not cfg.get("media_permission_enabled", True):
             await message.reply("✅ 当前群未开启媒体权限限制，所有成员都可直接发送媒体。")
             return

@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Join Gate Mini App Demo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #000000;
+      --panel: rgba(28, 28, 30, 0.88);
+      --panel-2: rgba(44, 44, 46, 0.92);
+      --line: rgba(255, 255, 255, 0.08);
+      --text: #f5f5f7;
+      --muted: #98989f;
+      --accent: #0a84ff;
+      --accent-soft: rgba(10, 132, 255, 0.16);
+      --ok: #30d158;
+      --ok-soft: rgba(48, 209, 88, 0.16);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top, rgba(255, 255, 255, 0.08), transparent 24%),
+        linear-gradient(180deg, #0b0b0d 0%, #000 100%);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      padding: 18px 14px 32px;
+    }
+
+    .frame {
+      width: 100%;
+      max-width: 420px;
+    }
+
+    .app {
+      border-radius: 28px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(10, 10, 12, 0.9);
+      box-shadow: 0 22px 60px rgba(0, 0, 0, 0.46);
+      backdrop-filter: blur(24px);
+    }
+
+    .hero {
+      padding: 22px 18px 18px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02));
+    }
+
+    .kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    h1 {
+      margin: 14px 0 8px;
+      font-size: 28px;
+      line-height: 1.15;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .body {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .panel-head strong {
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .small {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .progress {
+      display: grid;
+      gap: 10px;
+    }
+
+    .bar {
+      height: 8px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(255,255,255,0.06);
+    }
+
+    .fill {
+      height: 100%;
+      width: 33%;
+      background: linear-gradient(90deg, #0a84ff, #5ac8fa);
+      border-radius: 999px;
+      transition: width 180ms ease;
+    }
+
+    .compact-steps {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .pill {
+      min-height: 34px;
+      padding: 0 12px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      font-size: 12px;
+      color: var(--muted);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+
+    .pill.done {
+      color: #dfffe6;
+      background: var(--ok-soft);
+      border-color: rgba(48, 209, 88, 0.25);
+    }
+
+    .list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 12px;
+      border-radius: 16px;
+      background: var(--panel-2);
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+
+    .item-left {
+      min-width: 0;
+    }
+
+    .item-left strong {
+      display: block;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .item-left span {
+      display: block;
+      margin-top: 2px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .state {
+      flex: 0 0 auto;
+      min-width: 64px;
+      text-align: center;
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.05);
+      color: var(--muted);
+    }
+
+    .state.joined {
+      color: #dfffe6;
+      background: var(--ok-soft);
+      border-color: rgba(48, 209, 88, 0.24);
+    }
+
+    .notice {
+      border-radius: 16px;
+      padding: 13px 14px;
+      font-size: 13px;
+      line-height: 1.55;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
+      color: #d7d7dc;
+    }
+
+    .notice.ok {
+      background: var(--ok-soft);
+      border-color: rgba(48, 209, 88, 0.24);
+      color: #e9fff0;
+    }
+
+    .footer {
+      padding: 0 14px 14px;
+      display: grid;
+      gap: 10px;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 16px;
+      min-height: 48px;
+      padding: 0 14px;
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0;
+      cursor: pointer;
+      transition: transform 140ms ease, opacity 140ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+    }
+
+    .primary {
+      width: 100%;
+      background: linear-gradient(180deg, #1991ff, #0a84ff);
+      color: #ffffff;
+    }
+
+    .secondary {
+      width: 100%;
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .ghost {
+      width: 100%;
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .hidden {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <div class="app">
+      <div class="hero">
+        <div class="kicker">Join Gate Demo</div>
+        <h1 id="heroTitle">加入备用群组</h1>
+        <p id="heroText">发图前请先加入当前主群要求的备用群组。</p>
+      </div>
+
+      <div class="body">
+        <section class="panel">
+          <div class="panel-head">
+            <strong>必备群组</strong>
+            <span class="small" id="progressText">3 个</span>
+          </div>
+          <div class="progress">
+            <div class="bar"><div class="fill" id="progressFill"></div></div>
+            <div class="compact-steps">
+              <div class="pill done">打开</div>
+              <div class="pill" id="stepJoin">加入群组</div>
+              <div class="pill done" id="stepUnlock">回群发图</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <strong>必备群组</strong>
+            <span class="small" id="panelHint">一键加入</span>
+          </div>
+          <div class="list" id="groupList"></div>
+        </section>
+
+        <div class="notice" id="waitBox">
+          加入这些备用群组后，回到主群重新发图即可。机器人会实时检测成员资格；退出备用群后，发图权限会自动失效。
+        </div>
+        <div class="notice ok hidden" id="okBox">
+          当前页面已加载完成。
+        </div>
+      </div>
+
+      <div class="footer">
+        <button class="primary" id="joinBtn" type="button">一键加入</button>
+        <button class="secondary" id="checkBtn" type="button">刷新资格说明</button>
+        <button class="ghost" id="simulateBtn" type="button">示例模式切换</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const fallbackPayload = {
+      group_title: "示例主群",
+      button_text: "一键加入",
+      groups: [
+        { title: "官方通知频道", hint: "必备群组", join_url: "https://t.me/telegram" },
+        { title: "用户交流群", hint: "必备群组", join_url: "https://t.me/durov" },
+        { title: "资源更新群", hint: "必备群组", join_url: "https://t.me/botnews" }
+      ]
+    };
+
+    function decodePayload(raw) {
+      if (!raw) return null;
+      try {
+        const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+        const binary = atob(padded);
+        const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+        const json = new TextDecoder("utf-8").decode(bytes);
+        return JSON.parse(json);
+      } catch (_error) {
+        return null;
+      }
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const payload = decodePayload(params.get("data")) || fallbackPayload;
+    const groups = Array.isArray(payload.groups) && payload.groups.length ? payload.groups.slice() : fallbackPayload.groups.slice();
+
+    const heroTitle = document.getElementById("heroTitle");
+    const heroText = document.getElementById("heroText");
+    const groupList = document.getElementById("groupList");
+    const panelHint = document.getElementById("panelHint");
+    const progressText = document.getElementById("progressText");
+    const progressFill = document.getElementById("progressFill");
+    const stepJoin = document.getElementById("stepJoin");
+    const stepUnlock = document.getElementById("stepUnlock");
+    const waitBox = document.getElementById("waitBox");
+    const okBox = document.getElementById("okBox");
+    const joinBtn = document.getElementById("joinBtn");
+    const checkBtn = document.getElementById("checkBtn");
+    const simulateBtn = document.getElementById("simulateBtn");
+
+    heroTitle.textContent = "加入备用群组";
+    heroText.textContent = `${payload.group_title || "当前主群"} 已开启发图权限校验。`;
+    panelHint.textContent = payload.button_text || "一键加入";
+    joinBtn.textContent = payload.button_text || "一键加入";
+
+    function render() {
+      groupList.innerHTML = "";
+      const total = groups.length;
+      progressText.textContent = `${total} 个`;
+      progressFill.style.width = total > 0 ? "100%" : "0%";
+      stepJoin.classList.toggle("done", total > 0);
+      stepUnlock.classList.toggle("done", true);
+      waitBox.classList.remove("hidden");
+      okBox.classList.add("hidden");
+      simulateBtn.style.opacity = payload === fallbackPayload ? "1" : "0.45";
+
+      groups.forEach((group) => {
+        const item = document.createElement("div");
+        item.className = "item";
+        const title = group.title || group.name || "未命名群组";
+        const hint = group.hint || "必备群组";
+        const joinUrl = group.join_url || "";
+        item.innerHTML = `
+          <div class="item-left">
+            <strong>${title}</strong>
+            <span>${hint}</span>
+          </div>
+          <div class="state ${joinUrl ? "joined" : ""}">
+            ${joinUrl ? "可加入" : "待配置"}
+          </div>
+        `;
+        if (joinUrl) {
+          item.style.cursor = "pointer";
+          item.addEventListener("click", () => {
+            window.location.href = joinUrl;
+          });
+        }
+        groupList.appendChild(item);
+      });
+    }
+
+    function openFirstJoinableGroup() {
+      const next = groups.find((item) => item.join_url);
+      if (!next) {
+        alert("当前还没有可用的加入链接。请先在机器人后台为必备群组准备邀请入口。");
+        return;
+      }
+      window.location.href = next.join_url;
+    }
+
+    joinBtn.addEventListener("click", () => {
+      openFirstJoinableGroup();
+    });
+
+    checkBtn.addEventListener("click", () => {
+      alert("真实版本里不需要在这里手动授权。\\n\\n你加入备用群后，回到主群再次发图，机器人会实时校验成员资格。");
+    });
+
+    simulateBtn.addEventListener("click", () => {
+      if (payload !== fallbackPayload) {
+        alert("当前页面已经由机器人动态注入了真实群组数据。");
+        return;
+      }
+      groups.reverse();
+      render();
+    });
+
+    render();
+  </script>
+</body>
+</html>
