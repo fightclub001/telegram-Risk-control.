@@ -354,14 +354,48 @@ def _remote_restart(
     if not restart_patterns:
         _log("restart skipped: no services and no fallback patterns configured")
         return
-    lines = ["set -euo pipefail"]
-    for pattern in restart_patterns:
-        lines.append(f"pkill -f -- {shlex.quote(pattern)} || true")
-    lines.append("sleep 6")
-    _ssh(
+    script = f"""
+import os
+import signal
+import time
+from pathlib import Path
+
+patterns = {restart_patterns!r}
+current_pid = os.getpid()
+killed = []
+
+for proc_dir in Path("/proc").iterdir():
+    if not proc_dir.name.isdigit():
+        continue
+    pid = int(proc_dir.name)
+    if pid == current_pid:
+        continue
+    try:
+        raw = (proc_dir / "cmdline").read_bytes()
+    except OSError:
+        continue
+    if not raw:
+        continue
+    cmdline = raw.replace(b"\\x00", b" ").decode("utf-8", errors="ignore")
+    if not cmdline:
+        continue
+    if not ("/opt/telegram-risk-control/venv/bin/python" in cmdline or "python" in cmdline):
+        continue
+    if any(pattern in cmdline for pattern in patterns):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append((pid, cmdline))
+        except ProcessLookupError:
+            pass
+
+time.sleep(8)
+for pid, cmdline in killed:
+    print(f"killed {{pid}} {{cmdline}}")
+"""
+    _remote_python(
         key_path,
-        _wrap_bash("\n".join(lines), use_sudo=False, sudo_password=""),
-        workspace=workspace,
+        workspace,
+        script,
         display_override="ssh fightclub@127.0.0.1 rotate user-owned service processes",
     )
 
