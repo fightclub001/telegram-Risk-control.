@@ -13,7 +13,7 @@ from __future__ import annotations
     - add_ad_sample(raw_text) -> AdSample | None
     - list_samples() -> List[AdSample]
     - remove_sample(sample_id) -> bool
-    - check_text(raw_text, min_len=2) -> (is_ad: bool, score: float, matched_id: Optional[int])
+    - check_text(raw_text, min_len=3) -> (is_ad: bool, score: float, matched_id: Optional[int])
 """
 
 import os
@@ -129,25 +129,24 @@ def _short_text_match_score(sample_text: str, candidate_text: str) -> float:
         return 1.0
     if sample_basic and candidate_basic and sample_basic == candidate_basic:
         return 0.99
-    if sample_text and candidate_text and (sample_text in candidate_text or candidate_text in sample_text):
-        return 0.97
-    if sample_basic and candidate_basic and (sample_basic in candidate_basic or candidate_basic in sample_basic):
-        return 0.95
 
     full_ratio = fuzz.ratio(candidate_text, sample_text) / 100.0
     full_partial = fuzz.partial_ratio(candidate_text, sample_text) / 100.0
+    len_ratio = min(len(candidate_text), len(sample_text)) / max(1, max(len(candidate_text), len(sample_text)))
     if sample_basic and candidate_basic:
         basic_ratio = fuzz.ratio(candidate_basic, sample_basic) / 100.0
         basic_partial = fuzz.partial_ratio(candidate_basic, sample_basic) / 100.0
+        basic_len_ratio = min(len(candidate_basic), len(sample_basic)) / max(1, max(len(candidate_basic), len(sample_basic)))
     else:
         basic_ratio = 0.0
         basic_partial = 0.0
+        basic_len_ratio = 0.0
 
     return max(
-        0.45 * full_partial + 0.25 * full_ratio + 0.30 * basic_partial,
-        0.55 * basic_partial + 0.45 * basic_ratio,
-        full_partial,
-        basic_partial,
+        0.30 * (full_partial * len_ratio) + 0.40 * full_ratio + 0.30 * (basic_partial * basic_len_ratio),
+        0.35 * (basic_partial * basic_len_ratio) + 0.65 * basic_ratio,
+        full_ratio,
+        basic_ratio,
     )
 
 
@@ -437,7 +436,7 @@ class SemanticAdDetector:
     def check_text(
         self,
         raw_text: str,
-        min_len: int = 2,
+        min_len: int = 3,
         threshold: float | None = None,
     ) -> Tuple[bool, float, Optional[int]]:
         """
@@ -474,13 +473,8 @@ class SemanticAdDetector:
                 continue
             sample_basic = _normalize_text_basic(sample_text)
             candidate_basic = _normalize_text_basic(norm)
-            if sample_basic and candidate_basic:
-                if sample_basic == candidate_basic:
-                    return True, 0.99, int(sid)
-                if (
-                    sample_basic in candidate_basic or candidate_basic in sample_basic
-                ) and min(len(sample_basic), len(candidate_basic)) >= min_len:
-                    return True, 0.95, int(sid)
+            if sample_basic and candidate_basic and sample_basic == candidate_basic:
+                return True, 0.99, int(sid)
             sample_len = int(text_len or len(sample_text))
             if min(norm_len, sample_len) <= 12:
                 short_score = _short_text_match_score(sample_text, norm)
@@ -488,13 +482,6 @@ class SemanticAdDetector:
                     return True, max(0.90, short_score), int(sid)
             if norm == sample_text:
                 return True, 1.0, int(sid)
-            if sample_text in norm:
-                return True, 1.0, int(sid)
-            if (
-                norm in sample_text
-                and norm_len >= max(min_len + 2, int(sample_len * 0.45))
-            ):
-                return True, 0.96, int(sid)
 
         soft_min_len = max(min_len, int(norm_len * 0.35))
         soft_max_len = max(norm_len + 24, int(norm_len * 2.5))
@@ -523,19 +510,11 @@ class SemanticAdDetector:
             candidate_basic = _normalize_text_basic(norm)
             grams_old = fp_str.split("|") if fp_str else _ngrams(text_old, 3)
 
-            if sample_basic and candidate_basic:
-                if sample_basic == candidate_basic:
-                    if 0.99 > best_score:
-                        best_score = 0.99
-                        best_id = sid
-                    continue
-                if (
-                    sample_basic in candidate_basic or candidate_basic in sample_basic
-                ) and min(len(sample_basic), len(candidate_basic)) >= min_len:
-                    if 0.95 > best_score:
-                        best_score = 0.95
-                        best_id = sid
-                    continue
+            if sample_basic and candidate_basic and sample_basic == candidate_basic:
+                if 0.99 > best_score:
+                    best_score = 0.99
+                    best_id = sid
+                continue
 
             if min(norm_len, sample_len) <= 12:
                 short_score = _short_text_match_score(text_old, norm)

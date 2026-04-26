@@ -5983,7 +5983,7 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
     """
     if not _semantic_detection_enabled_for_group(group_id):
         return False
-    if _semantic_ad_text_len(text) < 2:
+    if _semantic_ad_text_len(text) <= 2:
         return False
 
     is_semantic_ad, sim, _ = get_semantic_ad_detector().check_text(
@@ -6190,7 +6190,7 @@ async def detect_and_warn(message: Message):
     _schedule_bio_watch_check(message)
 
     # 语义广告检测（优先级最高；命中后直接删除不做提醒）
-    if cfg.get("semantic_ad_enabled", False) and _semantic_ad_text_len(message.text or "") >= 2:
+    if cfg.get("semantic_ad_enabled", False) and _semantic_ad_text_len(message.text or "") > 2:
         if await _check_and_delete_semantic_ad_message(message, text, group_id=group_id, user_id=user_id):
             return
     else:
@@ -6198,8 +6198,8 @@ async def detect_and_warn(message: Message):
         reason = []
         if not cfg.get("semantic_ad_enabled", False):
             reason.append("semantic_ad_enabled=false")
-        if _semantic_ad_text_len(message.text or "") < 2:
-            reason.append("归一化文本长度<2")
+        if _semantic_ad_text_len(message.text or "") <= 2:
+            reason.append("归一化文本长度<=2")
         if reason:
             _push_listen_log(
                 group_id=group_id,
