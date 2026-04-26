@@ -36,6 +36,7 @@ GROUP_IDS = set()
 ADMIN_IDS = set()
 KNOWN_GROUP_IDS = set()
 SHARED_GROUP_CONFIG_KEY = "__shared__"
+PRIMARY_TEMPLATE_GROUP_ID = -1003576447078
 GROUP_GUARD_CACHE_TTL_SEC = max(10, int((os.getenv("GROUP_GUARD_CACHE_TTL_SECONDS") or "60").strip()))
 group_guard_cache = {}
 BOT_SELF_ID: int | None = None
@@ -639,6 +640,24 @@ def _remove_semantic_ad_sample(sample_id: int) -> bool:
     if removed:
         _schedule_admin_state_sync("semantic-ad-remove")
     return removed
+
+
+def _semantic_ad_text_len(raw_text: str) -> int:
+    try:
+        from semantic_ads import normalize_text
+
+        return len(normalize_text(raw_text))
+    except Exception:
+        return len((raw_text or "").strip())
+
+
+def _semantic_ad_threshold(group_id: int) -> float:
+    cfg = get_group_config(group_id)
+    try:
+        value = float(cfg.get("semantic_ad_score_threshold", 0.85))
+    except Exception:
+        value = 0.85
+    return max(0.0, min(1.0, value))
 
 
 def get_join_approval_avatar_ocr() -> Any:
@@ -1258,6 +1277,7 @@ def _default_group_config():
         "media_report_max_per_day": 3,
         "media_report_delete_threshold": 2,
         "semantic_ad_enabled": False,
+        "semantic_ad_score_threshold": 0.85,
         "join_approval_avatar_terms": join_terms,
         "bio_watch_blacklist_links": list(BIO_WATCH_DEFAULT_LINKS),
         "image_fuzzy_block_enabled": True,
@@ -1275,6 +1295,18 @@ def _ensure_group_config_defaults(group_cfg: dict[str, Any]) -> None:
     for key, value in defaults.items():
         if key not in group_cfg:
             group_cfg[key] = deepcopy(value)
+
+
+def _build_new_group_config_template(groups: dict[str, Any]) -> dict[str, Any]:
+    source_cfg = groups.get(str(PRIMARY_TEMPLATE_GROUP_ID))
+    if isinstance(source_cfg, dict):
+        _ensure_group_config_defaults(source_cfg)
+        return deepcopy(source_cfg)
+    shared_cfg = groups.get(SHARED_GROUP_CONFIG_KEY)
+    if isinstance(shared_cfg, dict):
+        _ensure_group_config_defaults(shared_cfg)
+        return deepcopy(shared_cfg)
+    return _default_group_config()
 
 
 def _collect_group_config_keys(groups: dict[str, Any]) -> list[str]:
@@ -1970,7 +2002,7 @@ async def load_config():
                 groups[str(gid)] = deepcopy(shared_template)
 
         for gid in group_keys:
-            groups.setdefault(str(gid), deepcopy(shared_template) if shared_template is not None else {})
+            groups.setdefault(str(gid), _build_new_group_config_template(groups))
 
         obsolete_keys = (
             "check_bio_link",
@@ -2955,12 +2987,8 @@ def get_group_config(group_id: int):
     if "groups" not in config or not isinstance(config["groups"], dict):
         config["groups"] = {}
     gid = str(int(group_id))
-    shared_cfg = config["groups"].get(SHARED_GROUP_CONFIG_KEY)
     if gid not in config["groups"] or not isinstance(config["groups"].get(gid), dict):
-        if isinstance(shared_cfg, dict):
-            config["groups"][gid] = deepcopy(shared_cfg)
-        else:
-            config["groups"][gid] = _default_group_config()
+        config["groups"][gid] = _build_new_group_config_template(config["groups"])
     group_cfg = config["groups"][gid]
     _ensure_group_config_defaults(group_cfg)
     return group_cfg
@@ -3016,6 +3044,7 @@ class AdminStates(StatesGroup):
     EditMediaDeleteThreshold = State()
     EditSemanticAdAdd = State()
     EditSemanticAdRemove = State()
+    EditSemanticAdThreshold = State()
 
 # ==================== UI 键盘 ====================
 def get_main_menu_keyboard():
@@ -3062,6 +3091,7 @@ def get_group_menu_keyboard(group_id: int):
 def _build_semantic_ad_summary(title: str, group_id: int) -> str:
     cfg = get_group_config(group_id)
     enabled = "✅ 已开启" if cfg.get("semantic_ad_enabled", False) else "❌ 已关闭"
+    threshold = _semantic_ad_threshold(group_id)
     image_samples = len(get_image_fuzzy_blocker().list_group_samples(group_id))
     try:
         detector = get_semantic_ad_detector()
@@ -3071,6 +3101,7 @@ def _build_semantic_ad_summary(title: str, group_id: int) -> str:
     return (
         f"<b>{title}</b> › 广告风控\n\n"
         f"文本语义识别：{enabled}\n"
+        f"命中阈值：{threshold:.2f}\n"
         f"广告文本样本：{text_samples} 条\n"
         f"广告图片样本：{image_samples} 张\n\n"
         "说明：广告图片库会同时用于群内发图追溯执法，以及入群头像相似图拦截。"
@@ -3080,9 +3111,11 @@ def _build_semantic_ad_summary(title: str, group_id: int) -> str:
 def get_semantic_ad_menu_keyboard(group_id: int):
     cfg = get_group_config(group_id)
     enabled = "✅" if cfg.get("semantic_ad_enabled", False) else "❌"
+    threshold = _semantic_ad_threshold(group_id)
     samples = get_image_fuzzy_blocker().list_group_samples(group_id)
     buttons = [
         [InlineKeyboardButton(text=f"开关 {enabled}", callback_data=f"toggle_semantic_ad:{group_id}")],
+        [InlineKeyboardButton(text=f"🎯 命中阈值: {threshold:.2f}", callback_data=f"edit_semantic_ad_threshold:{group_id}")],
         [InlineKeyboardButton(text="➕ 增加广告语句", callback_data=f"add_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="➖ 减少广告语句", callback_data=f"remove_semantic_ad:{group_id}")],
         [InlineKeyboardButton(text="📂 广告词库展示", callback_data=f"view_semantic_ad:{group_id}")],
@@ -3968,6 +4001,27 @@ async def toggle_semantic_ad(callback: CallbackQuery):
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
 
+@router.callback_query(F.data.startswith("edit_semantic_ad_threshold:"), F.from_user.id.in_(ADMIN_IDS))
+async def edit_semantic_ad_threshold(callback: CallbackQuery, state: FSMContext):
+    try:
+        group_id = int(callback.data.split(":", 1)[1])
+        await state.update_data(group_id=group_id)
+        current = _semantic_ad_threshold(group_id)
+        title = await get_chat_title_safe(callback.bot, group_id)
+        text = (
+            f"<b>{title}</b> › AD机器学习 › 命中阈值\n\n"
+            "请发送 0.00 到 1.00 之间的小数。\n"
+            "例如：0.85\n"
+            "发送 /cancel 取消。\n\n"
+            f"当前值：{current:.2f}"
+        )
+        await callback.message.edit_text(text, reply_markup=None)
+        await state.set_state(AdminStates.EditSemanticAdThreshold)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("add_semantic_ad:"), F.from_user.id.in_(ADMIN_IDS))
 async def add_semantic_ad_callback(callback: CallbackQuery, state: FSMContext):
     try:
@@ -3984,6 +4038,31 @@ async def add_semantic_ad_callback(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
+
+
+@router.message(StateFilter(AdminStates.EditSemanticAdThreshold), F.from_user.id.in_(ADMIN_IDS))
+async def process_semantic_ad_threshold(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        group_id = int(data.get("group_id"))
+        kb = get_semantic_ad_menu_keyboard(group_id)
+        if (message.text or "").strip() == "/cancel":
+            await message.reply("已取消。", reply_markup=kb)
+            await state.set_state(AdminStates.GroupMenu)
+            return
+        value = float((message.text or "").strip())
+        if value < 0 or value > 1:
+            raise ValueError("范围必须在 0.00 到 1.00 之间")
+        cfg = get_group_config(group_id)
+        cfg["semantic_ad_score_threshold"] = round(value, 2)
+        await save_config()
+        await message.reply(
+            f"✅ 已更新广告命中阈值为 {cfg['semantic_ad_score_threshold']:.2f}",
+            reply_markup=kb,
+        )
+        await state.set_state(AdminStates.GroupMenu)
+    except Exception as e:
+        await message.reply(f"❌ 请输入 0.00 到 1.00 之间的小数。{e}")
 
 
 @router.message(StateFilter(AdminStates.EditSemanticAdAdd), F.from_user.id.in_(ADMIN_IDS))
@@ -5591,10 +5670,13 @@ async def _check_and_delete_semantic_ad_message(message: Message, text: str, *, 
     """
     if not _semantic_detection_enabled_for_group(group_id):
         return False
-    if len((text or "").strip()) < 4:
+    if _semantic_ad_text_len(text) < 2:
         return False
 
-    is_semantic_ad, sim, _ = get_semantic_ad_detector().check_text(text)
+    is_semantic_ad, sim, _ = get_semantic_ad_detector().check_text(
+        text,
+        threshold=_semantic_ad_threshold(group_id),
+    )
     _push_listen_log(
         group_id=group_id,
         user_id=user_id,
@@ -5795,7 +5877,7 @@ async def detect_and_warn(message: Message):
     _schedule_bio_watch_check(message)
 
     # 语义广告检测（优先级最高；命中后直接删除不做提醒）
-    if cfg.get("semantic_ad_enabled", False) and len((message.text or "").strip()) >= 4:
+    if cfg.get("semantic_ad_enabled", False) and _semantic_ad_text_len(message.text or "") >= 2:
         if await _check_and_delete_semantic_ad_message(message, text, group_id=group_id, user_id=user_id):
             return
     else:
@@ -5803,8 +5885,8 @@ async def detect_and_warn(message: Message):
         reason = []
         if not cfg.get("semantic_ad_enabled", False):
             reason.append("semantic_ad_enabled=false")
-        if len((message.text or "").strip()) < 4:
-            reason.append("文本长度<4")
+        if _semantic_ad_text_len(message.text or "") < 2:
+            reason.append("归一化文本长度<2")
         if reason:
             _push_listen_log(
                 group_id=group_id,

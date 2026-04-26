@@ -13,13 +13,14 @@ from __future__ import annotations
     - add_ad_sample(raw_text) -> AdSample | None
     - list_samples() -> List[AdSample]
     - remove_sample(sample_id) -> bool
-    - check_text(raw_text, min_len=4) -> (is_ad: bool, score: float, matched_id: Optional[int])
+    - check_text(raw_text, min_len=2) -> (is_ad: bool, score: float, matched_id: Optional[int])
 """
 
 import os
 import re
 import sqlite3
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -36,9 +37,8 @@ class AdSample:
     created_at: float
 
 
-_RE_KEEP = re.compile(r"[0-9a-z\u4e00-\u9fff]")
 _RE_REPEAT = re.compile(r"(.)\1+")
-DEFAULT_MATCH_THRESHOLD = float(os.getenv("SEMANTIC_AD_SCORE_THRESHOLD", "0.75"))
+DEFAULT_MATCH_THRESHOLD = float(os.getenv("SEMANTIC_AD_SCORE_THRESHOLD", "0.85"))
 MAINTENANCE_INTERVAL_SEC = max(
     600, int((os.getenv("SEMANTIC_AD_MAINTENANCE_INTERVAL_SECONDS") or "21600").strip())
 )
@@ -54,13 +54,14 @@ COMPACT_HAMMING_MAX = max(
 
 
 def normalize_text(raw: str) -> str:
-    """文本归一化：只保留中英数字、小写、去标点空格、合并重复字符."""
+    """文本归一化：保留文字、数字和表情符号，去掉空白/标点/控制字符，合并重复字符."""
     if not raw:
         return ""
     s = raw.lower()
     kept: List[str] = []
     for ch in s:
-        if _RE_KEEP.match(ch):
+        cat = unicodedata.category(ch)
+        if cat[0] in {"L", "N"} or cat in {"So", "Sk"}:
             kept.append(ch)
     if not kept:
         return ""
@@ -69,9 +70,23 @@ def normalize_text(raw: str) -> str:
     return s3
 
 
+def _normalize_text_basic(raw: str) -> str:
+    """Secondary normalization for text-only comparison on short samples."""
+    if not raw:
+        return ""
+    kept: List[str] = []
+    for ch in raw.lower():
+        cat = unicodedata.category(ch)
+        if cat[0] in {"L", "N"}:
+            kept.append(ch)
+    if not kept:
+        return ""
+    return _RE_REPEAT.sub(r"\1", "".join(kept))
+
+
 def _ngrams(text: str, n: int = 3) -> List[str]:
     if len(text) < n:
-        return []
+        return [text] if text else []
     return [text[i : i + n] for i in range(len(text) - n + 1)]
 
 
@@ -106,8 +121,38 @@ def _hamming(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
 
 
+def _short_text_match_score(sample_text: str, candidate_text: str) -> float:
+    sample_basic = _normalize_text_basic(sample_text)
+    candidate_basic = _normalize_text_basic(candidate_text)
+
+    if sample_text == candidate_text:
+        return 1.0
+    if sample_basic and candidate_basic and sample_basic == candidate_basic:
+        return 0.99
+    if sample_text and candidate_text and (sample_text in candidate_text or candidate_text in sample_text):
+        return 0.97
+    if sample_basic and candidate_basic and (sample_basic in candidate_basic or candidate_basic in sample_basic):
+        return 0.95
+
+    full_ratio = fuzz.ratio(candidate_text, sample_text) / 100.0
+    full_partial = fuzz.partial_ratio(candidate_text, sample_text) / 100.0
+    if sample_basic and candidate_basic:
+        basic_ratio = fuzz.ratio(candidate_basic, sample_basic) / 100.0
+        basic_partial = fuzz.partial_ratio(candidate_basic, sample_basic) / 100.0
+    else:
+        basic_ratio = 0.0
+        basic_partial = 0.0
+
+    return max(
+        0.45 * full_partial + 0.25 * full_ratio + 0.30 * basic_partial,
+        0.55 * basic_partial + 0.45 * basic_ratio,
+        full_partial,
+        basic_partial,
+    )
+
+
 class SemanticAdDetector:
-    """轻量级组合算法广告检测（SimHash + Ngram + RapidFuzz + 关键词权重）."""
+    """轻量级组合算法广告检测（SimHash + Ngram + RapidFuzz 相似度）."""
 
     def __init__(self, data_dir: str) -> None:
         self.data_dir = data_dir
@@ -303,7 +348,7 @@ class SemanticAdDetector:
     def add_ad_sample(self, raw_text: str) -> Optional[AdSample]:
         """加入广告样本。只对“真正重复”的文本做去重，避免短句被误判为已存在。"""
         norm = normalize_text(raw_text)
-        if not norm or len(norm) < 4:
+        if not norm or len(norm) < 2:
             return None
 
         grams = _ngrams(norm, 3)
@@ -324,7 +369,7 @@ class SemanticAdDetector:
             FROM ads
             WHERE text_len BETWEEN ? AND ?
             """,
-            (max(4, len(norm) - 1), len(norm) + 1),
+            (max(2, len(norm) - 1), len(norm) + 1),
         )
         rows = cur.fetchall()
         for sid, existing_text, existing_sh, existing_len in rows:
@@ -389,14 +434,18 @@ class SemanticAdDetector:
 
     # ---------- 新消息检测 ----------
 
-    def check_text(self, raw_text: str, min_len: int = 4) -> Tuple[bool, float, Optional[int]]:
+    def check_text(
+        self,
+        raw_text: str,
+        min_len: int = 2,
+        threshold: float | None = None,
+    ) -> Tuple[bool, float, Optional[int]]:
         """
         新消息检测：
         1. 归一化 + 文本长度过滤
         2. N-gram 指纹 + SimHash
         3. RapidFuzz 文本相似度
-        4. 关键词权重
-        5. 综合评分
+        4. 综合评分
         """
         norm = normalize_text(raw_text)
         if not norm or len(norm) < min_len:
@@ -423,11 +472,24 @@ class SemanticAdDetector:
             sample_text = str(text_old or "")
             if not sample_text:
                 continue
+            sample_basic = _normalize_text_basic(sample_text)
+            candidate_basic = _normalize_text_basic(norm)
+            if sample_basic and candidate_basic:
+                if sample_basic == candidate_basic:
+                    return True, 0.99, int(sid)
+                if (
+                    sample_basic in candidate_basic or candidate_basic in sample_basic
+                ) and min(len(sample_basic), len(candidate_basic)) >= min_len:
+                    return True, 0.95, int(sid)
+            sample_len = int(text_len or len(sample_text))
+            if min(norm_len, sample_len) <= 12:
+                short_score = _short_text_match_score(sample_text, norm)
+                if short_score >= 0.90:
+                    return True, max(0.90, short_score), int(sid)
             if norm == sample_text:
                 return True, 1.0, int(sid)
             if sample_text in norm:
                 return True, 1.0, int(sid)
-            sample_len = int(text_len or len(sample_text))
             if (
                 norm in sample_text
                 and norm_len >= max(min_len + 2, int(sample_len * 0.45))
@@ -456,7 +518,32 @@ class SemanticAdDetector:
             sid = int(sid)
             text_old = str(text_old)
             sh_old = int(sh_old)
+            sample_len = len(text_old)
+            sample_basic = _normalize_text_basic(text_old)
+            candidate_basic = _normalize_text_basic(norm)
             grams_old = fp_str.split("|") if fp_str else _ngrams(text_old, 3)
+
+            if sample_basic and candidate_basic:
+                if sample_basic == candidate_basic:
+                    if 0.99 > best_score:
+                        best_score = 0.99
+                        best_id = sid
+                    continue
+                if (
+                    sample_basic in candidate_basic or candidate_basic in sample_basic
+                ) and min(len(sample_basic), len(candidate_basic)) >= min_len:
+                    if 0.95 > best_score:
+                        best_score = 0.95
+                        best_id = sid
+                    continue
+
+            if min(norm_len, sample_len) <= 12:
+                short_score = _short_text_match_score(text_old, norm)
+                if short_score > best_score:
+                    best_score = short_score
+                    best_id = sid
+                if short_score >= 0.90:
+                    continue
 
             ngram_sim = _jaccard(grams_new, grams_old)
             containment = max(
@@ -478,33 +565,15 @@ class SemanticAdDetector:
 
             text_similarity = fuzz.ratio(norm, text_old) / 100.0
 
-            keyword_weights = {
-                "免费": 0.2,
-                "下载": 0.2,
-                "破解": 0.3,
-                "频道": 0.2,
-                "福利": 0.1,
-                "tg": 0.2,
-                "加群": 0.2,
-            }
-            keyword_score = 0.0
-            for kw, w in keyword_weights.items():
-                if kw in raw_text or kw in norm:
-                    keyword_score += w
-            if keyword_score > 1.0:
-                keyword_score = 1.0
-
             balanced_score = (
-                0.35 * simhash_similarity
-                + 0.30 * text_similarity
-                + 0.20 * ngram_sim
-                + 0.15 * keyword_score
+                0.40 * simhash_similarity
+                + 0.35 * text_similarity
+                + 0.25 * ngram_sim
             )
             containment_score = (
-                0.38 * partial_similarity
-                + 0.27 * containment
+                0.45 * partial_similarity
+                + 0.35 * containment
                 + 0.20 * ngram_sim
-                + 0.15 * keyword_score
             )
             score = max(balanced_score, containment_score)
 
@@ -518,14 +587,20 @@ class SemanticAdDetector:
             elif (
                 partial_similarity >= 0.88
                 and containment >= 0.62
-                and keyword_score >= 0.2
             ):
                 score = max(score, 0.84)
+            elif (
+                containment >= 0.78
+                and text_similarity >= 0.78
+                and max(norm_len, len(text_old)) >= 8
+            ):
+                score = max(score, 0.82)
 
             if score > best_score:
                 best_score = score
                 best_id = sid
 
-        is_ad = best_score >= DEFAULT_MATCH_THRESHOLD and best_id is not None
+        effective_threshold = DEFAULT_MATCH_THRESHOLD if threshold is None else float(threshold)
+        is_ad = best_score >= effective_threshold and best_id is not None
         return is_ad, best_score, best_id
 
