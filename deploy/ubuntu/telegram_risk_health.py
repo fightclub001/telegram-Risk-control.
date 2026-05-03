@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 import json
 import os
-import platform
-import ssl
 import subprocess
 import time
 import urllib.error
@@ -10,21 +8,12 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-try:
-    import certifi
-    _CERTIFI_CAFILE = certifi.where()
-except Exception:
-    _CERTIFI_CAFILE = None
-
 
 HOST = os.getenv("HEALTH_LISTEN_HOST", "127.0.0.1")
 PORT = int(os.getenv("HEALTH_LISTEN_PORT", "18080"))
 READ_TOKEN = os.getenv("HEARTBEAT_READ_TOKEN", "").strip()
 ALLOW_ANON_STATUS = (os.getenv("HEALTH_ALLOW_ANON_STATUS", "1").strip().lower() in {"1", "true", "yes", "on"})
-_svc = os.getenv("PRIMARY_SERVICE_NAME", "").strip()
-if not _svc and platform.system() == 'Darwin':
-    _svc = "ai.telegram-risk-control"
-SERVICE_NAME = _svc or "telegram-risk-control.service"
+SERVICE_NAME = os.getenv("PRIMARY_SERVICE_NAME", "telegram-risk-control.service").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_BOT_API_BASE", "https://api.telegram.org").strip().rstrip("/")
 NETWORK_TIMEOUT_SEC = max(2, int((os.getenv("HEALTH_NET_TIMEOUT_SEC") or "8").strip()))
@@ -36,9 +25,6 @@ _LAST_FULLY_HEALTHY_TS = time.time()
 
 
 def service_is_healthy() -> bool:
-    if platform.system() == 'Darwin':
-        proc = subprocess.run(["pgrep", "-f", "main.py"], capture_output=True, check=False)
-        return proc.returncode == 0
     proc = subprocess.run(
         ["systemctl", "is-active", SERVICE_NAME],
         capture_output=True,
@@ -65,10 +51,7 @@ def telegram_api_is_healthy() -> bool:
 
     ok = False
     try:
-        ctx = None
-        if _CERTIFI_CAFILE:
-            ctx = ssl.create_default_context(cafile=_CERTIFI_CAFILE)
-        with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT_SEC, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT_SEC) as resp:
             ok = resp.status == 200
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
         ok = False
@@ -127,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._write_json(401, {"ok": False, "error": "unauthorized"})
 
         query = parse_qs(parsed.query)
-        node_id = (query.get("node_id") or [os.getenv("PRIMARY_NODE_ID", "mac-main")])[0]
+        node_id = (query.get("node_id") or ["ubuntu-main"])[0]
         status = compute_status()
         return self._write_json(
             200,
